@@ -59,6 +59,8 @@ private class IosJavaScriptSession(private val timeoutSeconds: Double) : YouTube
             configuration.websiteDataStore = WKWebsiteDataStore.nonPersistentDataStore()
             configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
             configuration.userContentController.addContentRuleList(rules)
+            configuration.userContentController.addUserScript(WKUserScript(OFFLINE_PEERS,
+                injectionTime = WKUserScriptInjectionTime.WKUserScriptInjectionTimeAtDocumentStart, forMainFrameOnly = false))
             val web = WKWebView(CGRectMake(0.0, 0.0, 1.0, 1.0), configuration)
             view = web
             val delegate = OfflineNavigation(onLoaded = {
@@ -133,6 +135,8 @@ private class IosJavaScriptSession(private val timeoutSeconds: Double) : YouTube
     }
 
     private companion object {
+        // ICE/STUN is not covered by CSP connect-src. Install before page code, including child-frame contexts.
+        const val OFFLINE_PEERS = """(function(root){['RTCPeerConnection','webkitRTCPeerConnection'].forEach(function(name){if(typeof root[name]!=='undefined')Object.defineProperty(root,name,{value:function(){throw new TypeError('Offline peer networking is unavailable');},writable:false,configurable:false});});})(window);"""
         const val OFFLINE_DOCUMENT = """<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; media-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'"></head><body></body></html>"""
     }
 }

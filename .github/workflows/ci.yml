@@ -121,8 +121,12 @@ jobs:
           echo "XCODE_VERSION=$(xcodebuild -version | head -n 1 | cut -d ' ' -f 2)" >> "$GITHUB_ENV"
           if [ "$(uname -m)" = arm64 ]; then
             echo 'IOS_TEST_TASK=iosSimulatorArm64Test' >> "$GITHUB_ENV"
+            echo 'IOS_FRAMEWORK_TASK=linkDebugFrameworkIosSimulatorArm64' >> "$GITHUB_ENV"
+            echo "KMPYT_FRAMEWORK=$GITHUB_WORKSPACE/kmpyt/build/bin/iosSimulatorArm64/debugFramework/KmpYT.framework" >> "$GITHUB_ENV"
           else
             echo 'IOS_TEST_TASK=iosX64Test' >> "$GITHUB_ENV"
+            echo 'IOS_FRAMEWORK_TASK=linkDebugFrameworkIosX64' >> "$GITHUB_ENV"
+            echo "KMPYT_FRAMEWORK=$GITHUB_WORKSPACE/kmpyt/build/bin/iosX64/debugFramework/KmpYT.framework" >> "$GITHUB_ENV"
           fi
           xcrun simctl list devices available
           python3 - <<'PY'
@@ -148,16 +152,18 @@ jobs:
           xcrun simctl bootstatus "$IOS_DEVICE" -b
       - name: Test native iOS protocols and media processing
         run: ./gradlew ":kmpyt:$IOS_TEST_TASK" "-PiosSimulatorDevice=$IOS_DEVICE" --stacktrace
-      - name: Assemble Swift framework
+      - name: Build the simulator framework for hosted tests
         id: framework
         if: always() && !cancelled()
-        run: ./gradlew :kmpyt:assembleKmpYTReleaseXCFramework --stacktrace
+        run: ./gradlew ":kmpyt:$IOS_FRAMEWORK_TASK" --stacktrace
       - name: Test WebKit in a UIKit application host
         if: ${{ !cancelled() && steps.framework.outcome == 'success' }}
         run: |
           command -v xcodegen || brew install xcodegen
           xcodegen generate --spec ci/ios-host/project.yml --project ci/ios-host
           xcodebuild -project ci/ios-host/KmpYTHost.xcodeproj -scheme KmpYTHost -configuration Debug -destination "id=$IOS_DEVICE" -derivedDataPath kmpyt/build/iosHost -resultBundlePath kmpyt/build/reports/ios-host.xcresult -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO test
+      - name: Assemble the release XCFramework
+        run: ./gradlew :kmpyt:assembleKmpYTReleaseXCFramework --stacktrace
       - name: Save Kotlin Native toolchain
         if: always() && steps.konan.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -173,3 +179,4 @@ jobs:
             kmpyt/build/reports/tests/
             kmpyt/build/test-results/
             kmpyt/build/reports/ios-host.xcresult/
+            kmpyt/build/bin/**/debugFramework/KmpYT.framework/Headers/

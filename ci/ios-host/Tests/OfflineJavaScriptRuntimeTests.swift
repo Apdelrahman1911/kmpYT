@@ -72,6 +72,25 @@ final class OfflineJavaScriptRuntimeTests: XCTestCase {
         }
     }
 
+    func testPeerNetworkingCannotBypassOfflinePolicy() async throws {
+        try await worker {
+            let session = try IosYouTubeJavaScriptRuntime(timeoutSeconds: 20).prepare(program: """
+                var blocked=true;
+                ['RTCPeerConnection','webkitRTCPeerConnection'].forEach(function(name){
+                  if(typeof window[name]==='function'){
+                    try { new window[name]({iceServers:[]}); blocked=false; } catch(error) {}
+                    var descriptor=Object.getOwnPropertyDescriptor(window,name);
+                    if(!descriptor||descriptor.writable||descriptor.configurable)blocked=false;
+                  }
+                });
+                globalThis.__kmpyt_capabilities={signature:true,throttling:false};
+                globalThis.__kmpyt_transform=function(kind,input){return input+':peerBlocked='+blocked;};
+                """)
+            defer { try? session.close() }
+            XCTAssertEqual(try session.call(function: .signature, input: "probe"), "probe:peerBlocked=true")
+        }
+    }
+
     func testActualWebKitReportsPolicyDenialAndCancelsExternalNavigation() async throws {
         let session = try await worker {
             try IosYouTubeJavaScriptRuntime(timeoutSeconds: 20).prepare(program: """
@@ -101,4 +120,6 @@ final class OfflineJavaScriptRuntimeTests: XCTestCase {
         // A policy-violation event proves a CSP denial; an ordinary DNS failure cannot satisfy this assertion.
         try await Task.sleep(nanoseconds: 100_000_000)
         let second = try await worker { try session.call(function: .throttling, input: "probe") }
-        XCTAssertEqual(second, "probe:kmpyt-offline:policy=tr
+        XCTAssertEqual(second, "probe:kmpyt-offline:policy=true")
+    }
+}

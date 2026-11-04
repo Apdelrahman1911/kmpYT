@@ -22,7 +22,7 @@ targets:
     sources: [Tests]
     dependencies:
       - target: KmpYTHost
-      - framework: ../../kmpyt/build/XCFrameworks/release/KmpYT.xcframework
+      - framework: ${KMPYT_FRAMEWORK}
         embed: false
       - sdk: WebKit.framework
       - sdk: AVFoundation.framework

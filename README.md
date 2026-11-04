@@ -54,7 +54,9 @@ iOS transfers restart after cancellation or failure; persistent cross-call resum
 
 [Cross-platform CI](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/ci.yml) runs shared/JVM tests on Linux, Windows and macOS, Android emulator tests, and iOS simulator/framework checks. [Approved-channel tests](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/live-youtube.yml) are manually triggered and restricted to [@oPiiLz](https://www.youtube.com/@oPiiLz). They upload redacted results rather than downloaded media or signed URLs. The live-test byte budget is a CI resource limit, not a library download limit.
 
-iOS file/protocol tests use the Kotlin simulator runner. WebKit is exercised by unconditional Swift XCTest cases inside the UIKit app in `ci/ios-host/`, using the assembled XCFramework. This verifies the same host lifecycle required by consuming iOS applications. CI generates that test project with XcodeGen and publishes its `.xcresult` report.
+iOS file/protocol tests use the Kotlin simulator runner. WebKit is exercised by unconditional Swift XCTest cases inside the UIKit app in `ci/ios-host/`, linked to the simulator framework. CI generates that project with XcodeGen, publishes its `.xcresult` report, and assembles the release XCFramework after the tests succeed.
+
+The [2026-11-04 live run](https://github.com/Apdelrahman1911/kmpYT/actions/runs/41902649543) reached the approved channel, but YouTube returned `AUTHORIZATION_REQUIRED` and no formats for its sampled videos. No live media was downloaded. Controlled transfer tests and this upstream access failure are reported separately; a passing offline suite does not establish live YouTube availability.
 
 YouTube's public interfaces can change or refuse resources. A listed format is not a guarantee of server access, device codec support or uninterrupted playback. Account login and bypassing protected playback are not provided. Native playback UIs remain the consuming application's responsibility.
 

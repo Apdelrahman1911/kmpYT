@@ -5,7 +5,7 @@ package dev.kmpyt
 import kotlinx.coroutines.*
 import platform.Foundation.*
 
-/** Native tests often start on main. Keep WebKit's main queue alive while its synchronous caller runs on Default. */
+/** Keep native callback queues responsive while file/mux tests run on Default. WebKit uses a separate UIKit XCTest host. */
 internal fun iosTest(seconds: Double = 60.0, block: suspend () -> Unit) {
     val lock = NSLock()
     var result: Result<Unit>? = null

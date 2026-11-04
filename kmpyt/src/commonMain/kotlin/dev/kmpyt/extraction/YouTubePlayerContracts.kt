@@ -7,9 +7,12 @@ interface YouTubeUrlTransforms {
     val signatureAvailable: Boolean
     val throttlingAvailable: Boolean
     val signatureTimestamp: Long?
+    @Throws(Exception::class)
     fun signature(input: String): String
+    @Throws(Exception::class)
     fun throttling(input: String): String
     /** Release native execution state when a cached compilation is evicted or cleared. */
+    @Throws(Exception::class)
     fun close() {}
 }
 
