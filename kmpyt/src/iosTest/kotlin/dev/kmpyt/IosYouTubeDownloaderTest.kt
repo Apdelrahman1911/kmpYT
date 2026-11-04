@@ -32,11 +32,13 @@ class IosYouTubeDownloaderTest {
                 val starts = track.segments.mapNotNull { value ->
                     val segment = value as AVAssetTrackSegment
                     segment.timeMapping.useContents {
+                        val mediaStart = CMTimeGetSeconds(source.start.readValue())
                         val mediaDuration = CMTimeGetSeconds(source.duration.readValue())
                         println("Authored ${path.substringAfterLast('/')} $type mapping: source=" +
-                            "${CMTimeGetSeconds(source.start.readValue())}/$mediaDuration, target=" +
+                            "$mediaStart/$mediaDuration, target=" +
                             "${CMTimeGetSeconds(target.start.readValue())}/${CMTimeGetSeconds(target.duration.readValue())}")
-                        if (mediaDuration.isFinite() && mediaDuration > 0) CMTimeGetSeconds(target.start.readValue()) else null
+                        if (mediaStart.isFinite() && mediaDuration.isFinite() && mediaDuration > 0)
+                            CMTimeGetSeconds(target.start.readValue()) else null
                     }
                 }
                 return requireNotNull(starts.minOrNull()) { "The authored track has no nonempty media mapping." }
