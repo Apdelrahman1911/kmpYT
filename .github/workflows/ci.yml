@@ -63,7 +63,7 @@ jobs:
           path: |
             kmpyt/build/reports/tests/
             kmpyt/build/test-results/
-            kmpyt/build/libs/*-jvm.jar
+            kmpyt/build/libs/*.jar
 
   android:
     name: Android API ${{ matrix.api }}
