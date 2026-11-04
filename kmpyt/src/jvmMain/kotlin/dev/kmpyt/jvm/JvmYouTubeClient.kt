@@ -34,5 +34,5 @@ fun createJvmYouTubeClient(ffmpegPath: String? = System.getenv("KMPYT_FFMPEG")):
     }
     val runtime = DesktopYouTubeJavaScriptRuntime()
     return YouTubeClient(KtorResearchTransport(http, maximumBytes = 8_000_000), runtime, JvmYouTubeDownloader(http, ffmpegPath),
-        onClose = { runtime.close(); http.close() }, platformName = "JVM")
+        onClose = { try { runtime.close() } finally { http.close() } }, platformName = "JVM")
 }

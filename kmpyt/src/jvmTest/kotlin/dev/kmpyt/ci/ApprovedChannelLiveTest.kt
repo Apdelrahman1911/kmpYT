@@ -6,6 +6,7 @@ import dev.kmpyt.youtube.YouTubeBrowseKind
 import dev.kmpyt.youtube.YouTubeFormatSelection
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
@@ -31,6 +32,7 @@ class ApprovedChannelLiveTest {
         var passed = false
         var failureType: String? = null
         var verifiedChannelId: String? = null
+        var stage = "channel"
         try {
             withTimeout(12 * 60_000L) {
                 val channel = client.channel("$channelUrl/videos")
@@ -40,7 +42,9 @@ class ApprovedChannelLiveTest {
                 val candidates = if (explicit != null) listOf(requireNotNull(YouTubeProvider().normalize(explicit))) else {
                     val uploads = channel.items.filter { it.kind == YouTubeBrowseKind.VIDEO }.map { it.url }
                     // Prefer short uploads when available to keep complete-download CI economical.
-                    val shorts = runCatching { client.channel("$channelUrl/shorts") }.getOrNull()
+                    val shorts = try { client.channel("$channelUrl/shorts") }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { null }
                         ?.takeIf { it.channelId == verifiedChannelId }?.items.orEmpty()
                         .filter { it.kind == YouTubeBrowseKind.VIDEO }.map { it.url }
                     (shorts + uploads).distinct().take(8)
@@ -48,8 +52,17 @@ class ApprovedChannelLiveTest {
                 assertTrue("The approved channel supplied no video candidates", candidates.isNotEmpty())
                 var completed = 0
                 for (url in candidates) {
+                    stage = "inspect:${YouTubeDownloadPolicy.videoId(url)}"
                     val report = client.inspect(url)
                     val media = report.media.singleOrNull { it.id == YouTubeDownloadPolicy.videoId(url) }
+                    events += buildJsonObject {
+                        put("videoId", YouTubeDownloadPolicy.videoId(url)); put("result", "inspection")
+                        put("mediaCount", report.media.size); put("uploaderChannelId", media?.uploaderChannelId)
+                        put("formatCount", media?.representations?.size ?: 0)
+                        put("diagnostics", JsonArray(report.diagnostics.map { it.code }
+                            .filter { it.length <= 100 && Regex("[A-Z0-9_]+").matches(it) }
+                            .distinct().map(::JsonPrimitive)))
+                    }
                     if (media == null || media.uploaderChannelId != verifiedChannelId) {
                         events += buildJsonObject { put("videoId", YouTubeDownloadPolicy.videoId(url)); put("result", "unverified-owner-no-media-request") }
                         if (explicit != null) fail("The supplied video is not a verified member of the approved channel.")
@@ -72,18 +85,22 @@ class ApprovedChannelLiveTest {
                     val selectedPlan = client.plan(report, YouTubeFormatSelection(plan.primary.id, plan.audio?.id))
                     var captionStatus = "not-provided"
                     media.captions?.tracks?.firstOrNull()?.let { track ->
+                        stage = "captions:${media.id}"
                         val document = client.captions(report, track.sourceIndex)
                         captionStatus = "loaded-${document.cues.size}-cues"
                     }
                     val destination = File(directory, "${media.id}.mp4")
                     val started = System.nanoTime()
                     var initialTotal: Long? = null
+                    var progressSeen = false
+                    stage = "download:${media.id}"
                     val result = client.download(selectedPlan, destination.absolutePath) { progress ->
-                        if (initialTotal == null) initialTotal = progress.totalBytes
+                        if (!progressSeen) { initialTotal = progress.totalBytes; progressSeen = true }
                         check(progress.bytesDownloaded <= byteBudget) { "The CI media-byte budget was exceeded." }
                     }
                     assertTrue(destination.isFile && result.bytesWritten == destination.length())
                     assertEquals(TransferPlanning.totalBytes(selectedPlan), initialTotal)
+                    stage = "verify-saved-media:${media.id}"
                     val packetReport = inspectSavedFile(destination)
                     val streams = packetReport.getValue("streams").jsonArray.map { it.jsonObject }
                     assertTrue(streams.any { it["codec_type"]?.jsonPrimitive?.content == "video" })
@@ -110,12 +127,13 @@ class ApprovedChannelLiveTest {
         } catch (failure: Throwable) {
             failureType = failure.javaClass.simpleName
             // Do not expose source response bodies, signed URLs or subprocess output in public test logs.
-            fail("Approved-channel live test failed ($failureType). See the redacted result artifact.")
+            fail("Approved-channel live test failed at $stage ($failureType). See the redacted result artifact.")
         } finally {
             client.close()
             File(reportDirectory, "approved-channel.json").writeText(buildJsonObject {
                 put("approvedChannel", channelUrl); put("resolvedChannelId", verifiedChannelId)
                 put("passed", passed); put("failureType", failureType); put("signedUrlsRecorded", false)
+                put("stage", stage)
                 put("events", JsonArray(events))
             }.toString())
             directory.deleteRecursively()

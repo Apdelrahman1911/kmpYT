@@ -42,11 +42,13 @@ try {
 }
 ```
 
-Call these suspending methods from a coroutine. Reuse a client to benefit from its player cache, then close it when its owner ends. Desktop execution requires Node.js 22 and Chrome/Chromium or Edge; set `KMPYT_NODE` and `KMPYT_CHROMIUM` for nonstandard locations. Pass an FFmpeg executable path when combining separate tracks. Inspect `report.media` to present all formats; `search`, `channel`, `playlist`, `more` and `captions` expose browsing and subtitle data.
+Call these suspending methods from a coroutine. Reuse a client to benefit from its player cache, then close it when its owner ends. Desktop execution requires Node.js 22 and Chrome/Chromium or Edge; set `KMPYT_NODE` and `KMPYT_CHROMIUM` for nonstandard locations. Pass an FFmpeg executable path when combining separate tracks.
+
+Inspect `report.media` to present formats. When a response supplies HLS/DASH catalogues, call `expandFormats(report)` before selecting their tracks; this fetches manifest metadata only. `playbackPlan(report, selection)` provides portable progressive/SABR source contracts. `search`, `channel`, `playlist`, `more` and `captions` expose browsing and subtitle data. Swift callers use `try await` for suspending operations and handle exported errors with `do`/`catch`.
 
 ## Current limitations
 
-iOS transfers restart after cancellation or failure; persistent cross-call resume is currently available on Android and desktop. Native media combining only accepts compatible codec/container pairs and does not transcode. Android timing around B-frames and AAC priming remains device dependent. The library supplies playback plans and caption cues; the host app provides its player, subtitle controls and account pages.
+iOS transfers restart after cancellation or failure; persistent cross-call resume is currently available on Android and desktop. Native media combining only accepts compatible codec/container pairs and does not transcode. iOS segmented transfers require static fragmented MP4. Live/encrypted and nested multivariant manifest downloads are unsupported. Android timing around B-frames and AAC priming remains device dependent. The library supplies playback plans and caption cues; the host app provides its player, subtitle controls and account pages.
 
 ## Validation
 

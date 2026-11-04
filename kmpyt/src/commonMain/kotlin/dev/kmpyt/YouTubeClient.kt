@@ -22,7 +22,7 @@ import kotlin.coroutines.CoroutineContext
  * Native JavaScript executes off the caller's UI thread. Call [close] to release owned resources.
  *
  * Swift callers use `try await` for suspending operations (for example,
- * `let report = try await client.inspect(url: url)`) and `try` for [select].
+ * `let report = try await client.inspect(url: url)`) and `try` for [select] or [playbackPlan].
  * Handle the exported NSError in `do`/`catch`, including cancellation and unavailable
  * formats. Close with `try await client.close()` after operations finish; do not close
  * from an active download's progress callback.
@@ -79,6 +79,19 @@ class YouTubeClient(
         browse.open(url)
     }
 
+    /**
+     * Expands up to eight source-declared HLS/DASH catalogues into at most 1,024 formats.
+     * Only manifest text is fetched. IDs are scoped to the original catalogue; repeated
+     * calls on the returned report do not refetch it. Select from this returned report,
+     * then [plan] resolves only the chosen HLS child playlists. Live/encrypted manifests
+     * and nested multivariant playlists remain unsupported.
+     */
+    @Throws(Exception::class)
+    suspend fun expandFormats(report: ExtractionReport,
+        mediaId: String = report.media.single().id): ExtractionReport = operation {
+        expandFormatsInternal(report, mediaId)
+    }
+
     /** Prefers a usable progressive pair; returned IDs always belong to this exact report. */
     @Throws(Exception::class)
     fun select(report: ExtractionReport, maxHeight: Int? = 1080, audioOnly: Boolean = false,
@@ -86,6 +99,17 @@ class YouTubeClient(
         val media = requireMedia(report, mediaId)
         return if (audioOnly) YouTubeFormatSelection.choose(media, platformName, maxHeight, audioOnly = true)
             else YouTubeFormatSelection.recommendedDownload(media, platformName, maxHeight = maxHeight)
+    }
+
+    /** Creates a portable progressive/static-SABR request; the host supplies the actual player. */
+    @Throws(Exception::class)
+    fun playbackPlan(report: ExtractionReport, selection: YouTubeFormatSelection,
+        mediaId: String = report.media.single().id): SourcePlaybackRequest {
+        requireMedia(report, mediaId)
+        val request = SourcePlaybackRequest.fromReport(report, mediaId, selection.primaryId, selection.audioId)
+        YouTubeFormatCapabilities.playbackProblem(request.plan.primary, request.plan.audio, platformName)
+            ?.let { throw IllegalArgumentException(it) }
+        return request
     }
 
     /** Resolves selected manifests only; no media transfer begins until [download] is called. */
@@ -99,11 +123,7 @@ class YouTubeClient(
     suspend fun captions(report: ExtractionReport, sourceIndex: Int, translationLanguage: String? = null,
         mediaId: String = report.media.single().id): YouTubeCaptionDocument = operation {
         requireMedia(report, mediaId)
-        captionService.register(report, mediaId)
-        captionService.select(mediaId, sourceIndex, translationLanguage)
-        val state = requireNotNull(captionService.state.value.videos[mediaId])
-        check(state.error == null) { state.error.orEmpty() }
-        requireNotNull(state.document) { "This subtitle track returned no document." }
+        captionService.loadSelected(report, mediaId, sourceIndex, translationLanguage)
     }
 
     @Throws(Exception::class)
@@ -120,10 +140,14 @@ class YouTubeClient(
     @Throws(Exception::class)
     suspend fun refresh(plan: PlannedDownload): PlannedDownload = operation {
         validatePlan(plan)
-        val report = inspector.inspect(plan.inspectionUrl, Clock.System.now().toEpochMilliseconds())
+        val inspected = inspector.inspect(plan.inspectionUrl, Clock.System.now().toEpochMilliseconds())
+        val catalogues = listOfNotNull(plan.primary, plan.audio).filter { it.manifestUrl != null && MANIFEST_ID in it.id }
+            .map { it.id.substringBefore(MANIFEST_ID) }.toSet()
+        val report = if (catalogues.isEmpty()) inspected else expandFormatsInternal(inspected, plan.mediaId, catalogues)
         val media = requireMedia(report, plan.mediaId)
         suspend fun replacement(previous: Representation): Representation {
-            val offered = if (previous.transport == TransportKind.PROGRESSIVE)
+            val offered = if (previous.transport == TransportKind.PROGRESSIVE &&
+                !(previous.manifestUrl != null && MANIFEST_ID !in previous.id))
                 refreshedProgressiveRepresentation(previous, media.representations)
             else requireNotNull(media.representations.singleOrNull { it.id == previous.id }) {
                 "The original selected format is no longer available. Inspect and select again."
@@ -221,26 +245,83 @@ class YouTubeClient(
         repeat(3) {
             val url = current.requireResourceUrl()
             require(visited.add(url)) { "The manifest repeats a previously requested resource." }
-            UrlPolicy.validate(url)?.let { throw IllegalArgumentException(it) }
-            YouTubeDownloadPolicy.requireResource(url, source, mediaId)
-            val response = transport.execute(ResearchRequest("GET", url, stage = "selected-manifest"))
-            require(response.url == url && response.status in 200..299) { "The selected manifest was not available at its declared URL." }
-            val parsed = (if (current.transport == TransportKind.HLS) HlsParser else DashParser).parse(url, response.body)
+            val parsed = readManifest(current, source, mediaId)
             val concrete = requireNotNull(parsed.representations.singleOrNull()) {
-                "Select a concrete media playlist or track before downloading."
+                "Call expandFormats and select a concrete media playlist or track before downloading."
             }
             require(concrete.selectable) { concrete.unavailableReason ?: "The selected manifest is unavailable." }
-            current = concrete.copy(id = original.id, role = original.role,
-                codecs = original.codecs ?: concrete.codecs, width = original.width ?: concrete.width,
-                height = original.height ?: concrete.height, audioGroupId = original.audioGroupId ?: concrete.audioGroupId,
-                audioTrackId = original.audioTrackId ?: concrete.audioTrackId,
-                audioLanguage = original.audioLanguage ?: concrete.audioLanguage,
-                frameRate = original.frameRate ?: concrete.frameRate,
-                sizeBytes = concrete.sizeBytes ?: original.sizeBytes,
-                durationMs = concrete.durationMs ?: original.durationMs,
-                expiresAtEpochMs = original.expiresAtEpochMs ?: concrete.expiresAtEpochMs)
+            val generic = current.manifestUrl == null && current.mimeType.substringBefore(';').lowercase() in MANIFEST_MIMES
+            current = concrete.copy(id = original.id, role = if (generic) concrete.role else current.role,
+                mimeType = if (!generic && current.role == TrackRole.AUDIO && concrete.role == TrackRole.MUXED &&
+                    concrete.mimeType == "video/mp4") "audio/mp4" else concrete.mimeType,
+                codecs = current.codecs ?: concrete.codecs, width = current.width ?: concrete.width,
+                height = current.height ?: concrete.height, audioGroupId = current.audioGroupId ?: concrete.audioGroupId,
+                audioTrackId = current.audioTrackId ?: concrete.audioTrackId,
+                audioLanguage = current.audioLanguage ?: concrete.audioLanguage,
+                audioDisplayName = current.audioDisplayName ?: concrete.audioDisplayName,
+                audioIsDefault = current.audioIsDefault ?: concrete.audioIsDefault,
+                frameRate = current.frameRate ?: concrete.frameRate,
+                sizeBytes = concrete.sizeBytes ?: current.sizeBytes,
+                durationMs = concrete.durationMs ?: current.durationMs,
+                expiresAtEpochMs = current.expiresAtEpochMs ?: concrete.expiresAtEpochMs)
             if (current.segments.isNotEmpty() || current.transport == TransportKind.PROGRESSIVE) return current
         }
         throw IllegalArgumentException("The selected manifest exceeded the resolution depth limit.")
+    }
+
+    private suspend fun readManifest(representation: Representation, source: String, mediaId: String): ManifestResult {
+        val url = representation.requireResourceUrl()
+        UrlPolicy.validate(url)?.let { throw IllegalArgumentException(it) }
+        YouTubeDownloadPolicy.requireResource(url, source, mediaId)
+        val response = transport.execute(ResearchRequest("GET", url, stage = "selected-manifest"))
+        require(response.url == url && response.status in 200..299) { "The selected manifest was not available at its declared URL." }
+        val result = (if (representation.transport == TransportKind.HLS) HlsParser else DashParser).parse(url, response.body)
+        require(result.representations.isNotEmpty()) {
+            result.diagnostics.firstOrNull()?.message ?: "The manifest did not provide supported formats."
+        }
+        return result
+    }
+
+    private suspend fun expandFormatsInternal(report: ExtractionReport, mediaId: String,
+        catalogueIds: Set<String>? = null): ExtractionReport {
+        val media = requireMedia(report, mediaId)
+        val catalogues = media.representations.filter { it.selectable && it.manifestUrl == null &&
+            it.transport in setOf(TransportKind.HLS, TransportKind.DASH) && it.segments.isEmpty() &&
+            (catalogueIds == null || it.id in catalogueIds) }
+        if (catalogues.isEmpty()) return report
+        require(catalogues.size <= 8) { "The report exceeds the manifest catalogue request limit." }
+        val replacements = mutableMapOf<String, List<Representation>>()
+        val diagnostics = mutableListOf<ExtractionDiagnostic>()
+        val requests = mutableListOf<ResearchRequest>()
+        val fetched = mutableMapOf<Pair<TransportKind, String>, ManifestResult>()
+        for (catalogue in catalogues) {
+            val url = catalogue.requireResourceUrl()
+            val key = catalogue.transport to url
+            val parsed = fetched[key] ?: readManifest(catalogue, report.input, mediaId).also {
+                fetched[key] = it
+                requests += ResearchRequest("GET", ResearchRedaction.url(url), stage = "selected-manifest")
+                diagnostics += it.diagnostics
+            }
+            replacements[catalogue.id] = parsed.representations.map { child ->
+                require(child.id.length in 1..512) { "A manifest format identifier exceeds the supported length." }
+                child.copy(id = "${catalogue.id}$MANIFEST_ID${child.role.name.lowercase()}:${child.id}",
+                    durationMs = child.durationMs ?: catalogue.durationMs,
+                    expiresAtEpochMs = child.expiresAtEpochMs ?: catalogue.expiresAtEpochMs,
+                    manifestUrl = url)
+            }
+        }
+        val expanded = media.representations.flatMap { replacements[it.id] ?: listOf(it) }
+        require(expanded.size <= 1024 && expanded.map { it.id }.distinct().size == expanded.size) {
+            "The expanded catalogue has excessive or ambiguous format identities."
+        }
+        return report.copy(media = report.media.map { if (it.id == mediaId) it.copy(representations = expanded) else it },
+            diagnostics = report.diagnostics + diagnostics + ExtractionDiagnostic("youtube-manifests", "MANIFEST_FORMATS_EXPANDED",
+                "Expanded ${catalogues.size} source catalogues into ${expanded.size} formats without requesting media bytes."),
+            requestPlan = report.requestPlan + requests)
+    }
+
+    private companion object {
+        const val MANIFEST_ID = "#manifest:"
+        val MANIFEST_MIMES = setOf("application/dash+xml", "application/vnd.apple.mpegurl", "application/x-mpegurl")
     }
 }

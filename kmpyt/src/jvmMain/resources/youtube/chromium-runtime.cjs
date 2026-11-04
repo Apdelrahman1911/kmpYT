@@ -7,9 +7,15 @@ const { spawn } = require('node:child_process');
 const readline = require('node:readline');
 let browser, socket, session, profile, counter = 0, pending = new Map();
 const offlineDocument = 'https://kmpyt.invalid/player-offline';
-const offlineHtml = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\' \'unsafe-eval\'; connect-src \'none\'"><title>ClearMedia offline player context</title>';
+const offlineHtml = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\' \'unsafe-eval\'; connect-src \'none\'"><title>kmpYT offline player context</title>';
 const output = value => process.stdout.write(JSON.stringify(value) + '\n');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+function ownedProfile() {
+  try {
+    return profile && path.basename(profile).startsWith('kmpyt-player-') &&
+      fs.realpathSync(path.dirname(profile)) === fs.realpathSync(os.tmpdir());
+  } catch (_) { return false; }
+}
 async function request(method, params = {}, sessionId) {
   const id = ++counter;
   return new Promise((resolve, reject) => {
@@ -18,8 +24,11 @@ async function request(method, params = {}, sessionId) {
     socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
   });
 }
-async function start(executable) {
-  profile = fs.mkdtempSync(path.join(os.tmpdir(), 'kmpyt-player-'));
+async function start(executable, suppliedProfile) {
+  if (typeof suppliedProfile !== 'string') throw new Error('profile');
+  profile = path.resolve(suppliedProfile);
+  if (!ownedProfile() ||
+      !fs.statSync(profile).isDirectory() || fs.readdirSync(profile).length !== 0) throw new Error('profile');
   browser = spawn(executable, [
     '--headless=new', '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
     '--user-data-dir=' + profile, '--no-first-run', '--no-default-browser-check',
@@ -102,7 +111,7 @@ async function close() {
     await delay(200);
     if (browser.exitCode === null) browser.kill();
   }
-  if (profile && path.dirname(profile) === os.tmpdir() && path.basename(profile).startsWith('kmpyt-player-')) {
+  if (ownedProfile()) {
     try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch (_) {}
   }
 }
@@ -114,7 +123,7 @@ lines.on('line', line => {
       const command = JSON.parse(line);
       if (command.action === 'prepare') {
         if (browser || typeof command.program !== 'string' || command.program.length > 5200000) throw new Error('input');
-        await start(command.executable);
+        await start(command.executable, command.profile);
         await evaluate(command.program);
         const capabilities = await evaluate('JSON.stringify(globalThis.__kmpyt_capabilities)');
         output({ ok: true, capabilities: JSON.parse(capabilities) });

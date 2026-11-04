@@ -50,14 +50,14 @@ object YouTubeFormatCapabilities {
         return null
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun playbackProblem(primary: Representation, audio: Representation?, platformName: String): String? {
-        if (!isAndroid(platformName)) return "Source playback is available on Android. Download this format to play the saved file."
-        // Source playback keeps tracks separate; it does not inherit the MP4 muxer's codec restriction.
+        // A portable source plan keeps tracks separate. The consuming native player validates device codecs.
         pairingProblem(primary, audio)?.let { return it }
         val tracks = listOfNotNull(primary, audio)
         if (!(tracks.all { it.transport == TransportKind.SABR } || tracks.all { it.transport == TransportKind.PROGRESSIVE }) ||
             tracks.any { it.segments.isNotEmpty() || it.initialization != null })
-            return "Source playback supports static SABR or progressive media. Download this format to play the saved file."
+            return "Portable source playback plans support static SABR or progressive media. Resolve other transports for download."
         return null
     }
 

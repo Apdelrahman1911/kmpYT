@@ -4,6 +4,12 @@ import dev.kmpyt.extraction.*
 import kotlin.test.*
 
 class YouTubeFormatCapabilitiesTest {
+    @Test fun portablePlaybackPlanningIsAvailableAcrossNativePlatformsWithoutClaimingDeviceCodecSupport() {
+        for (platform in listOf("Android", "JVM", "iOS")) {
+            assertNull(YouTubeFormatCapabilities.playbackProblem(video, audio, platform))
+            assertNotNull(YouTubeFormatCapabilities.playbackProblem(video.copy(transport = TransportKind.HLS), audio, platform))
+        }
+    }
     private val video = Representation("137", "https://rr1.googlevideo.com/video", TrackRole.VIDEO,
         mimeType = "video/mp4", codecs = "avc1.640028", height = 1080, sizeBytes = 10_000)
     private val audio = Representation("140", "https://rr1.googlevideo.com/audio", TrackRole.AUDIO,

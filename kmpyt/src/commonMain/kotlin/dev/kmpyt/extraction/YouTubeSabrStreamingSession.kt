@@ -16,6 +16,7 @@ data class SourcePlaybackMetadata(val id: String, val title: String, val kind: M
 data class SourcePlaybackRequest(val metadata: SourcePlaybackMetadata, val plan: PlannedDownload,
     val progressiveFallback: PlannedDownload? = null) {
     override fun toString() = "SourcePlaybackRequest(id=${metadata.id}, kind=${metadata.kind}, resource=redacted)"
+    @Throws(Exception::class)
     fun requireSupportedSource() {
         TransferPlanning.parts(plan) // Shared URL, approved-source and representation-boundary checks also apply to playback.
         require(metadata.id == plan.mediaId)
@@ -46,6 +47,7 @@ data class SourcePlaybackRequest(val metadata: SourcePlaybackMetadata, val plan:
         }
     }
 
+    @Throws(Exception::class)
     fun requireStaticSabr() {
         requireSupportedSource()
         require(metadata.id == plan.sabrSource().videoId)
@@ -56,6 +58,7 @@ data class SourcePlaybackRequest(val metadata: SourcePlaybackMetadata, val plan:
 
     companion object {
         /** Select source-backed identities only; inspection does not itself authorize playback. */
+        @Throws(Exception::class)
         fun fromReport(report: ExtractionReport, mediaId: String, primaryId: String, audioId: String? = null): SourcePlaybackRequest {
             require(report.provider == ProviderId.YOUTUBE)
             val media = report.media.single { it.id == mediaId && it.provider == ProviderId.YOUTUBE }
@@ -90,7 +93,10 @@ data class SourcePlaybackRequest(val metadata: SourcePlaybackMetadata, val plan:
     }
 }
 
-interface SourcePlaybackController { suspend fun playSource(request: SourcePlaybackRequest) }
+interface SourcePlaybackController {
+    @Throws(Exception::class)
+    suspend fun playSource(request: SourcePlaybackRequest)
+}
 
 /** An actual caller authorization contract, rechecked before every transport request. No default grant exists. */
 fun interface SourcePlaybackAuthorization {

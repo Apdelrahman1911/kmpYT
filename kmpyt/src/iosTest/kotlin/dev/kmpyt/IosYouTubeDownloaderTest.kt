@@ -6,6 +6,8 @@ import dev.kmpyt.extraction.*
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.*
 import io.ktor.http.*
+import kotlinx.cinterop.readValue
+import kotlinx.cinterop.useContents
 import kotlinx.coroutines.CancellationException
 import platform.AVFoundation.*
 import platform.CoreMedia.CMTimeGetSeconds
@@ -13,6 +15,95 @@ import platform.Foundation.*
 import kotlin.test.*
 
 class IosYouTubeDownloaderTest {
+    @Test fun passthroughMuxPreservesAuthoredRelativeAudioDelay() = iosTest {
+        inIosTestDirectory { directory ->
+            suspend fun store(name: String, bytes: ByteArray): String {
+                val file = IosMediaFile("$directory/$name")
+                try { file.write(0, bytes); file.flush() } finally { file.close() }
+                return file.path
+            }
+            val video = store("video.mp4", IosAuthoredMedia.video)
+            val audio = store("audio.m4a", IosAuthoredMedia.delayedAudio)
+            fun start(path: String, type: String): Double {
+                val track = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(path), options = null)
+                    .tracksWithMediaType(type).first() as AVAssetTrack
+                return CMTimeGetSeconds(track.timeRange.useContents { start.readValue() })
+            }
+            val originalGap = start(audio, requireNotNull(AVMediaTypeAudio)) - start(video, requireNotNull(AVMediaTypeVideo))
+            assertTrue(originalGap > 0.15, "The authored fixture must contain a real audio timeline delay: $originalGap")
+            val output = "$directory/combined.mp4"
+            IosMediaMuxer.mux(video, TrackRole.VIDEO, audio, output)
+            val actualGap = start(output, requireNotNull(AVMediaTypeAudio)) - start(output, requireNotNull(AVMediaTypeVideo))
+            assertEquals(originalGap, actualGap, 0.005, "MP4 muxing must retain the relative A/V start offset.")
+        }
+    }
+
+    @Test fun manifestResponsesAndContradictoryRangeTotalsAreRejectedBeforePublication() = iosTest {
+        inIosTestDirectory { directory ->
+            for (type in listOf("application/xml", "application/vnd.apple.mpegurl", "audio/x-mpegurl")) {
+                val http = HttpClient(MockEngine {
+                    respond(IosAuthoredMedia.video, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, type))
+                }) { followRedirects = false }
+                try {
+                    assertFailsWith<IllegalStateException> {
+                        IosYouTubeDownloader(http).download(plan(IosAuthoredMedia.video.size.toLong(), null), "$directory/rejected.mp4") {}
+                    }
+                    assertTrue(children(directory).isEmpty())
+                } finally { http.close() }
+            }
+            val bytes = IosAuthoredMedia.video
+            val http = HttpClient(MockEngine {
+                respond(bytes, HttpStatusCode.PartialContent, headersOf(
+                    HttpHeaders.ContentType to listOf("video/mp4"),
+                    HttpHeaders.ContentRange to listOf("bytes 0-${bytes.size - 1}/${bytes.size - 1}")))
+            }) { followRedirects = false }
+            try {
+                val selected = plan(bytes.size.toLong(), null)
+                val range = SegmentResource(selected.primary.url!!, rangeStart = 0, rangeLength = bytes.size.toLong())
+                assertFailsWith<IllegalStateException> {
+                    IosYouTubeDownloader(http).download(selected.copy(primary = selected.primary.copy(segments = listOf(range))),
+                        "$directory/invalid-range.mp4") {}
+                }
+                assertTrue(children(directory).isEmpty())
+            } finally { http.close() }
+        }
+    }
+
+    @Test fun actualUmpFramesCommitThroughNativeSabrSinkBeforePublication() = iosTest {
+        inIosTestDirectory { directory ->
+            val bytes = IosAuthoredMedia.video
+            val id = SabrFormatId(136, 1uL, "authored")
+            fun number(tag: Int, value: Long) = SabrWireField(tag, SabrWireValue.Varint(value.toULong()))
+            fun binary(tag: Int, value: ByteArray) = SabrWireField(tag, SabrWireValue.Bytes(value))
+            val header = YouTubeProtobufWire.encode(listOf(number(1, 1), binary(2, "AUTHORED001".encodeToByteArray()),
+                number(6, 0), number(8, 0), number(9, 0), number(11, 0), number(12, 600),
+                binary(13, YouTubeSabrProtocol.encodeFormatId(id)), number(14, bytes.size.toLong())))
+            val response = YouTubeUmpFraming.encodePart(20, header) +
+                YouTubeUmpFraming.encodePart(21, byteArrayOf(1) + bytes) + YouTubeUmpFraming.encodePart(22, byteArrayOf(1))
+            var requests = 0
+            val http = HttpClient(MockEngine { request ->
+                requests++
+                assertEquals(HttpMethod.Post, request.method)
+                respond(response, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/vnd.yt-ump"))
+            }) { followRedirects = false }
+            try {
+                val original = plan(bytes.size.toLong(), null)
+                val source = YouTubeSabrResource(original.mediaId, "https://fixture.invalid/sabr", "AQID", id, SabrClientInfo(1, "authored"))
+                val selected = original.copy(primary = original.primary.copy(url = source.endpoint,
+                    transport = TransportKind.SABR, sabr = source))
+                val updates = mutableListOf<YouTubeDownloadProgress>()
+                val result = IosYouTubeDownloader(http).download(selected, "$directory/sabr.mp4") { updates += it }
+                assertEquals(1, requests)
+                assertEquals(bytes.size.toLong(), result.bytesWritten)
+                assertEquals(bytes.size.toLong(), updates.first().totalBytes)
+                assertEquals(0L, updates.first().bytesDownloaded)
+                val asset = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(result.destinationPath), options = null)
+                assertEquals(1, asset.tracksWithMediaType(AVMediaTypeVideo).size)
+                assertEquals(listOf("sabr.mp4"), children(directory))
+            } finally { http.close() }
+        }
+    }
+
     @Test fun downloadsExactAvcAndAacThenAvFoundationExportsBothTracks() = iosTest {
         inIosTestDirectory { directory ->
             val video = IosAuthoredMedia.video

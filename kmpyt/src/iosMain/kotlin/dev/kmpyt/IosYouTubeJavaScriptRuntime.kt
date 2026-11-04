@@ -22,7 +22,9 @@ class IosYouTubeJavaScriptRuntime @Throws(Exception::class) constructor(private 
         val ready = IosRuntimeResult<IosJavaScriptSession>()
         val session = IosJavaScriptSession(timeoutSeconds)
         onMain {
-            WKContentRuleListStore.defaultStore().compileContentRuleListForIdentifier(
+            val ruleStore = WKContentRuleListStore.defaultStore()
+            if (ruleStore == null) { ready.fail("NETWORK_BLOCKER_UNAVAILABLE"); return@onMain }
+            ruleStore.compileContentRuleListForIdentifier(
                 "dev.kmpyt.offline.v1", OFFLINE_RULES,
             ) { rules, error ->
                 if (error != null || rules == null) ready.fail("NETWORK_BLOCKER_UNAVAILABLE")

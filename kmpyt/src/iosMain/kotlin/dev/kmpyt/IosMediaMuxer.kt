@@ -16,23 +16,31 @@ internal object IosMediaMuxer {
         currentCoroutineContext().ensureActive()
         require(!NSFileManager.defaultManager.fileExistsAtPath(outputPath)) { "The mux destination already exists." }
         val composition = AVMutableComposition.composition()
-        fun add(path: String, mediaType: String) {
+        val selected = mutableListOf<Pair<AVAssetTrack, String>>()
+        fun select(path: String, mediaType: String) {
             val asset = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(path), options = null)
             val tracks = asset.tracksWithMediaType(mediaType)
             val source = tracks.firstOrNull() as? AVAssetTrack
                 ?: error("The downloaded file does not contain the selected ${if (mediaType == AVMediaTypeVideo) "video" else "audio"} track.")
             val duration = CMTimeGetSeconds(source.timeRange.useContents { duration.readValue() })
             check(duration.isFinite() && duration > 0) { "The downloaded track has no valid media duration." }
+            selected += source to mediaType
+        }
+        if (primaryRole != TrackRole.AUDIO) select(primaryPath, requireNotNull(AVMediaTypeVideo))
+        if (primaryRole != TrackRole.VIDEO) select(primaryPath, requireNotNull(AVMediaTypeAudio))
+        audioPath?.let { select(it, requireNotNull(AVMediaTypeAudio)) }
+        // One origin for the selection preserves relative audio/video offsets and edit-list gaps.
+        val origin = selected.map { it.first.timeRange.useContents { start.readValue() } }
+            .reduce { earliest, time -> if (CMTimeCompare(time, earliest) < 0) time else earliest }
+        selected.forEach { (source, mediaType) ->
             val destination = composition.addMutableTrackWithMediaType(mediaType, preferredTrackID = kCMPersistentTrackID_Invalid)
                 ?: error("AVFoundation could not create the selected track.")
-            check(destination.insertTimeRange(source.timeRange, ofTrack = source, atTime = kCMTimeZero, error = null)) {
+            val offset = CMTimeSubtract(source.timeRange.useContents { start.readValue() }, origin)
+            check(destination.insertTimeRange(source.timeRange, ofTrack = source, atTime = offset, error = null)) {
                 "AVFoundation could not read the downloaded track for MP4 muxing."
             }
             if (mediaType == AVMediaTypeVideo) destination.preferredTransform = source.preferredTransform
         }
-        if (primaryRole != TrackRole.AUDIO) add(primaryPath, requireNotNull(AVMediaTypeVideo))
-        if (primaryRole != TrackRole.VIDEO) add(primaryPath, requireNotNull(AVMediaTypeAudio))
-        audioPath?.let { add(it, requireNotNull(AVMediaTypeAudio)) }
         val exporter = AVAssetExportSession(asset = composition, presetName = AVAssetExportPresetPassthrough)
         check(exporter.supportedFileTypes.contains(AVFileTypeMPEG4)) { "The selected tracks cannot be combined into MP4 on this device." }
         exporter.outputURL = NSURL.fileURLWithPath(outputPath)
@@ -43,7 +51,7 @@ internal object IosMediaMuxer {
         try {
             finished.await()
             currentCoroutineContext().ensureActive()
-            check(exporter.status == AVAssetExportSessionStatus.AVAssetExportSessionStatusCompleted) {
+            check(exporter.status == AVAssetExportSessionStatusCompleted) {
                 "AVFoundation could not combine the downloaded media into MP4 (code ${exporter.error?.code ?: 0})."
             }
             val output = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(outputPath), options = null)

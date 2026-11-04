@@ -30,7 +30,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
         require(input.credentialRef == null) { "This adapter supports anonymous inspected resources; account credentials are not accepted." }
         YouTubeFormatCapabilities.downloadProblem(input.primary, input.audio, platformName)?.let { error(it) }
         val destination = File(destinationPath).canonicalFile
-        val key = destination.path.let { if (System.getProperty("os.name").startsWith("Windows", true)) it.lowercase(Locale.ROOT) else it }
+        val key = destination.path.let { if (System.getProperty("os.name").orEmpty().startsWith("Windows", true)) it.lowercase(Locale.ROOT) else it }
         check(activeDestinations.putIfAbsent(key, true) == null) { "Another download is using this destination." }
         try {
             require(!destination.exists()) { "The destination already exists; choose another file." }

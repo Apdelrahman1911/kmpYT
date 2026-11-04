@@ -158,4 +158,21 @@ class YouTubeClientTest {
             assertTrue(failure.message.orEmpty().startsWith("iOS"))
         } finally { client.close() }
     }
+
+    @Test fun portablePlaybackPlanKeepsSourceTracksAndDoesNotStartANativePlayerOrDownload() = runTest {
+        for (platform in listOf("Android", "JVM", "iOS")) {
+            val client = YouTubeClient(ResearchTransport { error("Playback planning must not request media") },
+                downloader = YouTubeDownloader { _, _, _ -> error("Playback planning must not download") },
+                platformName = platform)
+            try {
+                val request = client.playbackPlan(report(video, audio), YouTubeFormatSelection(video.id, audio.id))
+                assertEquals(video, request.plan.primary)
+                assertEquals(audio, request.plan.audio)
+                assertEquals(id, request.metadata.id)
+                assertFailsWith<IllegalArgumentException> {
+                    client.playbackPlan(report(video.copy(transport = TransportKind.HLS)), YouTubeFormatSelection(video.id))
+                }
+            } finally { client.close() }
+        }
+    }
 }

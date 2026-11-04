@@ -35,4 +35,3 @@ class KtorResearchTransport(private val client: HttpClient, private val maximumB
         }
     }
 }
-

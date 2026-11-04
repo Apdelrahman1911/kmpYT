@@ -68,8 +68,23 @@ class PublicYouTubeCaptionService(private val transport: ResearchTransport,
     }
 
     override suspend fun select(videoId: String, sourceIndex: Int, translationLanguage: String?) {
+        selectResult(videoId, sourceIndex, translationLanguage)
+    }
+
+    /** Returns this request's document even if a later selection now owns the observable state. */
+    internal suspend fun loadSelected(report: ExtractionReport, videoId: String, sourceIndex: Int,
+        translationLanguage: String?): YouTubeCaptionDocument {
+        register(report, videoId)
+        val catalogue = requireNotNull(report.media.single { it.id == videoId }.captions) {
+            "This video did not provide subtitle tracks."
+        }
+        return selectResult(videoId, sourceIndex, translationLanguage, catalogue).getOrThrow()
+    }
+
+    private suspend fun selectResult(videoId: String, sourceIndex: Int, translationLanguage: String?,
+        requestedCatalogue: YouTubeCaptionCatalogue? = null): Result<YouTubeCaptionDocument> {
         val existing = requireNotNull(state.value.videos[videoId]) { "Inspect this video to choose subtitles." }
-        val catalogue = requireNotNull(existing.catalogue) { "This video did not provide subtitle tracks." }
+        val catalogue = requestedCatalogue ?: requireNotNull(existing.catalogue) { "This video did not provide subtitle tracks." }
         val track = catalogue.tracks.singleOrNull { it.sourceIndex == sourceIndex }
             ?: throw IllegalArgumentException("Choose a subtitle track from this video.")
         requirePublicTrack(track, videoId)
@@ -91,8 +106,8 @@ class PublicYouTubeCaptionService(private val transport: ResearchTransport,
                 enabled = true, loading = old.cached[selection] == null, error = null, revision = old.revision + 1)
             current.withVideo(started)
         }
-        if (started.document != null) { persist(videoId); return }
-        try {
+        started.document?.let { document -> persist(videoId); return Result.success(document) }
+        return try {
             val document = YouTubeCaptionClient(transport) { candidate -> candidate == requestTrack }.load(requestTrack)
             validateCaptionDocument(document)
             mutable.update { current ->
@@ -105,6 +120,9 @@ class PublicYouTubeCaptionService(private val transport: ResearchTransport,
                 }
             }
             persist(videoId)
+            if (document.cues.isEmpty()) Result.failure(IllegalStateException(
+                "This subtitle track returned no text. Inspect the video again or choose another track."))
+            else Result.success(document)
         } catch (cancelled: CancellationException) {
             mutable.update { current -> current.changeIfCurrent(videoId, started.revision) { it.copy(loading = false) } }
             throw cancelled
@@ -113,6 +131,7 @@ class PublicYouTubeCaptionService(private val transport: ResearchTransport,
             mutable.update { current -> current.changeIfCurrent(videoId, started.revision) {
                 it.copy(document = null, loading = false, error = message)
             } }
+            Result.failure(IllegalStateException(message))
         }
     }
 

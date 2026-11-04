@@ -38,7 +38,9 @@ object HlsParser : ManifestParser {
                 values["URI"]?.let { uri ->
                     audioGroups += group
                     result += Representation("hls-audio-${result.size}-$group", EmbeddedData.absolute(url, uri),
-                        TrackRole.AUDIO, TransportKind.HLS, "audio/mp4", audioGroupId = group)
+                        TrackRole.AUDIO, TransportKind.HLS, "audio/mp4", audioGroupId = group,
+                        audioLanguage = values["LANGUAGE"], audioDisplayName = values["NAME"],
+                        audioIsDefault = values["DEFAULT"]?.let { it == "YES" }, manifestUrl = url)
                 }
             }
         }
@@ -66,7 +68,8 @@ object HlsParser : ManifestParser {
                     val role = when { audioOnly -> TrackRole.AUDIO; group in audioGroups -> TrackRole.VIDEO; else -> TrackRole.MUXED }
                     result += Representation("hls-variant-${result.size}${group?.let { "-$it" }.orEmpty()}",
                         EmbeddedData.absolute(url, line), role, TransportKind.HLS,
-                        if (audioOnly) "audio/mp4" else "video/mp4", codecs, width, height, bandwidth, audioGroupId = group)
+                        if (audioOnly) "audio/mp4" else "video/mp4", codecs, width, height, bandwidth,
+                        audioGroupId = group, manifestUrl = url)
                     pending = null
                 }
             }
@@ -118,7 +121,7 @@ object HlsParser : ManifestParser {
         val audio = segments.all { it.url.substringBefore('?').substringBefore('#').substringAfterLast('.').lowercase() in setOf("aac", "m4a", "mp3") }
         return ManifestResult(listOf(Representation("hls-vod", url, if (audio) TrackRole.AUDIO else TrackRole.MUXED,
             TransportKind.HLS, if (audio) "audio/mp4" else if (initialization != null) "video/mp4" else "video/mp2t",
-            durationMs = totalMs, segments = segments, initialization = initialization)))
+            durationMs = totalMs, segments = segments, initialization = initialization, manifestUrl = url)))
     }
 
     private fun resource(url: String, text: String?, previous: SegmentResource?, duration: Long?): SegmentResource {

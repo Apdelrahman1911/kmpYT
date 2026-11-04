@@ -52,6 +52,8 @@ class DashParserTest {
         val result = parse("<AdaptationSet mimeType=\"video/mp4\"><Representation id=\"v\"><BaseURL>movie.mp4</BaseURL><SegmentBase indexRange=\"0-30\"/></Representation></AdaptationSet>")
         assertEquals("https://fixtures.example/media/movie.mp4", result.representations.single().url)
         assertTrue(result.representations.single().segments.isEmpty())
+        assertEquals(TransportKind.PROGRESSIVE, result.representations.single().transport)
+        assertEquals(url, result.representations.single().manifestUrl)
     }
 
     @Test fun protectedDynamicAndExternalEntityManifestsAreRejected() {

@@ -39,6 +39,8 @@ import kotlinx.serialization.Serializable
     val loudnessDb: Double? = null,
     val colorInfo: MediaColorInfo? = null,
     val isHdr: Boolean? = null,
+    /** Manifest that actually supplied this child track; null for an unexpanded catalogue pointer. */
+    val manifestUrl: String? = null,
 ) {
     val selectable: Boolean get() = unavailableReason == null && !url.isNullOrBlank() &&
         (transport in setOf(TransportKind.PROGRESSIVE, TransportKind.HLS, TransportKind.DASH) || transport == TransportKind.SABR && sabr != null && sizeBytes != null && sizeBytes > 0)

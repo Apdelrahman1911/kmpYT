@@ -3,6 +3,7 @@
 package dev.kmpyt
 
 import dev.kmpyt.extraction.*
+import dev.kmpyt.downloads.DownloadProtocol
 import dev.kmpyt.youtube.YouTubeFormatCapabilities
 import io.ktor.client.HttpClient
 import io.ktor.client.request.*
@@ -10,6 +11,7 @@ import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.utils.io.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
 import platform.Foundation.*
 
 /** Real Darwin streaming and AVFoundation muxing. Failed/cancelled staging files are removed; no cross-call resume yet. */
@@ -148,17 +150,21 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
                 check(response.headers[HttpHeaders.ContentEncoding].let { it == null || it.equals("identity", true) }) {
                     "Compressed media responses cannot be saved as the inspected byte stream."
                 }
-                val type = response.headers[HttpHeaders.ContentType]?.substringBefore(';')?.lowercase().orEmpty()
-                check(!type.startsWith("text/") && !type.contains("json") && !type.contains("html")) { "The media server returned a document instead of media." }
+                val type = (response.headers[HttpHeaders.ContentType] ?: part.mimeType).substringBefore(';').trim().lowercase()
+                check(!type.contains("mpegurl") && !type.contains("xml") &&
+                    (type.startsWith("video/") || type.startsWith("audio/") ||
+                        type in setOf("application/mp4", "application/ogg", "application/octet-stream"))) {
+                    "The media server returned a document or unsupported content type instead of media."
+                }
                 val length = response.headers[HttpHeaders.ContentLength]?.let { value ->
                     value.toLongOrNull()?.takeIf { it >= 0 } ?: error("The media server returned an invalid content length.")
                 }
                 val rangeLength = part.resource.rangeLength
                 if (rangeLength != null) {
-                    val actual = Regex("bytes (\\d+)-(\\d+)/(?:\\d+|\\*)").matchEntire(response.headers[HttpHeaders.ContentRange].orEmpty())
+                    val actual = DownloadProtocol.parseContentRange(response.headers[HttpHeaders.ContentRange])
                         ?: error("The media server returned an invalid byte range.")
-                    check(actual.groupValues[1].toLongOrNull() == part.resource.rangeStart &&
-                        actual.groupValues[2].toLongOrNull() == requireNotNull(part.resource.rangeStart) + rangeLength - 1 &&
+                    check(actual.first == part.resource.rangeStart &&
+                        actual.last == requireNotNull(part.resource.rangeStart) + rangeLength - 1 &&
                         (length == null || length == rangeLength)) { "The media server returned a different byte range." }
                 }
                 val total = rangeLength ?: length ?: initial.total

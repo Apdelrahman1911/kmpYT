@@ -49,9 +49,11 @@ object DashParser : ManifestParser {
                         Resources(emptyList(), null)
                     }
                 }
-                result += Representation(id, base, role, TransportKind.DASH, mime, fields["codecs"],
+                val transport = if (resources.segments.isEmpty()) TransportKind.PROGRESSIVE else TransportKind.DASH
+                result += Representation(id, base, role, transport, mime, fields["codecs"],
                     fields["width"]?.toIntOrNull(), fields["height"]?.toIntOrNull(), bandwidth,
-                    durationMs = duration, segments = resources.segments, initialization = resources.initialization)
+                    durationMs = duration, segments = resources.segments, initialization = resources.initialization,
+                    manifestUrl = url)
             }
         }
         require(result.isNotEmpty()) { "DASH has no supported representations" }
