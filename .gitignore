@@ -1,0 +1,16 @@
+.gradle/
+.kotlin/
+.konan/
+**/build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+artifacts/
+.private/
+*.private.*
+.env
+.env.*
+*.keystore
+*.jks
+*.hprof

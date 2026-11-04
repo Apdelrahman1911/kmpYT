@@ -1,0 +1,7 @@
+{
+  "channelUrl": "https://www.youtube.com/@oPiiLz",
+  "handle": "@oPiiLz",
+  "authorization": "The repository owner authorized testing videos belonging to this channel.",
+  "maximumVideosPerRun": 2,
+  "maximumDownloadBytesPerVideo": 67108864
+}

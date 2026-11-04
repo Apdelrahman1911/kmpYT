@@ -1,0 +1,1 @@
+CC0: all video/audio assets in this directory are generated from FFmpeg testsrc2 and sine sources. No platform content or Snaptube code/assets are included. Captures are independently authored test response documents, not live platform responses.
