@@ -55,7 +55,7 @@ jobs:
           "KMPYT_FFMPEG=$mediaTool" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Verify shared and desktop code
         shell: bash
-        run: ./gradlew :kmpyt:jvmTest --stacktrace
+        run: ./gradlew :kmpyt:jvmTest :kmpyt:jvmJar --stacktrace
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -63,6 +63,7 @@ jobs:
           path: |
             kmpyt/build/reports/tests/
             kmpyt/build/test-results/
+            kmpyt/build/libs/*-jvm.jar
 
   android:
     name: Android API ${{ matrix.api }}
@@ -152,6 +153,14 @@ jobs:
           xcrun simctl bootstatus "$IOS_DEVICE" -b
       - name: Test native iOS protocols and media processing
         run: ./gradlew ":kmpyt:$IOS_TEST_TASK" "-PiosSimulatorDevice=$IOS_DEVICE" --stacktrace
+      - name: Upload native test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-native-test-reports
+          path: |
+            kmpyt/build/reports/tests/
+            kmpyt/build/test-results/
       - name: Build the simulator framework for hosted tests
         id: framework
         if: always() && !cancelled()

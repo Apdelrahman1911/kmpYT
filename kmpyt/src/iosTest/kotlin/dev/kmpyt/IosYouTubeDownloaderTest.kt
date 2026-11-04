@@ -11,8 +11,6 @@ import kotlinx.cinterop.useContents
 import kotlinx.coroutines.CancellationException
 import platform.AVFoundation.*
 import platform.CoreMedia.CMTimeGetSeconds
-import platform.CoreMedia.CMSampleBufferGetPresentationTimeStamp
-import platform.CoreFoundation.CFRelease
 import platform.Foundation.*
 import kotlin.test.*
 
@@ -29,15 +27,19 @@ class IosYouTubeDownloaderTest {
             fun start(path: String, type: String): Double {
                 val asset = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(path), options = null)
                 val track = asset.tracksWithMediaType(type).first() as AVAssetTrack
-                val reader = AVAssetReader(asset, error = null)
-                val output = AVAssetReaderTrackOutput(track, outputSettings = null)
-                reader.addOutput(output)
-                check(reader.startReading()) { "Could not read native authored media samples." }
-                try {
-                    val sample = requireNotNull(output.copyNextSampleBuffer()) { "The authored track has no media sample." }
-                    try { return CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample)) }
-                    finally { CFRelease(sample) }
-                } finally { reader.cancelReading() }
+                // The track's overall range includes the initial empty edit. Read the first
+                // nonempty media mapping, rather than its time-zero gap/sample placeholder.
+                val starts = track.segments.mapNotNull { value ->
+                    val segment = value as AVAssetTrackSegment
+                    segment.timeMapping.useContents {
+                        val mediaDuration = CMTimeGetSeconds(source.duration.readValue())
+                        println("Authored ${path.substringAfterLast('/')} $type mapping: source=" +
+                            "${CMTimeGetSeconds(source.start.readValue())}/$mediaDuration, target=" +
+                            "${CMTimeGetSeconds(target.start.readValue())}/${CMTimeGetSeconds(target.duration.readValue())}")
+                        if (mediaDuration.isFinite() && mediaDuration > 0) CMTimeGetSeconds(target.start.readValue()) else null
+                    }
+                }
+                return requireNotNull(starts.minOrNull()) { "The authored track has no nonempty media mapping." }
             }
             val originalGap = start(audio, requireNotNull(AVMediaTypeAudio)) - start(video, requireNotNull(AVMediaTypeVideo))
             assertTrue(originalGap > 0.15, "The authored fixture must contain a real audio timeline delay: $originalGap")

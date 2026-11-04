@@ -26,6 +26,8 @@ Use JDK 17 or newer and the checked-in Gradle wrapper. Android builds require SD
 
 The initial version is `0.1.0`. Artifacts are not published to Maven Central. Build from this repository, use a composite build, or publish locally. macOS can produce `KmpYT.xcframework` with `:kmpyt:assembleKmpYTReleaseXCFramework`.
 
+After publishing locally, add `mavenLocal()` to the consuming build's repositories and use `implementation("io.github.apdelrahman1911.kmpyt:kmpyt:0.1.0")` in `commonMain`. Publish Apple artifacts from macOS. Successful CI jobs also provide the JVM JAR, Android AAR and Apple XCFramework as downloadable build artifacts.
+
 ```kotlin
 // Android: dev.kmpyt.android.createAndroidYouTubeClient(context)
 // iOS: dev.kmpyt.createIosYouTubeClient()
