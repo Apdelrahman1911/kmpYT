@@ -23,6 +23,31 @@ import java.util.UUID
 /** Real HTTP, files and MediaExtractor/MediaMuxer; generated CC0 assets require no device encoder. */
 @RunWith(AndroidJUnit4::class)
 class AndroidYouTubeDownloaderTest {
+    @Test fun nativeMuxAllocatesForActualSamplesInsteadOfTheWholeSafetyCeiling(): Unit = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().context
+        val directory = File(context.cacheDir, "kmpyt-small-samples-${UUID.randomUUID()}").apply { mkdirs() }
+        val video = File(directory, "video.mp4").apply { context.assets.open("research/video.mp4").use { input -> outputStream().use { input.copyTo(it) } } }
+        val audio = File(directory, "audio.m4a").apply { context.assets.open("research/audio.m4a").use { input -> outputStream().use { input.copyTo(it) } } }
+        val output = File(directory, "muxed.mp4")
+        val allocations = mutableListOf<Int>()
+        val processor = AndroidMediaProcessor(sampleBufferAllocator = { size ->
+            allocations += size
+            ByteBuffer.allocateDirect(size)
+        })
+        try {
+            val primary = Representation("video", video.toURI().toString(), TrackRole.VIDEO, mimeType = "video/mp4", codecs = "avc1.4d401e")
+            val sound = Representation("audio", audio.toURI().toString(), TrackRole.AUDIO, mimeType = "audio/mp4", codecs = "mp4a.40.2")
+            processor.materialize(primary, sound, { resource, target ->
+                val source = if (resource.url == primary.url) video else { assertEquals(sound.url, resource.url); audio }
+                source.inputStream().use { input -> target.outputStream().use { input.copyTo(it) } }
+            }, output)
+            assertEquals(samples(video, "video/"), samples(output, "video/"))
+            assertEquals(samples(audio, "audio/"), samples(output, "audio/"))
+            assertTrue(allocations.isNotEmpty())
+            assertTrue("Small real frames should need less than128KiB, allocations=$allocations", allocations.all { it < 128 * 1024 })
+        } finally { directory.deleteRecursively() }
+    }
+
     @Test fun nativeDownloadAndMuxKeepEveryEncodedVideoAndAudioSample(): Unit = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().context
         val video = context.assets.open("research/video.mp4").use { it.readBytes() }

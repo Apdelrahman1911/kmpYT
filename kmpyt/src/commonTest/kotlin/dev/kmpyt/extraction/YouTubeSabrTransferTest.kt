@@ -478,7 +478,9 @@ class YouTubeSabrTransferTest {
             assertNull(receipt.httpStatus); assertEquals(0L, receipt.receivedBytes); assertTrue(receipt.mediaHeaders.isEmpty())
             assertEquals(SabrTransferFailureStage.HTTP_REQUEST, receipt.failureStage)
             assertEquals("IllegalArgumentException", receipt.transportFailureType)
-            assertTrue(receipt.failureFrames.isNotEmpty() && receipt.failureFrames.size <= 8)
+            // Kotlin/Native uses #method/#internal symbols, and optimized runtimes may
+            // strip frames. Unrecognized formats must be omitted rather than exposed.
+            assertTrue(receipt.failureFrames.size <= 8)
             assertTrue(receipt.failureFrames.all { it.matches(Regex("[A-Za-z0-9_.$<>]+")) && '.' in it })
             assertFalse(receipt.toString().contains("private-token")); assertFalse(receipt.toString().contains("bad URI"))
             assertFalse(receipt.toString().contains("https://")); assertFalse(receipt.toString().contains(".kt:"))

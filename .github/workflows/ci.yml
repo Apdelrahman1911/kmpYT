@@ -146,8 +146,18 @@ jobs:
         run: |
           xcrun simctl boot "$IOS_DEVICE" || true
           xcrun simctl bootstatus "$IOS_DEVICE" -b
-      - name: Test native iOS and assemble Swift framework
-        run: ./gradlew ":kmpyt:$IOS_TEST_TASK" :kmpyt:assembleKmpYTReleaseXCFramework "-PiosSimulatorDevice=$IOS_DEVICE" --stacktrace
+      - name: Test native iOS protocols and media processing
+        run: ./gradlew ":kmpyt:$IOS_TEST_TASK" "-PiosSimulatorDevice=$IOS_DEVICE" --stacktrace
+      - name: Assemble Swift framework
+        id: framework
+        if: always() && !cancelled()
+        run: ./gradlew :kmpyt:assembleKmpYTReleaseXCFramework --stacktrace
+      - name: Test WebKit in a UIKit application host
+        if: ${{ !cancelled() && steps.framework.outcome == 'success' }}
+        run: |
+          command -v xcodegen || brew install xcodegen
+          xcodegen generate --spec ci/ios-host/project.yml --project ci/ios-host
+          xcodebuild -project ci/ios-host/KmpYTHost.xcodeproj -scheme KmpYTHost -configuration Debug -destination "id=$IOS_DEVICE" -derivedDataPath kmpyt/build/iosHost -resultBundlePath kmpyt/build/reports/ios-host.xcresult -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO test
       - name: Save Kotlin Native toolchain
         if: always() && steps.konan.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -162,3 +172,4 @@ jobs:
             kmpyt/build/XCFrameworks/
             kmpyt/build/reports/tests/
             kmpyt/build/test-results/
+            kmpyt/build/reports/ios-host.xcresult/

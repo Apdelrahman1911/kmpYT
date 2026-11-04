@@ -54,7 +54,10 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
             total?.let { requireIosStorage(working, it) }
             onProgress(YouTubeDownloadProgress(0, total))
             representations.forEachIndexed { index, representation ->
-                files += IosMediaFile("$working/track-$index", representation.sizeBytes.takeIf { representation.transport == TransportKind.SABR },
+                // AVURLAsset uses the container extension while recognizing local track files.
+                val extension = if (representation.mimeType.substringBefore(';').contains("webm")) "webm"
+                    else if (representation.role == TrackRole.AUDIO) "m4a" else "mp4"
+                files += IosMediaFile("$working/track-$index.$extension", representation.sizeBytes.takeIf { representation.transport == TransportKind.SABR },
                     durableWrites = representation.transport == TransportKind.SABR)
             }
             if (plan.primary.transport == TransportKind.SABR) {

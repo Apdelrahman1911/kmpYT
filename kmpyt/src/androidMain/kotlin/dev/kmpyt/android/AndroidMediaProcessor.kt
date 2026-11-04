@@ -24,7 +24,9 @@ import java.nio.ByteOrder
 import java.util.UUID
 
 /** Authorized transport writes resources to supplied files. This class never opens a network connection. */
-internal class AndroidMediaProcessor(private val maximumBytes: Long = Long.MAX_VALUE) : FileMediaProcessor {
+internal class AndroidMediaProcessor(private val maximumBytes: Long = Long.MAX_VALUE,
+    private val sampleBufferAllocator: (Int) -> ByteBuffer = ByteBuffer::allocateDirect) : FileMediaProcessor {
+    private companion object { const val MAX_SAMPLE_BYTES = 16 * 1024 * 1024 }
 
     override suspend fun materialize(primary: Representation, audio: Representation?,
         fetch: suspend (SegmentResource, File) -> Unit, output: File): Unit = withContext(Dispatchers.IO) {
@@ -220,16 +222,39 @@ internal class AndroidMediaProcessor(private val maximumBytes: Long = Long.MAX_V
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(track.file.path); extractor.selectTrack(track.index)
-            val buffer = ByteBuffer.allocateDirect(16 * 1024 * 1024)
+            var buffer: ByteBuffer? = null
             var lastTime: Long? = null
             var samples = 0L
             while (extractor.sampleTrackIndex >= 0) {
                 currentCoroutineContext().ensureActive()
                 require(extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_ENCRYPTED == 0) { "Encrypted research samples are unsupported" }
                 require(extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME == 0) { "Partial research samples are unsupported" }
-                buffer.clear()
-                val count = extractor.readSampleData(buffer, 0)
-                require(count > 0 && count <= buffer.capacity()) { "Empty or excessive media sample" }
+                // Android 9+ exposes the exact encoded sample size. A small phone must
+                // not reserve the entire 16 MiB safety ceiling for a few-kilobyte frame.
+                val declaredSize = if (Build.VERSION.SDK_INT >= 28) extractor.sampleSize else null
+                require(declaredSize == null || declaredSize in 1..MAX_SAMPLE_BYTES.toLong()) { "Empty or excessive media sample" }
+                var currentBuffer = buffer ?: allocateSampleBuffer(declaredSize?.toInt() ?: 64 * 1024)
+                if (declaredSize != null && declaredSize > currentBuffer.capacity())
+                    currentBuffer = allocateSampleBuffer(declaredSize.toInt())
+                var count: Int
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    currentBuffer.clear()
+                    count = try { extractor.readSampleData(currentBuffer, 0) }
+                    catch (failure: IllegalArgumentException) {
+                        // Older extractors report insufficient capacity as an argument error.
+                        // Retry this same sample without advancing; growth remains bounded.
+                        if (declaredSize != null || currentBuffer.capacity() >= MAX_SAMPLE_BYTES) throw failure
+                        currentBuffer = allocateSampleBuffer(minOf(MAX_SAMPLE_BYTES, currentBuffer.capacity() * 2))
+                        continue
+                    }
+                    require(count in 1..MAX_SAMPLE_BYTES) { "Empty or excessive media sample" }
+                    if (count <= currentBuffer.capacity()) break
+                    require(declaredSize == null) { "Media sample size changed during extraction" }
+                    currentBuffer = allocateSampleBuffer(count)
+                }
+                require(declaredSize == null || count.toLong() == declaredSize) { "Media sample size changed during extraction" }
+                buffer = currentBuffer
                 val time = extractor.sampleTime
                 if (lastTime == null) validateFirstTimestamp(track.format, time)
                 else if (allowVideoReordering && hasVideoPresentationReordering(track)) {
@@ -238,13 +263,21 @@ internal class AndroidMediaProcessor(private val maximumBytes: Long = Long.MAX_V
                     require(time >= 0) { "Negative video presentation timestamps are unsupported" }
                 } else require(time >= lastTime) { "Media sample timestamp discontinuity is unsupported" }
                 require(++samples <= 2_000_000) { "Research media exceeds the sample limit" }
-                buffer.position(0); buffer.limit(count)
-                consume(buffer, count, time, extractor.sampleFlags)
+                currentBuffer.position(0); currentBuffer.limit(count)
+                consume(currentBuffer, count, time, extractor.sampleFlags)
                 lastTime = time
                 extractor.advance()
             }
             require(samples > 0) { "Media track contains no samples" }
         } finally { extractor.release() }
+    }
+
+    private fun allocateSampleBuffer(bytes: Int): ByteBuffer {
+        require(bytes in 1..MAX_SAMPLE_BYTES) { "Empty or excessive media sample" }
+        return try { sampleBufferAllocator(bytes) }
+        catch (failure: OutOfMemoryError) {
+            throw IllegalStateException("Not enough memory to process this encoded media sample. Close other tasks and retry.", failure)
+        }
     }
 
     private fun validateFirstTimestamp(format: MediaFormat, time: Long) {

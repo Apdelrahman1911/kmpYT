@@ -1,0 +1,46 @@
+name: KmpYTHost
+options:
+  deploymentTarget:
+    iOS: '15.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    CODE_SIGNING_ALLOWED: NO
+targets:
+  KmpYTHost:
+    type: application
+    platform: iOS
+    sources: [App]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.kmpyt.ci.host
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+  KmpYTHostTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Tests]
+    dependencies:
+      - target: KmpYTHost
+      - framework: ../../kmpyt/build/XCFrameworks/release/KmpYT.xcframework
+        embed: false
+      - sdk: WebKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: Security.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.kmpyt.ci.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/KmpYTHost.app/KmpYTHost
+        BUNDLE_LOADER: $(TEST_HOST)
+        OTHER_LDFLAGS: $(inherited) -lc++
+schemes:
+  KmpYTHost:
+    build:
+      targets:
+        KmpYTHost: all
+        KmpYTHostTests: [test]
+    test:
+      targets: [KmpYTHostTests]

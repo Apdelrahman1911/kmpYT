@@ -6,6 +6,7 @@ local.properties
 .idea/
 *.iml
 .DS_Store
+ci/ios-host/*.xcodeproj/
 artifacts/
 .private/
 *.private.*

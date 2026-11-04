@@ -22,6 +22,7 @@ class IosYouTubeJavaScriptRuntime @Throws(Exception::class) constructor(private 
         val ready = IosRuntimeResult<IosJavaScriptSession>()
         val session = IosJavaScriptSession(timeoutSeconds)
         onMain {
+            ready.stage("RULE_COMPILATION")
             val ruleStore = WKContentRuleListStore.defaultStore()
             if (ruleStore == null) { ready.fail("NETWORK_BLOCKER_UNAVAILABLE"); return@onMain }
             ruleStore.compileContentRuleListForIdentifier(
@@ -51,6 +52,7 @@ private class IosJavaScriptSession(private val timeoutSeconds: Double) : YouTube
     override val capabilities: YouTubeJavaScriptCapabilities get() = actualCapabilities
 
     fun start(program: String, rules: WKContentRuleList, ready: IosRuntimeResult<IosJavaScriptSession>) {
+        ready.stage("DOCUMENT_NAVIGATION")
         if (isClosed()) { ready.fail("SESSION_CLOSED"); return }
         try {
             val configuration = WKWebViewConfiguration()
@@ -60,6 +62,7 @@ private class IosJavaScriptSession(private val timeoutSeconds: Double) : YouTube
             val web = WKWebView(CGRectMake(0.0, 0.0, 1.0, 1.0), configuration)
             view = web
             val delegate = OfflineNavigation(onLoaded = {
+                ready.stage("PROGRAM_EVALUATION")
                 if (isClosed()) ready.fail("SESSION_CLOSED")
                 else web.evaluateJavaScript(program + "\n;JSON.stringify(globalThis.__kmpyt_capabilities || null)") { result, error ->
                     if (isClosed()) ready.fail("SESSION_CLOSED")
@@ -92,6 +95,7 @@ private class IosJavaScriptSession(private val timeoutSeconds: Double) : YouTube
             // JsonPrimitive escapes quotes/newlines without interpolating caller input into JavaScript syntax.
             val script = "globalThis.__kmpyt_transform(${JsonPrimitive(kind)},${JsonPrimitive(input)})"
             onMain {
+                pending.stage("FUNCTION_EVALUATION")
                 val web = view
                 if (isClosed() || web == null) pending.fail("SESSION_CLOSED")
                 else web.evaluateJavaScript(script) { result, error ->
@@ -151,6 +155,11 @@ private class OfflineNavigation(private val onLoaded: () -> Unit, private val on
 private class IosRuntimeResult<T> {
     private val condition = NSCondition()
     private var result: Result<T>? = null
+    private var stage = "MAIN_DISPATCH"
+    fun stage(value: String) {
+        condition.lock()
+        try { stage = value } finally { condition.unlock() }
+    }
     fun succeed(value: T) = finish(Result.success(value))
     fun fail(code: String) = finish(Result.failure(YouTubeJavaScriptFailure(code)))
     private fun finish(value: Result<T>) {
@@ -164,7 +173,7 @@ private class IosRuntimeResult<T> {
             val deadline = NSDate.dateWithTimeIntervalSinceNow(seconds)
             while (result == null) {
                 if (!condition.waitUntilDate(deadline) && result == null) {
-                    result = Result.failure(YouTubeJavaScriptFailure("RUNTIME_TIMEOUT"))
+                    result = Result.failure(YouTubeJavaScriptFailure("RUNTIME_TIMEOUT_$stage"))
                 }
             }
             return requireNotNull(result).getOrThrow()

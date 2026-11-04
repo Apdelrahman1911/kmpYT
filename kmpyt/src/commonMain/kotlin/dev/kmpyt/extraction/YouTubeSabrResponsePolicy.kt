@@ -70,7 +70,7 @@ data class SabrTransferResponseDiagnostic(
     /** Fixed internal reason or a bounded exception class name; never a message, cause or URL. */
     val transportFailureType: String? = null,
     val failureStage: SabrTransferFailureStage? = null,
-    /** At most eight static class.method names; no locations, messages, URLs or causes. */
+    /** At most eight static class.method names; may be empty for stripped/unsupported runtime symbols. No locations, messages, URLs or causes. */
     val failureFrames: List<String> = emptyList(),
     /** Actual discarded extra-track bytes and complete packets; never committed output. */
     val ignoredMediaPayloadBytes: Long = 0,
