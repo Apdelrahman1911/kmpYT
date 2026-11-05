@@ -6,6 +6,7 @@ import java.nio.file.Path
 import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlinx.serialization.json.*
 
 /** Native DOM/V8 execution in a fresh offline Chromium profile. No user browser profile is read. */
@@ -49,7 +50,7 @@ class DesktopYouTubeJavaScriptRuntime internal constructor(private val helperSou
             throw failure
         } catch (_: Exception) {
             session.close()
-            throw IllegalStateException("The isolated desktop player JavaScript runtime could not initialize.")
+            throw YouTubeJavaScriptFailure("OFFLINE_HELPER_INITIALIZATION_FAILED")
         }
     }
 
@@ -78,7 +79,8 @@ class DesktopYouTubeJavaScriptRuntime internal constructor(private val helperSou
             try {
                 writer.write(command.toString()); writer.newLine(); writer.flush()
                 val line = reads.submit<String> { reader.readLine() }.get(timeout, TimeUnit.SECONDS)
-                require(line != null && line.length <= 100_000)
+                if (line == null) { broken = true; throw YouTubeJavaScriptFailure("OFFLINE_HELPER_EXITED") }
+                if (line.length > 100_000) { broken = true; throw YouTubeJavaScriptFailure("OFFLINE_HELPER_RESPONSE_LIMIT") }
                 val result = Json.parseToJsonElement(line).jsonObject
                 if (result["ok"]?.jsonPrimitive?.booleanOrNull != true) {
                     val code = result["error"]?.jsonPrimitive?.content?.takeIf { it.length <= 128 && Regex("[A-Za-z0-9_$:-]+").matches(it) }
@@ -86,7 +88,8 @@ class DesktopYouTubeJavaScriptRuntime internal constructor(private val helperSou
                 }
                 return result
             } catch (failure: YouTubeJavaScriptFailure) { throw failure }
-            catch (_: Exception) { broken = true; throw IllegalStateException("Offline player JavaScript execution failed.") }
+            catch (_: TimeoutException) { broken = true; throw YouTubeJavaScriptFailure("OFFLINE_HELPER_TIMEOUT") }
+            catch (_: Exception) { broken = true; throw YouTubeJavaScriptFailure("OFFLINE_HELPER_PROTOCOL_FAILED") }
         }
 
         override fun call(function: YouTubeJavaScriptFunction, input: String): String {

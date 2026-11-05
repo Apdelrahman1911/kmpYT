@@ -30,7 +30,7 @@ class DesktopYouTubeJavaScriptRuntimeTest {
         """.trimIndent()
         DesktopYouTubeJavaScriptRuntime().use { runtime ->
             val compilation = ContextYouTubePlayerProgramCompiler(runtime).compile(program, YouTubeProgramBinding())
-            val transforms = assertNotNull(compilation.transforms, compilation.diagnostics.joinToString { it.code })
+            val transforms = assertNotNull(compilation.transforms, compilation.diagnostics.joinToString { "${it.code}: ${it.message}" })
             try {
                 // Literal percent distinguishes raw signatures from URI-encoded helper inputs/outputs.
                 val signature = transforms.signature("a+/=%25")

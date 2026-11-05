@@ -70,7 +70,7 @@ Run `./gradlew :kmpyt:connectedDebugAndroidTest` to exercise the native Android 
 
 The smoke test verifies the uploader before transferring media, checks saved audio/video samples and decodes a video frame. Its five-minute/eight-MiB budget applies only to this test. The test application's private `files/kmpyt-live-smoke.json` contains redacted diagnostics; downloaded media is deleted afterward. The 2026-11-05 local Android 15 run stopped at DNS resolution (`TRANSPORT_DNS_FAILURE`), before any media download. Live playback on that emulator remains unverified.
 
-The [2026-11-04 live run](https://github.com/Apdelrahman1911/kmpYT/actions/runs/41902649543) reached the approved channel, but YouTube returned `AUTHORIZATION_REQUIRED` and no formats for its sampled videos. No live media was downloaded. Controlled transfer tests and this upstream access failure are reported separately; a passing offline suite does not establish live YouTube availability.
+The [2026-11-05 live run](https://github.com/Apdelrahman1911/kmpYT/actions/runs/41980615183) reached the approved channel, but YouTube again returned `AUTHORIZATION_REQUIRED` and no formats for the selected video. No live media was downloaded. Controlled transfer tests and this upstream access failure are reported separately; a passing offline suite does not establish live YouTube availability.
 
 YouTube's public interfaces can change or refuse resources. A listed format is not a guarantee of server access, device codec support or uninterrupted playback. Account login and bypassing protected playback are not provided. Native playback UIs remain the consuming application's responsibility.
 
