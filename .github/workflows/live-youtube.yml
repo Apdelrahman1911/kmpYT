@@ -40,7 +40,8 @@ jobs:
           sudo apt-get install -y ffmpeg
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Verify approved channel metadata and media transfer
-        run: ./gradlew :kmpyt:jvmTest --tests dev.kmpyt.ci.ApprovedChannelLiveTest --stacktrace
+        # A live check must not reuse a previous server response from Gradle's cache.
+        run: ./gradlew :kmpyt:jvmTest --rerun --tests dev.kmpyt.ci.ApprovedChannelLiveTest --stacktrace
       - name: Upload redacted test results
         uses: actions/upload-artifact@v4
         if: always()
