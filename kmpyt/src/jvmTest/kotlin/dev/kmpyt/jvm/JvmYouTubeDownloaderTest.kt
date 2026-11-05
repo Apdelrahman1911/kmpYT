@@ -12,6 +12,8 @@ import kotlinx.coroutines.withTimeout
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import dev.kmpyt.testfixtures.startLoopback
+import dev.kmpyt.testfixtures.loopbackUrl
 import okhttp3.mockwebserver.RecordedRequest
 import okio.Buffer
 import org.junit.Assume.assumeTrue
@@ -23,11 +25,34 @@ import kotlin.test.*
 class JvmYouTubeDownloaderTest {
     private fun media(name: String) = requireNotNull(javaClass.getResourceAsStream("/research/$name")).use { it.readBytes() }
     private fun plan(server: MockWebServer, audio: Boolean = false): PlannedDownload {
-        val video = Representation("video", server.url("/video").toString(), if (audio) TrackRole.VIDEO else TrackRole.MUXED,
+        val video = Representation("video", server.loopbackUrl("/video").toString(), if (audio) TrackRole.VIDEO else TrackRole.MUXED,
             mimeType = "video/mp4", codecs = "avc1.4d401e", sizeBytes = media("video.mp4").size.toLong())
-        val sound = if (audio) Representation("audio", server.url("/audio").toString(), TrackRole.AUDIO,
+        val sound = if (audio) Representation("audio", server.loopbackUrl("/audio").toString(), TrackRole.AUDIO,
             mimeType = "audio/mp4", codecs = "mp4a.40.2", sizeBytes = media("audio.m4a").size.toLong()) else null
-        return PlannedDownload(video, sound, inspectionUrl = server.url("/owned").toString(), mediaId = "owned")
+        return PlannedDownload(video, sound, inspectionUrl = server.loopbackUrl("/owned").toString(), mediaId = "owned")
+    }
+
+    @Test fun aChunkedPrefixCannotBePublishedAsTheInspectedCompleteFile(): Unit = runBlocking {
+        val body = media("video.mp4")
+        val directory = Files.createTempDirectory("kmpyt-truncated-publication-").toFile()
+        val output = File(directory, "saved.mp4")
+        val server = MockWebServer()
+        repeat(3) {
+            server.enqueue(MockResponse().setHeader("Content-Type", "video/mp4").setHeader("ETag", "\"owned\"")
+                .setChunkedBody(Buffer().write(body.copyOf(100)), 25))
+        }
+        server.startLoopback()
+        val http = HttpClient(CIO)
+        try {
+            assertFailsWith<java.io.IOException> {
+                withTimeout(10_000) {
+                    JvmYouTubeDownloader(http, allowLocalHttp = true).download(plan(server), output.path) { }
+                }
+            }
+            assertFalse(output.exists())
+            assertEquals(3, server.requestCount)
+            assertContentEquals(body.copyOf(100), File(directory, ".saved.mp4.kmpyt/0-0").readBytes())
+        } finally { http.close(); server.shutdown(); directory.deleteRecursively() }
     }
 
     @Test fun independentDownloaderInstancesCannotMixTheSameCanonicalDestination(): Unit = runBlocking {
@@ -37,7 +62,7 @@ class JvmYouTubeDownloaderTest {
         val server = MockWebServer()
         server.enqueue(MockResponse().setHeader("Content-Type", "video/mp4").setHeader("ETag", "\"owned\"")
             .setBody(Buffer().write(body)))
-        server.start()
+        server.startLoopback()
         val http = HttpClient(CIO)
         val firstBytes = CompletableDeferred<Unit>()
         val continueFirst = CompletableDeferred<Unit>()
@@ -80,7 +105,7 @@ class JvmYouTubeDownloaderTest {
                     .throttleBody(4096, 10, TimeUnit.MILLISECONDS)
             }
         }
-        server.start()
+        server.startLoopback()
         val http = HttpClient(CIO)
         try {
             val selected = plan(server)
@@ -91,7 +116,7 @@ class JvmYouTubeDownloaderTest {
             assertFalse(destination.exists())
             val checkpoint = File(directory, ".saved.mp4.kmpyt/checkpoint.json")
             assertTrue(checkpoint.isFile)
-            assertFalse(checkpoint.readText().contains(server.url("/").toString()))
+            assertFalse(checkpoint.readText().contains(server.loopbackUrl("/").toString()))
             val progress = mutableListOf<YouTubeDownloadProgress>()
             val result = downloader.download(selected, destination.path) { progress += it }
             assertContentEquals(body, destination.readBytes())
@@ -114,7 +139,7 @@ class JvmYouTubeDownloaderTest {
         val server = MockWebServer()
         server.enqueue(MockResponse().setHeader("Content-Type", "video/mp4").setBody(Buffer().write(video)))
         server.enqueue(MockResponse().setHeader("Content-Type", "audio/mp4").setBody(Buffer().write(audio)))
-        server.start()
+        server.startLoopback()
         val http = HttpClient(CIO)
         try {
             val progress = mutableListOf<YouTubeDownloadProgress>()
@@ -132,7 +157,7 @@ class JvmYouTubeDownloaderTest {
     }
 
     @Test fun missingMuxerFailsBeforeDownloadingEitherTrack(): Unit = runBlocking {
-        val server = MockWebServer(); server.start()
+        val server = MockWebServer(); server.startLoopback()
         val http = HttpClient(CIO)
         val directory = Files.createTempDirectory("kmpyt-preflight-test").toFile()
         try {

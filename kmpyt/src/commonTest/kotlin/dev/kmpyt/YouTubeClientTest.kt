@@ -175,4 +175,23 @@ class YouTubeClientTest {
             } finally { client.close() }
         }
     }
+
+    @Test fun channelAndPlaylistConvenienceMethodsAcceptSupportedCanonicalUrlVariants() = runTest {
+        val requests = mutableListOf<String>()
+        val client = YouTubeClient(ResearchTransport {
+            requests += it.url
+            ResearchResponse(it.url, 200, """<script>var ytInitialData={"contents":{}};</script>""")
+        })
+        try {
+            client.channel("@fixture")
+            client.channel("https://youtube.com/c/Legacy/")
+            client.channel("https://m.youtube.com/user/Legacy/")
+            client.playlist("https://youtube.com/playlist/?list=PLfixture&si=discarded")
+            assertEquals(listOf("https://www.youtube.com/@fixture/videos", "https://www.youtube.com/c/Legacy/videos",
+                "https://www.youtube.com/user/Legacy/videos", "https://www.youtube.com/playlist?list=PLfixture"), requests)
+            assertFailsWith<IllegalArgumentException> { client.channel("https://www.youtube.com/playlist?list=PLfixture") }
+            assertFailsWith<IllegalArgumentException> { client.playlist("https://www.youtube.com/@fixture") }
+            assertEquals(4, requests.size)
+        } finally { client.close() }
+    }
 }

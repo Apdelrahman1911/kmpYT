@@ -67,16 +67,20 @@ class YouTubeClient(
     /** Accepts a public channel URL or an @handle; channelId is populated only by the response. */
     @Throws(Exception::class)
     suspend fun channel(urlOrHandle: String): YouTubeBrowsePage = operation {
-        val url = if (urlOrHandle.startsWith('@')) "https://www.youtube.com/$urlOrHandle/videos" else urlOrHandle
+        val url = PublicYouTubeBrowseService.canonicalBrowseUrl(
+            if (urlOrHandle.startsWith('@')) "https://www.youtube.com/$urlOrHandle" else urlOrHandle)
         val path = Url(url).encodedPath
-        require(path.startsWith("/@") || path.startsWith("/channel/")) { "Use a YouTube @handle or channel URL." }
+        require(path.startsWith("/@") || path.startsWith("/channel/") || path.startsWith("/c/") || path.startsWith("/user/")) {
+            "Use a YouTube @handle or channel URL."
+        }
         browse.open(url)
     }
 
     @Throws(Exception::class)
     suspend fun playlist(url: String): YouTubeBrowsePage = operation {
-        require(Url(url).encodedPath == "/playlist") { "Use a YouTube playlist URL." }
-        browse.open(url)
+        val canonical = PublicYouTubeBrowseService.canonicalBrowseUrl(url)
+        require(Url(canonical).encodedPath == "/playlist") { "Use a YouTube playlist URL." }
+        browse.open(canonical)
     }
 
     /**
@@ -153,7 +157,7 @@ class YouTubeClient(
                 "The original selected format is no longer available. Inspect and select again."
             }
             return resolve(offered, report.input, plan.mediaId).also {
-                require(TransferPlanning.sameRepresentation(previous, it)) { "The selected source track changed. Inspect and select again." }
+                require(sameRefreshedTrack(previous, it)) { "The selected source track changed. Inspect and select again." }
             }
         }
         PlannedDownload(replacement(plan.primary), plan.audio?.let { replacement(it) },

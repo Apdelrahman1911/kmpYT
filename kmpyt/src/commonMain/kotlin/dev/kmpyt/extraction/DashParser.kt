@@ -53,7 +53,7 @@ object DashParser : ManifestParser {
                 result += Representation(id, base, role, transport, mime, fields["codecs"],
                     fields["width"]?.toIntOrNull(), fields["height"]?.toIntOrNull(), bandwidth,
                     durationMs = duration, segments = resources.segments, initialization = resources.initialization,
-                    manifestUrl = url)
+                    audioLanguage = fields["lang"], manifestUrl = url)
             }
         }
         require(result.isNotEmpty()) { "DASH has no supported representations" }

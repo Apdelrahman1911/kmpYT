@@ -12,7 +12,9 @@ import dev.kmpyt.UrlPolicy
     /** Bounded, payload-free protocol receipts; source/cookie/token values are excluded. */
     val sabrDiagnostics: List<String> = emptyList())
 @Serializable data class PartState(val key: String, val bytes: Long = 0, val total: Long? = null,
-    val etag: String? = null, val lastModified: String? = null, val complete: Boolean = false)
+    val etag: String? = null, val lastModified: String? = null, val complete: Boolean = false,
+    /** Full HTTP object size, independent of this part's selected byte-range length. */
+    val objectTotalBytes: Long? = null)
 data class TransferPart(val key: String, val resource: SegmentResource, val mimeType: String,
     val expectedBytes: Long? = null)
 

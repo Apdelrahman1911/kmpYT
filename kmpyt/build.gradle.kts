@@ -72,7 +72,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    testOptions { unitTests.isReturnDefaultValues = true }
+    testOptions {
+        targetSdk = 36
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 tasks.withType<KotlinNativeSimulatorTest>().configureEach {

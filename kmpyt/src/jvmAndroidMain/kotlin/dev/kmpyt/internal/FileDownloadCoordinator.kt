@@ -51,12 +51,24 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                     .getOrNull()?.takeIf { it.planDigest == digest }
                 if (restored == null) directory.listFiles()?.filter { it.name != "lock" }?.forEach { it.deleteRecursively() }
                 var plan = input.copy(sabrCheckpoint = restored?.sabrCheckpoint)
+                val expectedParts = if (plan.primary.transport == TransportKind.SABR) emptyMap()
+                    else TransferPlanning.parts(plan).associateBy { it.key }
                 var states = restored?.parts.orEmpty().mapNotNull { state ->
                     val file = File(directory, state.key)
                     // Only keys authored by TransferPlanning are allowed to name local files.
                     require(Regex("\\d+-\\d+").matches(state.key)) { "Invalid local checkpoint resource key." }
                     if (!file.isFile) null else if (plan.primary.transport == TransportKind.SABR) state
-                    else state.copy(bytes = file.length(), complete = state.complete && file.length() == state.bytes)
+                    else {
+                        val expected = requireNotNull(expectedParts[state.key]) { "The checkpoint does not belong to the selected media parts." }.expectedBytes
+                        val length = file.length()
+                        if (expected != null && (length > expected || state.total != null && state.total != expected ||
+                                state.complete && length != expected)) {
+                            // A legacy/corrupted completed checkpoint must not skip the exact-size
+                            // transport check and publish an incomplete inspected representation.
+                            check(file.delete()) { "Could not discard an incompatible media checkpoint." }
+                            null
+                        } else state.copy(bytes = length, complete = state.complete && length == state.bytes)
+                    }
                 }
                 val active = AtomicReference<HttpURLConnection?>(null)
                 suspend fun current(): Boolean { currentCoroutineContext().ensureActive(); return true }
@@ -99,7 +111,8 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                                         else {
                                             val result = HttpDownloadTransfer(allowLocalHttp, plan.requestHeaders,
                                                 refreshOnExpiry = true, onConnection = { active.set(it) }).fetch(
-                                                FileTransferRequest(part.resource.url, plan, state.total, state.etag, state.lastModified),
+                                                FileTransferRequest(part.resource.url, plan, state.total, state.etag, state.lastModified,
+                                                    expectedBytes = part.expectedBytes),
                                                 file, ::current) {
                                                     state = PartState(part.key, it.bytes, it.total, it.etag, it.lastModified)
                                                     progress(state, it.speedBytesPerSecond)

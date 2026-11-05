@@ -20,7 +20,15 @@ internal class PermanentDownloadException(message: String) : IOException(message
 internal class RetryableDownloadException(message: String, val retryAfterSeconds: Long? = null) : IOException(message)
 internal class ExpiredResourceException : IOException("Authorized media resource expired")
 
-internal data class FileTransferRequest(val url: String, val transferPlan: PlannedDownload, val totalBytes: Long? = null, val etag: String? = null, val lastModified: String? = null)
+internal data class FileTransferRequest(
+    val url: String,
+    val transferPlan: PlannedDownload,
+    val totalBytes: Long? = null,
+    val etag: String? = null,
+    val lastModified: String? = null,
+    /** Exact inspected length, kept separate from a previous response/checkpoint's total. */
+    val expectedBytes: Long? = null,
+)
 
 internal data class TransferProgress(
     val bytes: Long,
@@ -31,6 +39,29 @@ internal data class TransferProgress(
 )
 
 internal data class TransferOutcome(val bytes: Long, val total: Long?, val etag: String?, val lastModified: String?)
+
+/** Both complete files and explicit byte ranges must contain the requested unencoded media. */
+internal fun requireMediaResponse(connection: HttpURLConnection) {
+    val contentType = connection.contentType?.substringBefore(';')?.trim()?.lowercase()
+    if (contentType != null && (contentType.startsWith("text/") || contentType.contains("json") ||
+            contentType.contains("xml") || contentType.contains("mpegurl"))) {
+        throw PermanentDownloadException("This URL returned a page or streaming manifest instead of a downloadable media file.")
+    }
+    if (!contentType.isNullOrBlank() && !contentType.startsWith("audio/") && !contentType.startsWith("video/") &&
+        contentType !in setOf("application/ogg", "application/mp4", "application/octet-stream", "binary/octet-stream")) {
+        throw PermanentDownloadException("This URL did not return a supported audio or video file.")
+    }
+    val encoding = connection.getHeaderField("Content-Encoding")
+    if (!encoding.isNullOrBlank() && !encoding.trim().equals("identity", true)) {
+        throw PermanentDownloadException("Server returned a compressed representation that cannot be resumed safely.")
+    }
+}
+
+internal fun mediaContentLength(connection: HttpURLConnection): Long? {
+    val header = connection.getHeaderField("Content-Length") ?: return null
+    return header.trim().toLongOrNull()?.takeIf { it >= 0 }
+        ?: throw PermanentDownloadException("The media server returned an invalid Content-Length.")
+}
 
 /** Progressive direct media transport. No HTML extraction, accounts, cookies or DRM processing. */
 internal class HttpDownloadTransfer(
@@ -52,6 +83,8 @@ internal class HttpDownloadTransfer(
             currentCoroutineContext().ensureActive()
             if (!isCurrent()) throw StaleDownloadException()
         }
+        require(task.totalBytes == null || task.totalBytes >= 0) { "Invalid stored media size" }
+        require(task.expectedBytes == null || task.expectedBytes >= 0) { "Invalid inspected media size" }
         partial.parentFile?.mkdirs()
         var offset = partial.takeIf { it.exists() }?.length() ?: 0L
         require(maximumBytes == null || maximumBytes > 0) { "Invalid explicit transfer byte budget" }
@@ -72,7 +105,7 @@ internal class HttpDownloadTransfer(
         while (true) {
             checkCurrent()
             val connection = open(task.url, offset, storedEtag, storedModified, ::checkCurrent,
-                task.transferPlan?.inspectionUrl, task.transferPlan?.mediaId)
+                task.transferPlan.inspectionUrl, task.transferPlan.mediaId)
             try {
                 val status = connection.responseCode
                 if (refreshOnExpiry && status in listOf(401, 403, 410)) throw ExpiredResourceException()
@@ -81,7 +114,7 @@ internal class HttpDownloadTransfer(
                 }
                 val etag = connection.getHeaderField("ETag")
                 val modified = connection.getHeaderField("Last-Modified")
-                val length = connection.getHeaderField("Content-Length")?.toLongOrNull()?.takeIf { it >= 0 }
+                val length = mediaContentLength(connection)
                 val plan = DownloadProtocol.plan(offset, status, connection.getHeaderField("Content-Range"), length, storedEtag, storedModified, etag, modified)
                 when (plan) {
                     is DownloadProtocol.ResponsePlan.Reject -> throw PermanentDownloadException(plan.reason)
@@ -90,6 +123,9 @@ internal class HttpDownloadTransfer(
                         continue
                     }
                     DownloadProtocol.ResponsePlan.AlreadyComplete -> {
+                        if (task.expectedBytes != null && task.expectedBytes != offset) {
+                            throw PermanentDownloadException("The completed range conflicts with the inspected media size. Inspect the source again.")
+                        }
                         if (task.totalBytes != null && task.totalBytes != offset) {
                             restart("The server's completed range conflicts with the known media size.")
                             continue
@@ -98,13 +134,16 @@ internal class HttpDownloadTransfer(
                         return@withContext TransferOutcome(offset, offset, etag ?: storedEtag, modified ?: storedModified)
                     }
                     is DownloadProtocol.ResponsePlan.Transfer -> {
-                        val knownTotal = task.totalBytes.takeIf { plan.append }
-                        if (knownTotal != null && plan.total != null && plan.total != knownTotal) {
+                        val knownTotal = task.expectedBytes ?: task.totalBytes
+                        if (task.expectedBytes != null && plan.total != null && plan.total != task.expectedBytes) {
+                            throw PermanentDownloadException("The response length conflicts with the inspected media size. Inspect the source again.")
+                        }
+                        if (plan.append && knownTotal != null && plan.total != null && plan.total != knownTotal) {
                             restart("The remote file size changed; restarting safely.")
                             continue
                         }
-                        // A range response may omit the representation size. Its body length
-                        // describes only this range, so retain the previously known full size.
+                        // Chunked full responses and ranges can omit the object size. Preserve
+                        // the inspected/checkpoint total so EOF cannot certify a short prefix.
                         val total = plan.total ?: knownTotal
                         if (status == 206 && total == null) {
                             // EOF cannot prove that an unknown-size partial is the whole file.
@@ -112,18 +151,7 @@ internal class HttpDownloadTransfer(
                             restart("The media server did not provide a verifiable complete file.")
                             continue
                         }
-                        val contentType = connection.contentType?.substringBefore(';')?.trim()?.lowercase()
-                        if (contentType != null && (contentType.startsWith("text/") || contentType.contains("json") || contentType.contains("xml") || contentType.contains("mpegurl"))) {
-                            throw PermanentDownloadException("This URL returned a page or streaming manifest instead of a downloadable media file.")
-                        }
-                        if (!contentType.isNullOrBlank() && !contentType.startsWith("audio/") && !contentType.startsWith("video/") &&
-                            contentType !in setOf("application/ogg", "application/mp4", "application/octet-stream", "binary/octet-stream")) {
-                            throw PermanentDownloadException("This URL did not return a supported audio or video file.")
-                        }
-                        val encoding = connection.getHeaderField("Content-Encoding")
-                        if (!encoding.isNullOrBlank() && !encoding.equals("identity", true)) {
-                            throw PermanentDownloadException("Server returned a compressed representation that cannot be resumed safely.")
-                        }
+                        requireMediaResponse(connection)
                         checkCurrent()
                         var bytes = plan.offset
                         val effectiveEtag = etag ?: storedEtag.takeIf { plan.append }
@@ -220,8 +248,11 @@ internal class HttpDownloadTransfer(
                 connection.setRequestProperty("Range", "bytes=$offset-")
                 DownloadProtocol.strongValidator(etag, lastModified)?.let { connection.setRequestProperty("If-Range", it) }
             }
-            onConnection(connection)
-            val response = try { connection.responseCode } catch (error: Throwable) {
+            val response = try {
+                onConnection(connection)
+                checkCurrent()
+                connection.responseCode
+            } catch (error: Throwable) {
                 connection.disconnect()
                 onConnection(null)
                 throw error

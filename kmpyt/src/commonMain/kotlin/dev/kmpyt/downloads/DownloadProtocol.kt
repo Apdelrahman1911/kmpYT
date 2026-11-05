@@ -54,7 +54,8 @@ object DownloadProtocol {
             return ResponsePlan.Reject("Invalid download size.")
         }
         return when (status) {
-            200 -> ResponsePlan.Transfer(0, contentLength, append = false)
+            200 -> if (contentRange != null) ResponsePlan.Reject("A full media response must not contain a partial Content-Range.")
+                else ResponsePlan.Transfer(0, contentLength, append = false)
             206 -> {
                 val range = parseContentRange(contentRange)
                     ?: return ResponsePlan.Reject("Server returned an invalid Content-Range.")

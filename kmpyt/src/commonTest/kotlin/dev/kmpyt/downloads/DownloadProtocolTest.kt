@@ -23,6 +23,13 @@ class DownloadProtocolTest {
         assertEquals(false, transfer.append)
     }
 
+    @Test fun fullResponseCannotCertifyAnUnexpectedPartialContentRange() {
+        for (range in listOf("bytes 0-99/1000", "bytes 0-99/*", "")) {
+            assertIs<DownloadProtocol.ResponsePlan.Reject>(plan(offset = 0, status = 200, range = range, length = 100))
+        }
+        assertIs<DownloadProtocol.ResponsePlan.Transfer>(plan(offset = 0, status = 200, range = null, length = null))
+    }
+
     @Test fun changedRepresentationRestarts() {
         assertIs<DownloadProtocol.ResponsePlan.Restart>(plan(newEtag = "\"file-b\""))
     }

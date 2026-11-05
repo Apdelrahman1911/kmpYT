@@ -165,4 +165,58 @@ class YouTubeManifestExpansionTest {
             assertEquals(1, requests.size)
         } finally { client.close() }
     }
+
+    @Test fun hlsRefreshRejectsChangedAudioLanguageEvenWhenTheCatalogueIdAndPartCountsMatch() = runTest {
+        var language = "en"
+        val requests = mutableListOf<String>()
+        val client = YouTubeClient(ResearchTransport { request ->
+            requests += request.url
+            val body = when (request.url) {
+                source -> """<script>var ytInitialPlayerResponse={"videoDetails":{"videoId":"ABCDEFGHIJK","title":"Fixture","author":"Author","thumbnail":{"thumbnails":[{"url":"https://i.ytimg.com/default.jpg"}]}},"playabilityStatus":{"status":"OK"},"streamingData":{"hlsManifestUrl":"$hls"}};</script>"""
+                hls -> """
+                    #EXTM3U
+                    #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="sound",NAME="Source audio",LANGUAGE="$language",URI="$language.m3u8"
+                    #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2",AUDIO="sound"
+                    video.m3u8
+                """.trimIndent()
+                "https://media.example/video.m3u8", "https://media.example/en.m3u8", "https://media.example/fr.m3u8" ->
+                    "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:3,\npart.m4s\n#EXT-X-ENDLIST"
+                else -> error("Refresh must not fetch media")
+            }
+            ResearchResponse(request.url, 200, body)
+        })
+        try {
+            val expanded = client.expandFormats(report(hlsPointer))
+            val plan = client.plan(expanded, assertNotNull(client.select(expanded)))
+            assertEquals("en", plan.audio?.audioLanguage)
+            language = "fr"
+            val failure = assertFailsWith<IllegalArgumentException> { client.refresh(plan) }
+            assertTrue(failure.message.orEmpty().contains("track changed"))
+            assertEquals("https://media.example/fr.m3u8", requests.last())
+            assertEquals(7, requests.size)
+        } finally { client.close() }
+    }
+
+    @Test fun dashRefreshKeepsSourceDeclaredLanguageAsPartOfTheSelectedAudioIdentity() = runTest {
+        var language = "en"
+        val requests = mutableListOf<String>()
+        val client = YouTubeClient(ResearchTransport { request ->
+            requests += request.url
+            val body = if (request.url == source)
+                """<script>var ytInitialPlayerResponse={"videoDetails":{"videoId":"ABCDEFGHIJK","title":"Fixture","author":"Author","thumbnail":{"thumbnails":[{"url":"https://i.ytimg.com/default.jpg"}]}},"playabilityStatus":{"status":"OK"},"streamingData":{"dashManifestUrl":"$mpd"}};</script>"""
+            else {
+                assertEquals(mpd, request.url)
+                dash("""<AdaptationSet mimeType="audio/mp4" codecs="mp4a.40.2" lang="$language"><Representation id="aac" bandwidth="128000"><BaseURL>audio.m4a</BaseURL></Representation></AdaptationSet>""")
+            }
+            ResearchResponse(request.url, 200, body)
+        })
+        try {
+            val plan = client.plan(report(dashPointer), YouTubeFormatSelection(dashPointer.id))
+            assertEquals("en", plan.primary.audioLanguage)
+            language = "fr"
+            val failure = assertFailsWith<IllegalArgumentException> { client.refresh(plan) }
+            assertTrue(failure.message.orEmpty().contains("track changed"))
+            assertEquals(listOf(mpd, source, mpd), requests)
+        } finally { client.close() }
+    }
 }

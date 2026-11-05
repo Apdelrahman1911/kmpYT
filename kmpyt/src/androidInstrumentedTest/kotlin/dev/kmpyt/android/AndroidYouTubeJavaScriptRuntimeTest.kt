@@ -17,6 +17,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import dev.kmpyt.testfixtures.startLoopback
+import dev.kmpyt.testfixtures.loopbackUrl
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -72,9 +74,9 @@ class AndroidYouTubeJavaScriptRuntimeTest {
         val server = MockWebServer()
         server.enqueue(MockResponse().setBody("This server must never be reached"))
         try {
-            server.start()
+            server.startLoopback()
             withContext(Dispatchers.IO) {
-                val url = server.url("/offline-probe").toString()
+                val url = server.loopbackUrl("/offline-probe").toString()
                 val session = runtime().prepare("""
                     globalThis.__offline_states = ['waiting','waiting','waiting','waiting'];
                     ['$url', 'file:///etc/hosts', 'content://dev.kmpyt.not-a-provider/private',

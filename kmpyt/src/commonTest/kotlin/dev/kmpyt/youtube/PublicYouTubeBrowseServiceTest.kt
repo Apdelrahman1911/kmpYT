@@ -253,4 +253,34 @@ class PublicYouTubeBrowseServiceTest {
         val transport = Transport { ResearchResponse(it.url, 200, initial(video().replace("https://i.ytimg.com/", "https://i.ytimg.com.attacker.test/"))) }
         assertNull(PublicYouTubeBrowseService(transport).home().items.single().thumbnailUrl)
     }
+
+    @Test fun exactResultBoundStillReadsTheTrailingPlaylistContinuation() = runTest {
+        val entries = (0 until 500).map { video(it.toString().padStart(11, 'A'), renderer = "playlistVideoRenderer") }
+        val transport = Transport { request -> ResearchResponse(request.url, 200,
+            if (request.method == "GET") config + initial(entries.joinToString(",") + "," + token("next"))
+            else continuation(video(secondId, renderer = "playlistVideoRenderer"))) }
+        val service = PublicYouTubeBrowseService(transport)
+        val first = service.open("$origin/playlist?list=$playlistId")
+        assertEquals(500, first.items.size)
+        assertEquals("next", first.continuation)
+        assertNull(first.notice)
+        val more = service.more(first)
+        assertEquals(501, more.items.size)
+        assertEquals(secondId, more.items.last().id)
+        assertEquals(2, transport.requests.size)
+    }
+
+    @Test fun anActuallyTruncatedPageReportsItsLimitWithoutSkippingEntriesIntoTheNextPage() = runTest {
+        val entries = (0 until 501).map { video(it.toString().padStart(11, 'A'), renderer = "playlistVideoRenderer") }
+        val transport = Transport { ResearchResponse(it.url, 200,
+            config + initial(entries.joinToString(",") + "," + token("next"))) }
+        val service = PublicYouTubeBrowseService(transport)
+        val page = service.open("$origin/playlist?list=$playlistId")
+        assertEquals(500, page.items.size)
+        assertNull(page.continuation)
+        assertNull(page.continuationContext)
+        assertTrue(page.notice.orEmpty().contains("omitted"))
+        assertSame(page, service.more(page))
+        assertEquals(1, transport.requests.size)
+    }
 }

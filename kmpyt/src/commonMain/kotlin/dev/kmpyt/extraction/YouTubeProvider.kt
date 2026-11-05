@@ -1,6 +1,7 @@
 package dev.kmpyt.extraction
 
 import io.ktor.http.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
 
 /** Bounded response reader. Optional independently compiled transforms process actual supplied URLs. */
@@ -108,6 +109,7 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
                     require(Url(endpoint).parameters.getAll("n")?.size == 1 && transforms?.throttlingAvailable == true)
                     sabrEndpoint = YouTubeUrlAssembly.replaceParameter(endpoint, "n", transforms.throttling(requireNotNull(Url(endpoint).parameters["n"])))
                     diagnostic("SABR_THROTTLING_PARAMETER_RESOLVED", "Executed the complete player n transform on the actual shared SABR endpoint. Server acceptance remains a separate transfer check.")
+                } catch (cancelled: CancellationException) { throw cancelled
                 } catch (_: Exception) {
                     sabrReady = false
                     diagnostic("SABR_THROTTLING_PARAMETER_UNRESOLVED", "The actual SABR endpoint requires a player n transformation that could not execute. No substitute value was generated.")
@@ -153,6 +155,7 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
                                 url = YouTubeUrlAssembly.replaceParameter(resource, parameter, supplied)
                                 diagnostic("SOURCE_SIGNATURE_ASSEMBLED", "An explicitly supplied signature was assembled under its supplied parameter name; no player transformation was inferred.")
                             } else require(!Url(resource).parameters[parameter].isNullOrEmpty())
+                        } catch (cancelled: CancellationException) { throw cancelled
                         } catch (_: Exception) {
                             val reason = if (!cipherFields?.get("s").isNullOrBlank())
                                 "Requires a complete supported player-JavaScript signature transformation; this supplied cipher was not resolved."
@@ -172,6 +175,7 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
                             require(Url(url).parameters.getAll("n")?.size == 1 && transforms?.throttlingAvailable == true)
                             url = YouTubeUrlAssembly.replaceParameter(url, "n", transforms.throttling(requireNotNull(Url(url).parameters["n"])))
                             diagnostic("THROTTLING_PARAMETER_RESOLVED", "The supplied n parameter was processed by a complete supported player program; media-server acceptance is tested separately.")
+                        } catch (cancelled: CancellationException) { throw cancelled
                         } catch (_: Exception) {
                             val reason = "Contains player throttling parameter n without a complete supported player-JavaScript transform."
                             unavailable = unavailable ?: reason
@@ -245,6 +249,7 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
                         url = YouTubeUrlAssembly.replaceParameter(url, "n", transforms.throttling(requireNotNull(Url(url).parameters["n"])))
                         unresolvedN = false
                         diagnostic("MANIFEST_THROTTLING_PARAMETER_RESOLVED", "The supplied manifest n parameter was processed with a complete supported player program.")
+                    } catch (cancelled: CancellationException) { throw cancelled
                     } catch (_: Exception) {
                         // Keep the original pointer unavailable; an execution failure is not success.
                     }

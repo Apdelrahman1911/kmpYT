@@ -11,6 +11,8 @@ import io.ktor.client.engine.android.Android
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import dev.kmpyt.testfixtures.startLoopback
+import dev.kmpyt.testfixtures.loopbackUrl
 import okio.Buffer
 import org.junit.Assert.*
 import org.junit.Test
@@ -59,14 +61,14 @@ class AndroidYouTubeDownloaderTest {
         val server = MockWebServer()
         server.enqueue(MockResponse().setHeader("Content-Type", "video/mp4").setBody(Buffer().write(video)))
         server.enqueue(MockResponse().setHeader("Content-Type", "audio/mp4").setBody(Buffer().write(audio)))
-        server.start()
+        server.startLoopback()
         val http = HttpClient(Android)
         try {
-            val primary = Representation("video", server.url("/video").toString(), TrackRole.VIDEO,
+            val primary = Representation("video", server.loopbackUrl("/video").toString(), TrackRole.VIDEO,
                 mimeType = "video/mp4", codecs = "avc1.4d401e", sizeBytes = video.size.toLong())
-            val sound = Representation("audio", server.url("/audio").toString(), TrackRole.AUDIO,
+            val sound = Representation("audio", server.loopbackUrl("/audio").toString(), TrackRole.AUDIO,
                 mimeType = "audio/mp4", codecs = "mp4a.40.2", sizeBytes = audio.size.toLong())
-            val plan = PlannedDownload(primary, sound, inspectionUrl = server.url("/owned").toString(), mediaId = "owned")
+            val plan = PlannedDownload(primary, sound, inspectionUrl = server.loopbackUrl("/owned").toString(), mediaId = "owned")
             val progress = mutableListOf<YouTubeDownloadProgress>()
             val result = AndroidYouTubeDownloader(http, true).download(plan, output.path) { progress += it }
             assertEquals("video/mp4", result.mimeType)

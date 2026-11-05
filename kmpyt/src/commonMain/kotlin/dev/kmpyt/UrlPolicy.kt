@@ -12,10 +12,15 @@ object UrlPolicy {
         val url = try { Url(input) } catch (_: Exception) { return "Enter a complete HTTPS URL." }
         if (url.host.isBlank() || "://" !in input) return "Enter a complete HTTPS URL."
         if (!url.user.isNullOrBlank() || !url.password.isNullOrBlank()) return "URLs containing account credentials are not supported."
-        val local = allowLocalHttp && url.protocol.name == "http" && url.host in setOf("127.0.0.1", "localhost")
+        // Explicit loopback literals only; never resolve arbitrary hostnames to relax HTTPS.
+        val local = allowLocalHttp && url.protocol.name == "http" && isLoopbackHost(url.host)
         if (url.protocol.name != "https" && !local) return "Use HTTPS. Other URL schemes are not supported."
         return null
     }
+
+    internal fun isLoopbackHost(host: String): Boolean = host.lowercase() in setOf(
+        "127.0.0.1", "localhost", "::1", "[::1]", "0:0:0:0:0:0:0:1", "[0:0:0:0:0:0:0:1]",
+    )
 }
 
 enum class MediaKind { VIDEO, AUDIO }

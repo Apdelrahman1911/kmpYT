@@ -12,7 +12,7 @@ The shared library inspects public videos, discovers formats, searches and brows
 | JVM desktop | Isolated Chromium controlled by Node.js 22 | Caller-installed FFmpeg |
 | iOS | Nonpersistent WKWebView with external requests blocked | AVFoundation |
 
-Public player programs are versioned by their actual source URL and reused within a bounded cache. Video metadata and signed resource URLs remain fresh. Available combined transfer sizes are reported before downloading; unknown lengths remain unknown. Android and desktop downloads support validated checkpoint resume. There is no fixed 512 MiB library limit.
+Public player programs are versioned by their actual source URL and reused within a bounded cache. Video metadata and signed resource URLs remain fresh. Available combined transfer sizes are reported before downloading; unknown lengths remain unknown. All three platforms support validated checkpoint resume. There is no fixed 512 MiB library limit.
 
 ## Build and integration
 
@@ -48,15 +48,27 @@ Call these suspending methods from a coroutine. Reuse a client to benefit from i
 
 Inspect `report.media` to present formats. When a response supplies HLS/DASH catalogues, call `expandFormats(report)` before selecting their tracks; this fetches manifest metadata only. `playbackPlan(report, selection)` provides portable progressive/SABR source contracts. `search`, `channel`, `playlist`, `more` and `captions` expose browsing and subtitle data. Swift callers use `try await` for suspending operations and handle exported errors with `do`/`catch`.
 
+Retry a cancelled or interrupted download with the same selection and destination to resume validated private progress. On iOS, HTTP resume requires a strong response validator; changed or unverifiable resources restart safely. Refreshed signing parameters can retain progress when the selected media, resource scope and validator still match. SABR checkpoints retain byte receipts and start a fresh protocol session; a changed source generation restarts. iOS checkpoints contain hashes and byte counts rather than signed URLs, headers or session tokens. The host app owns background scheduling and must keep the destination directory available.
+
 ## Current limitations
 
-iOS transfers restart after cancellation or failure; persistent cross-call resume is currently available on Android and desktop. Native media combining only accepts compatible codec/container pairs and does not transcode. iOS segmented transfers require static fragmented MP4. Live/encrypted and nested multivariant manifest downloads are unsupported. Android timing around B-frames and AAC priming remains device dependent. The library supplies playback plans and caption cues; the host app provides its player, subtitle controls and account pages.
+Native media combining only accepts compatible codec/container pairs and does not transcode. iOS segmented transfers require static fragmented MP4. Live/encrypted and nested multivariant manifest downloads are unsupported. Android timing around B-frames and AAC priming remains device dependent. The library supplies playback plans and caption cues; the host app provides its player, subtitle controls and account pages.
 
 ## Validation
 
 [Cross-platform CI](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/ci.yml) runs shared/JVM tests on Linux, Windows and macOS, Android emulator tests, and iOS simulator/framework checks. [Approved-channel tests](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/live-youtube.yml) are manually triggered and restricted to [@oPiiLz](https://www.youtube.com/@oPiiLz). They upload redacted results rather than downloaded media or signed URLs. The live-test byte budget is a CI resource limit, not a library download limit.
 
 iOS file/protocol tests use the Kotlin simulator runner. WebKit is exercised by unconditional Swift XCTest cases inside the UIKit app in `ci/ios-host/`, linked to the simulator framework. CI generates that project with XcodeGen, publishes its `.xcresult` report, and assembles the release XCFramework after the tests succeed.
+
+Run `./gradlew :kmpyt:connectedDebugAndroidTest` to exercise the native Android runtime, file transfers and media combining on a connected emulator. These tests use authored fixtures and local servers; the live smoke test is skipped by default. To explicitly check one approved-channel video on Android:
+
+```shell
+./gradlew :kmpyt:connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=dev.kmpyt.android.AndroidApprovedVideoSmokeTest \
+  -Pandroid.testInstrumentationRunnerArguments.kmpytLiveSmoke=true
+```
+
+The smoke test verifies the uploader before transferring media, checks saved audio/video samples and decodes a video frame. Its five-minute/eight-MiB budget applies only to this test. The test application's private `files/kmpyt-live-smoke.json` contains redacted diagnostics; downloaded media is deleted afterward. The 2026-11-05 local Android 15 run stopped at DNS resolution (`TRANSPORT_DNS_FAILURE`), before any media download. Live playback on that emulator remains unverified.
 
 The [2026-11-04 live run](https://github.com/Apdelrahman1911/kmpYT/actions/runs/41902649543) reached the approved channel, but YouTube returned `AUTHORIZATION_REQUIRED` and no formats for its sampled videos. No live media was downloaded. Controlled transfer tests and this upstream access failure are reported separately; a passing offline suite does not establish live YouTube availability.
 

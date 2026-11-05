@@ -8,6 +8,8 @@ import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import dev.kmpyt.testfixtures.startLoopback
+import dev.kmpyt.testfixtures.loopbackUrl
 import okhttp3.mockwebserver.RecordedRequest
 import okhttp3.mockwebserver.SocketPolicy
 import okio.Buffer
@@ -28,7 +30,7 @@ class HttpDownloadTransferTest {
 
     private fun partial(): File = File.createTempFile("kmpyt-transfer-", ".part")
 
-    private fun task(server: MockWebServer): FileTransferRequest { val url = server.url("/media.mp4").toString(); return FileTransferRequest(url, PlannedDownload(Representation("owned", url, TrackRole.MUXED, mimeType = "video/mp4"), inspectionUrl = server.url("/page").toString(), mediaId = "owned")) }
+    private fun task(server: MockWebServer): FileTransferRequest { val url = server.loopbackUrl("/media.mp4").toString(); return FileTransferRequest(url, PlannedDownload(Representation("owned", url, TrackRole.MUXED, mimeType = "video/mp4"), inspectionUrl = server.loopbackUrl("/page").toString(), mediaId = "owned")) }
 
     private fun response(body: ByteArray, status: Int = 200, range: String? = null, etag: String = "\"a\"") =
         MockResponse().setResponseCode(status).setBody(Buffer().write(body))
@@ -44,7 +46,7 @@ class HttpDownloadTransferTest {
         try {
             java.io.RandomAccessFile(file, "rw").use { it.setLength(offset) }
             server.enqueue(response(tail, 206, "bytes $offset-${total - 1}/$total"))
-            server.start()
+            server.startLoopback()
             val result = HttpDownloadTransfer(true).fetch(task(server).copy(etag = "\"a\"", totalBytes = total), file, { true }) { }
             assertEquals(total, result.bytes)
             assertEquals(total, file.length())
@@ -60,7 +62,7 @@ class HttpDownloadTransferTest {
         val file = partial()
         try {
             server.enqueue(response(bytes))
-            server.start()
+            server.startLoopback()
             val progress = mutableListOf<TransferProgress>()
             val result = HttpDownloadTransfer(true).fetch(task(server), file, { true }) { progress += it }
             assertArrayEquals(bytes, file.readBytes())
@@ -83,7 +85,7 @@ class HttpDownloadTransferTest {
             }
         }
         try {
-            server.start()
+            server.startLoopback()
             val initial = task(server)
             try {
                 HttpDownloadTransfer(true).fetch(initial, file, { active.get() }) {
@@ -110,7 +112,7 @@ class HttpDownloadTransferTest {
         val replacement = ByteArray(bytes.size) { ((it + 17) % 251).toByte() }
         try {
             server.enqueue(response(replacement, etag = "\"b\""))
-            server.start()
+            server.startLoopback()
             file.writeBytes(bytes.copyOfRange(0, 100_000))
             HttpDownloadTransfer(true).fetch(task(server).copy(etag = "\"a\""), file, { true }) { }
             assertArrayEquals(replacement, file.readBytes())
@@ -131,7 +133,7 @@ class HttpDownloadTransferTest {
             }
         }
         try {
-            server.start()
+            server.startLoopback()
             try {
                 HttpDownloadTransfer(true).fetch(task(server), file, { true }) { last = it }
                 error("A truncated response must not complete")
@@ -149,7 +151,7 @@ class HttpDownloadTransferTest {
             file.writeBytes(bytes.copyOfRange(0, 100))
             val original = file.readBytes()
             server.enqueue(response(bytes.copyOfRange(0, 100), 206, "bytes 0-99/${bytes.size}"))
-            server.start()
+            server.startLoopback()
             try {
                 HttpDownloadTransfer(true).fetch(task(server).copy(etag = "\"a\""), file, { true }) { }
                 error("A wrong-offset response must fail")
@@ -165,7 +167,7 @@ class HttpDownloadTransferTest {
         try {
             file.writeBytes(bytes.copyOfRange(0, 100))
             server.enqueue(response(bytes.copyOfRange(100, 200), 206, "bytes 100-199/*"))
-            server.start()
+            server.startLoopback()
             try {
                 HttpDownloadTransfer(true).fetch(
                     task(server).copy(etag = "\"a\"", totalBytes = bytes.size.toLong()),
@@ -187,7 +189,7 @@ class HttpDownloadTransferTest {
             file.writeBytes(bytes.copyOfRange(0, 100))
             server.enqueue(response(bytes.copyOfRange(100, 200), 206, "bytes 100-199/*"))
             server.enqueue(response(bytes))
-            server.start()
+            server.startLoopback()
             val result = HttpDownloadTransfer(true).fetch(task(server).copy(etag = "\"a\""), file, { true }) { }
             assertArrayEquals(bytes, file.readBytes())
             assertEquals(bytes.size.toLong(), result.total)
@@ -205,7 +207,7 @@ class HttpDownloadTransferTest {
             file.writeBytes(bytes.copyOfRange(0, 100))
             server.enqueue(response(bytes.copyOfRange(100, 200), 206, "bytes 100-199/*"))
             server.enqueue(response(bytes.copyOfRange(0, 200), 206, "bytes 0-199/*"))
-            server.start()
+            server.startLoopback()
             try {
                 HttpDownloadTransfer(true).fetch(task(server).copy(etag = "\"a\""), file, { true }) { }
                 error("Repeated ambiguous partial responses must fail")
@@ -223,7 +225,7 @@ class HttpDownloadTransferTest {
             server.enqueue(MockResponse().setResponseCode(416)
                 .setHeader("Content-Range", "bytes */100").setHeader("ETag", "\"a\""))
             server.enqueue(response(bytes))
-            server.start()
+            server.startLoopback()
             val result = HttpDownloadTransfer(true).fetch(
                 task(server).copy(etag = "\"a\"", totalBytes = bytes.size.toLong()),
                 file, { true },
@@ -243,7 +245,7 @@ class HttpDownloadTransferTest {
             file.writeBytes(bytes.copyOfRange(0, 100))
             server.enqueue(response(replacement.copyOfRange(100, 300), 206, "bytes 100-299/300"))
             server.enqueue(response(replacement))
-            server.start()
+            server.startLoopback()
             val result = HttpDownloadTransfer(true).fetch(
                 task(server).copy(etag = "\"a\"", totalBytes = bytes.size.toLong()),
                 file, { true },
@@ -259,7 +261,7 @@ class HttpDownloadTransferTest {
         val server = MockWebServer()
         val file = partial()
         try {
-            server.start()
+            server.startLoopback()
             try {
                 HttpDownloadTransfer(false).fetch(task(server), file, { true }) { }
                 error("Release transport must require HTTPS")
@@ -271,8 +273,8 @@ class HttpDownloadTransferTest {
     @Test fun anonymousRedirectCanTransferActualBytesFromAnotherOrigin() = runBlocking {
         val server = MockWebServer(); val target = MockWebServer(); val file = partial()
         try {
-            server.start(); target.start()
-            server.enqueue(MockResponse().setResponseCode(302).setHeader("Location",target.url("/cdn/media.mp4")))
+            server.startLoopback(); target.startLoopback()
+            server.enqueue(MockResponse().setResponseCode(302).setHeader("Location",target.loopbackUrl("/cdn/media.mp4")))
             target.enqueue(response(bytes))
             val outcome = HttpDownloadTransfer(true,requestHeaders=mapOf("X-Owned-Header" to "source-only-test"))
                 .fetch(task(server),file,{true}) { }
@@ -289,11 +291,11 @@ class HttpDownloadTransferTest {
         val server = MockWebServer(); val target = MockWebServer(); val file = partial()
         val header = "Bearer controlled-session-test"
         try {
-            server.start(); target.start()
-            server.enqueue(MockResponse().setResponseCode(302).setHeader("Location",target.url("/cdn/media.mp4")))
+            server.startLoopback(); target.startLoopback()
+            server.enqueue(MockResponse().setResponseCode(302).setHeader("Location",target.loopbackUrl("/cdn/media.mp4")))
             target.enqueue(response(bytes))
             try {
-                HttpDownloadTransfer(true,requestHeaders=mapOf("Authorization" to header),sessionOrigin=server.url("/").toString())
+                HttpDownloadTransfer(true,requestHeaders=mapOf("Authorization" to header),sessionOrigin=server.loopbackUrl("/").toString())
                     .fetch(task(server),file,{true}) { }
                 error("Protected session headers must remain on their stored origin")
             } catch (_: IllegalArgumentException) { }
@@ -308,7 +310,7 @@ class HttpDownloadTransferTest {
         val file = partial()
         try {
             server.enqueue(MockResponse().setHeader("Content-Type", "application/zip").setBody("not media"))
-            server.start()
+            server.startLoopback()
             try {
                 HttpDownloadTransfer(true).fetch(task(server), file, { true }) { }
                 error("A nonmedia response must fail")
@@ -322,7 +324,7 @@ class HttpDownloadTransferTest {
         val file = partial()
         try {
             server.enqueue(response(byteArrayOf()))
-            server.start()
+            server.startLoopback()
             try {
                 HttpDownloadTransfer(true).fetch(task(server), file, { true }) { }
                 error("Empty media must fail")

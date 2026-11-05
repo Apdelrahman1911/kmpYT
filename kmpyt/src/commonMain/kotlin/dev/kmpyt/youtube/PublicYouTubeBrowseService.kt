@@ -76,8 +76,9 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
             else (page.items + parsed.items).distinctBy { it.kind to it.id }
         val limitReached = combined.size >= MAX_TOTAL_ITEMS || next.pagesLoaded >= MAX_PAGES
         val repeated = parsed.token != null && parsed.token in consumed
-        val usableNext = parsed.token != null && !limitReached && !repeated && !invalidEndpoint
+        val usableNext = parsed.token != null && !limitReached && !repeated && !invalidEndpoint && !parsed.truncated
         val notice = when {
+            parsed.truncated -> PAGE_TRUNCATED_NOTICE
             limitReached -> "The page limit was reached. Open the full list in YouTube to continue."
             invalidEndpoint -> "YouTube returned an unsupported next-page destination. Open the full list in YouTube."
             repeated -> "YouTube repeated its continuation. Reload the list to check for more results."
@@ -92,6 +93,7 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
     private fun assemble(source: String, title: String, parsed: Parsed, context: YouTubeBrowseContinuation?): YouTubeBrowsePage {
         val items = if (isPlaylist(source)) parsed.items else parsed.items.distinctBy { it.kind to it.id }
         val notice = when {
+            parsed.truncated -> PAGE_TRUNCATED_NOTICE
             items.isEmpty() && Url(source).encodedPath == "/" ->
                 "YouTube returned no public recommendations. Search for a video, or open YouTube in the browser to sign in."
             items.isEmpty() -> "No public videos, channels or playlists were returned. Search again or open this page in YouTube."
@@ -99,7 +101,8 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
             parsed.unavailable > 0 -> "Unavailable entries were omitted from this public list."
             else -> null
         }
-        return YouTubeBrowsePage(title.take(300), items, parsed.token.takeIf { context != null }, source, notice, context)
+        return YouTubeBrowsePage(title.take(300), items, parsed.token.takeIf { context != null && !parsed.truncated },
+            source, notice, context.takeUnless { parsed.truncated })
     }
 
     private data class Fetch(val response: ResearchResponse? = null, val notice: String? = null)
@@ -156,7 +159,8 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
     private fun parseObject(value: String): JsonObject? = value.takeIf { it.length <= MAX_PAGE }
         ?.let { runCatching { Json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
 
-    private data class Parsed(val items: List<YouTubeBrowseItem>, val token: String?, val endpoint: String?, val unavailable: Int)
+    private data class Parsed(val items: List<YouTubeBrowseItem>, val token: String?, val endpoint: String?,
+        val unavailable: Int, val truncated: Boolean)
 
     private fun parse(data: JsonObject, source: String): Parsed {
         val items = mutableListOf<YouTubeBrowseItem>()
@@ -164,6 +168,7 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
         var endpoint: String? = null
         var visited = 0
         var unavailable = 0
+        var truncated = false
         fun continuation(value: JsonObject) {
             val command = value.obj("continuationEndpoint") ?: value
             val actual = command.obj("continuationCommand")?.text("token")
@@ -173,7 +178,7 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
             endpoint = command.obj("commandMetadata")?.obj("webCommandMetadata")?.text("apiUrl")
         }
         fun visit(value: JsonElement, depth: Int) {
-            if (depth > 64 || ++visited > MAX_NODES || items.size >= MAX_PAGE_ITEMS) return
+            if (depth > 64 || ++visited > MAX_NODES) { truncated = true; return }
             when (value) {
                 is JsonArray -> value.forEach { visit(it, depth + 1) }
                 is JsonObject -> {
@@ -182,6 +187,7 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
                     if (value.containsKey("nextContinuationData")) { continuation(value); return }
                     for ((key, child) in value) {
                         if (key in ITEM_RENDERERS && child is JsonObject) {
+                            if (items.size >= MAX_PAGE_ITEMS) { truncated = true; return }
                             val result = readItem(key, child, source)
                             if (result != null) items += result else unavailable++
                             return
@@ -197,7 +203,7 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
         // Skip headers, menus and account actions; only actual content/continuation regions are result lists.
         listOf("contents", "continuationContents", "onResponseReceivedActions", "onResponseReceivedCommands", "onResponseReceivedEndpoints")
             .mapNotNull { data[it] }.forEach { visit(it, 0) }
-        return Parsed(items, token, endpoint, unavailable)
+        return Parsed(items, token, endpoint, unavailable, truncated)
     }
 
     private fun readItem(renderer: String, value: JsonObject, source: String): YouTubeBrowseItem? {
@@ -378,6 +384,7 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
         private const val MAX_TOTAL_ITEMS = 5_000
         private const val MAX_PAGES = 100
         private const val MAX_TOKEN = 16_384
+        private const val PAGE_TRUNCATED_NOTICE = "YouTube returned more results than this page limit. Some entries were omitted; refine your search or open the full list in YouTube."
         private val VIDEO_ID = Regex("[A-Za-z0-9_-]{11}")
         private val PLAYLIST_ID = Regex("[A-Za-z0-9_-]{2,200}")
         private val CHANNEL_ID = Regex("UC[A-Za-z0-9_-]{10,64}")
