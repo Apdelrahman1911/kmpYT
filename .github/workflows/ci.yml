@@ -152,19 +152,26 @@ jobs:
           xcrun simctl boot "$IOS_DEVICE" || true
           xcrun simctl bootstatus "$IOS_DEVICE" -b
       - name: Test native iOS protocols and media processing
-        run: ./gradlew ":kmpyt:$IOS_TEST_TASK" "-PiosSimulatorDevice=$IOS_DEVICE" --stacktrace
+        run: |
+          set -o pipefail
+          mkdir -p kmpyt/build/reports
+          ./gradlew ":kmpyt:$IOS_TEST_TASK" "-PiosSimulatorDevice=$IOS_DEVICE" --stacktrace 2>&1 | tee kmpyt/build/reports/ios-native-build.log
       - name: Upload native test diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ios-native-test-reports
           path: |
+            kmpyt/build/reports/ios-native-build.log
             kmpyt/build/reports/tests/
             kmpyt/build/test-results/
       - name: Build the simulator framework for hosted tests
         id: framework
         if: always() && !cancelled()
-        run: ./gradlew ":kmpyt:$IOS_FRAMEWORK_TASK" --stacktrace
+        run: |
+          set -o pipefail
+          mkdir -p kmpyt/build/reports
+          ./gradlew ":kmpyt:$IOS_FRAMEWORK_TASK" --stacktrace 2>&1 | tee kmpyt/build/reports/ios-framework-build.log
       - name: Test WebKit in a UIKit application host
         if: ${{ !cancelled() && steps.framework.outcome == 'success' }}
         run: |
@@ -185,6 +192,7 @@ jobs:
           name: ios-framework-and-reports
           path: |
             kmpyt/build/XCFrameworks/
+            kmpyt/build/reports/ios-*-build.log
             kmpyt/build/reports/tests/
             kmpyt/build/test-results/
             kmpyt/build/reports/ios-host.xcresult/

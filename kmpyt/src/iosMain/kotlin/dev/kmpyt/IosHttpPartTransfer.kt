@@ -15,6 +15,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import platform.Foundation.NSDate
 import platform.Foundation.NSURL
+import platform.Foundation.timeIntervalSince1970
 
 /** A response validator is checked before an existing file is opened for appending. */
 internal class IosHttpPartTransfer(private val http: HttpClient, private val store: IosDownloadResumeStore,
