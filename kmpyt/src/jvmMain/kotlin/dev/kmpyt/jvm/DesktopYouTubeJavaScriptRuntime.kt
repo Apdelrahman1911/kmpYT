@@ -39,7 +39,9 @@ class DesktopYouTubeJavaScriptRuntime internal constructor(private val helperSou
         val session = Session(process, profile, callTimeoutSeconds) { sessions.remove(it) }
         sessions += session
         try {
-            val reply = session.exchange(buildJsonObject { put("action", "prepare"); put("program", program); put("executable", browser.toString()); put("profile", profile.toString()) }, 40)
+            // Includes a separate 30s cold browser startup allowance plus bounded offline setup.
+            // Individual CDP requests, JS evaluation and subsequent transforms keep their limits.
+            val reply = session.exchange(buildJsonObject { put("action", "prepare"); put("program", program); put("executable", browser.toString()); put("profile", profile.toString()) }, 60)
             val capabilities = requireNotNull(reply["capabilities"] as? JsonObject)
             session.actualCapabilities = YouTubeJavaScriptCapabilities(
                 capabilities["signature"]?.jsonPrimitive?.booleanOrNull == true,

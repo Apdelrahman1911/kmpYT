@@ -50,7 +50,8 @@ async function start(executable, suppliedProfile) {
   ], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
   const endpoint = await new Promise((resolve, reject) => {
     let text = '';
-    const timer = setTimeout(() => reject(failure('OFFLINE_BROWSER_STARTUP_TIMEOUT')), 15000);
+    // Cold browser installation/profile startup is separate from CDP and JS execution limits.
+    const timer = setTimeout(() => reject(failure('OFFLINE_BROWSER_STARTUP_TIMEOUT')), 30000);
     browser.once('error', () => { clearTimeout(timer); reject(failure('OFFLINE_BROWSER_SPAWN_FAILED')); });
     browser.once('exit', () => { clearTimeout(timer); reject(failure('OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT')); });
     browser.stderr.on('data', data => {
