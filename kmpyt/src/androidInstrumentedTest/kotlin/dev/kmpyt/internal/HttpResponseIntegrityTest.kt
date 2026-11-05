@@ -94,6 +94,69 @@ class HttpResponseIntegrityTest {
         } finally { server.shutdown(); file.delete() }
     }
 
+    @Test fun changedStrongEtagChunkedReplacementDoesNotInheritCheckpointSize(): Unit = runBlocking {
+        val server = MockWebServer()
+        val file = File.createTempFile("kmpyt-replacement-size-", ".part", InstrumentationRegistry.getInstrumentation().targetContext.cacheDir)
+        try {
+            val replacements = listOf(ByteArray(100) { 7 }, ByteArray(bytes.size + 16) { 19 })
+            replacements.forEach { server.enqueue(chunked(it)) }
+            server.startLoopback()
+            for (replacement in replacements) {
+                file.writeBytes(bytes.copyOf(1000))
+                val progress = mutableListOf<TransferProgress>()
+                val result = HttpDownloadTransfer(true).fetch(
+                    request(server).copy(totalBytes = bytes.size.toLong(), etag = "\"old\""),
+                    file, { true },
+                ) { progress += it }
+                assertArrayEquals(replacement, file.readBytes())
+                assertEquals(replacement.size.toLong(), result.total)
+                assertNull(progress.first().total)
+                assertEquals(replacement.size.toLong(), progress.last().total)
+                val request = server.takeRequest()
+                assertEquals("bytes=1000-", request.getHeader("Range"))
+                assertEquals("\"old\"", request.getHeader("If-Range"))
+            }
+        } finally { server.shutdown(); file.delete() }
+    }
+
+    @Test fun unchangedStrongEtagChunkedResponseStillRequiresCheckpointSize(): Unit = runBlocking {
+        val server = MockWebServer()
+        val file = File.createTempFile("kmpyt-same-entity-size-", ".part", InstrumentationRegistry.getInstrumentation().targetContext.cacheDir)
+        try {
+            file.writeBytes(bytes.copyOf(1000))
+            server.enqueue(chunked(bytes.copyOf(100)))
+            server.startLoopback()
+            val progress = mutableListOf<TransferProgress>()
+            expectFailure<RetryableDownloadException> {
+                HttpDownloadTransfer(true).fetch(
+                    request(server).copy(totalBytes = bytes.size.toLong(), etag = "\"owned\""),
+                    file, { true },
+                ) { progress += it }
+            }
+            assertEquals(bytes.size.toLong(), progress.last().total)
+            assertEquals(1, server.requestCount)
+        } finally { server.shutdown(); file.delete() }
+    }
+
+    @Test fun changedStrongEtagCannotDiscardTheInspectedExactSize(): Unit = runBlocking {
+        val server = MockWebServer()
+        val file = File.createTempFile("kmpyt-inspected-replacement-", ".part", InstrumentationRegistry.getInstrumentation().targetContext.cacheDir)
+        try {
+            file.writeBytes(bytes.copyOf(1000))
+            server.enqueue(chunked(bytes.copyOf(100)))
+            server.startLoopback()
+            val progress = mutableListOf<TransferProgress>()
+            expectFailure<RetryableDownloadException> {
+                HttpDownloadTransfer(true).fetch(
+                    request(server, bytes.size.toLong()).copy(etag = "\"old\""),
+                    file, { true },
+                ) { progress += it }
+            }
+            assertEquals(bytes.size.toLong(), progress.last().total)
+            assertEquals(1, server.requestCount)
+        } finally { server.shutdown(); file.delete() }
+    }
+
     @Test fun http200WithPartialContentRangeCannotBecomeAnUnknownSizeCompleteFile(): Unit = runBlocking {
         val server = MockWebServer()
         val file = File.createTempFile("kmpyt-200-range-", ".part", InstrumentationRegistry.getInstrumentation().targetContext.cacheDir)

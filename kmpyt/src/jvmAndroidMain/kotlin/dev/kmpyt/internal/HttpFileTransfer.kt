@@ -134,7 +134,13 @@ internal class HttpDownloadTransfer(
                         return@withContext TransferOutcome(offset, offset, etag ?: storedEtag, modified ?: storedModified)
                     }
                     is DownloadProtocol.ResponsePlan.Transfer -> {
-                        val knownTotal = task.expectedBytes ?: task.totalBytes
+                        val oldStrongEtag = DownloadProtocol.strongValidator(task.etag, null)
+                        val newStrongEtag = DownloadProtocol.strongValidator(etag, null)
+                        val replacedEntity = status == 200 && oldStrongEtag != null && newStrongEtag != null &&
+                            oldStrongEtag != newStrongEtag
+                        // A confirmed replacement cannot inherit the previous entity's size.
+                        // Inspection bounds remain exact, even when the server changes validators.
+                        val knownTotal = task.expectedBytes ?: task.totalBytes.takeUnless { replacedEntity }
                         if (task.expectedBytes != null && plan.total != null && plan.total != task.expectedBytes) {
                             throw PermanentDownloadException("The response length conflicts with the inspected media size. Inspect the source again.")
                         }

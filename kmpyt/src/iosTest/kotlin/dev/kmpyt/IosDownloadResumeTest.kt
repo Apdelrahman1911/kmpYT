@@ -71,6 +71,72 @@ class IosDownloadResumeTest {
         }
     }
 
+    @Test fun interruptedChunkedReplacementForgetsTheOldSizeAndResumesAtItsActualNewLength() = iosTest {
+        inIosTestDirectory { directory ->
+            val selected = plan(size = null)
+            interrupt(directory, selected)
+            // A valid MP4 free atom changes the entity length without changing the authored media tracks.
+            val freeAtom = ByteArray(136).also {
+                it[3] = 136.toByte()
+                "free".encodeToByteArray().copyInto(it, 4)
+            }
+            val replacement = bytes + freeAtom
+            val replacementCut = bytes.size + 32
+            val newTag = "\"replacement-v2\""
+            val updates = mutableListOf<YouTubeDownloadProgress>()
+            var requests = 0
+            val http = HttpClient(MockEngine { request ->
+                requests++
+                if (requests == 1) {
+                    assertEquals("bytes=$cut-", request.headers[HttpHeaders.Range])
+                    respond(replacement.copyOfRange(cut, replacement.size), HttpStatusCode.PartialContent,
+                        mediaHeaders(replacement.size - cut, newTag, "bytes $cut-${replacement.lastIndex}/${replacement.size}"))
+                } else {
+                    assertNull(request.headers[HttpHeaders.Range])
+                    respond(replacement.copyOfRange(0, replacementCut), HttpStatusCode.OK,
+                        Headers.build {
+                            appendAll(mediaHeaders(null, newTag))
+                            append(HttpHeaders.TransferEncoding, "chunked")
+                        })
+                }
+            }) { followRedirects = false }
+            try {
+                assertFailsWith<CancellationException> {
+                    IosYouTubeDownloader(http).download(selected, "$directory/output.mp4") {
+                        updates += it
+                        if (it.bytesDownloaded > bytes.size) throw CancellationException("interrupt the larger replacement")
+                    }
+                }
+                assertEquals(2, requests)
+                assertEquals(bytes.size.toLong(), updates.first().totalBytes)
+                val reset = updates.indexOfFirst { it.bytesDownloaded == 0L && it.totalBytes == null }
+                assertTrue(reset >= 0, "The changed entity must publish an unknown-size restart before its first bytes.")
+                assertTrue(updates.drop(reset).all { it.totalBytes == null })
+                val saved = savedPart(directory, selected)
+                assertEquals(replacementCut.toLong(), saved.bytes)
+                assertNull(saved.total)
+                assertNull(saved.objectTotalBytes)
+                assertFalse(saved.complete)
+                assertFalse(NSFileManager.defaultManager.fileExistsAtPath("$directory/output.mp4"))
+            } finally { http.close() }
+            val resumed = HttpClient(MockEngine { request ->
+                assertEquals("bytes=$replacementCut-", request.headers[HttpHeaders.Range])
+                respond(replacement.copyOfRange(replacementCut, replacement.size), HttpStatusCode.PartialContent,
+                    mediaHeaders(replacement.size - replacementCut, newTag,
+                        "bytes $replacementCut-${replacement.lastIndex}/${replacement.size}"))
+            }) { followRedirects = false }
+            val resumedUpdates = mutableListOf<YouTubeDownloadProgress>()
+            try {
+                val result = IosYouTubeDownloader(resumed).download(selected, "$directory/output.mp4") { resumedUpdates += it }
+                assertNull(resumedUpdates.first().totalBytes)
+                assertEquals(replacement.size.toLong(), resumedUpdates.last().totalBytes)
+                assertEquals(replacement.size.toLong(), result.bytesWritten)
+                assertContentEquals(replacement, read(result.destinationPath))
+                assertEquals(listOf("output.mp4"), children(directory))
+            } finally { resumed.close() }
+        }
+    }
+
     @Test fun weakOrMissingInitialValidatorsDoNotRetainUnverifiablePartialBytes() = iosTest {
         for (tag in listOf(null, "W/$validator", "\"malformed\" \"tag\"")) {
             inIosTestDirectory { directory ->

@@ -1,5 +1,6 @@
 package dev.kmpyt.extraction
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import kotlin.test.*
 
@@ -67,6 +68,68 @@ class TransferSizeMetadataTest {
         }, { _, _, total -> totals += total })
         assertEquals(120L, totals.first())
         assertEquals(128L, totals.last())
+    }
+
+    @Test fun interruptedUnknownLengthReplacementDropsOldSizeAndResumesWithoutRestoringIt() = runTest {
+        val selected = plan(video.copy(sizeBytes = null), null)
+        var saved = listOf(PartState("0-0", bytes = 40, total = 100, objectTotalBytes = 100))
+        val published = mutableListOf<Long?>()
+        assertFailsWith<CancellationException> {
+            TransferCoordinator().run(selected, saved, { true }, { part, state, progress ->
+                assertEquals(100L, state.total)
+                progress(PartState(part.key), 0)
+                assertNull(saved.single().total)
+                assertNull(saved.single().objectTotalBytes)
+                progress(PartState(part.key, bytes = 20), 10)
+                throw CancellationException("Replacement interrupted after a durable prefix")
+            }, { states, _, total -> saved = states; published += total })
+        }
+        assertEquals(20L, saved.single().bytes)
+        assertNull(saved.single().total)
+        assertEquals(listOf(100L, null, null), published)
+
+        TransferCoordinator().run(selected, saved, { true }, { part, state, progress ->
+            assertEquals(20L, state.bytes)
+            assertNull(state.total)
+            progress(PartState(part.key, bytes = 120), 10)
+            assertNull(published.last(), "An old 100-byte response must not constrain the replacement")
+            PartState(part.key, bytes = 150)
+        }, { states, _, total -> saved = states; published += total })
+        assertEquals(150L, published.last())
+        assertEquals(PartState("0-0", bytes = 150, total = 150, complete = true), saved.single())
+    }
+
+    @Test fun restartKeepsInspectedSizeWhileDiscardingPreviousResponseReceipt() = runTest {
+        val selected = plan(video, null)
+        val restored = listOf(PartState("0-0", bytes = 40, total = 100, objectTotalBytes = 100))
+        var saved = restored
+        val totals = mutableListOf<Long?>()
+        TransferCoordinator().run(selected, restored, { true }, { part, _, progress ->
+            progress(PartState(part.key), 0)
+            assertEquals(100L, saved.single().total)
+            assertNull(saved.single().objectTotalBytes)
+            progress(PartState(part.key, bytes = 20), 10)
+            assertEquals(100L, saved.single().total)
+            PartState(part.key, bytes = 100)
+        }, { states, _, total -> saved = states; totals += total })
+        assertTrue(totals.all { it == 100L })
+        assertTrue(saved.single().complete)
+    }
+
+    @Test fun continuingUnknownUpdatesKeepTheValidatedCheckpointSize() = runTest {
+        val selected = plan(video.copy(sizeBytes = null), null)
+        val restored = listOf(PartState("0-0", bytes = 40, total = 100, objectTotalBytes = 100))
+        val totals = mutableListOf<Long?>()
+        TransferCoordinator().run(selected, restored, { true }, { _, state, progress ->
+            progress(state.copy(total = null), 0)
+            progress(state.copy(bytes = 60, total = null), 10)
+            assertEquals(100L, totals.last())
+            state.copy(bytes = 100, total = null)
+        }, { states, _, total ->
+            totals += total
+            assertEquals(100L, states.single().objectTotalBytes)
+        })
+        assertTrue(totals.all { it == 100L })
     }
 
     @Test fun initializationAndRangesAreCountedOnceAndPartialRangesRemainUnknown() {

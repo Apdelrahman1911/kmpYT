@@ -138,8 +138,16 @@ class TransferCoordinator(private val maximumBytes: Long = Long.MAX_VALUE) {
             persist(ordered, speed, total)
             lastPublished = value
         }
-        fun retainTotal(update: PartState, previous: PartState, complete: Boolean = update.complete): PartState = update.copy(
-            total = update.total ?: if (complete) update.bytes else previous.total?.takeIf { it >= update.bytes }, complete = complete)
+        fun retainTotal(update: PartState, previous: PartState, expectedBytes: Long?,
+            complete: Boolean = update.complete): PartState {
+            // Native transports publish zero bytes before replacing a retained prefix. A
+            // former response's length no longer describes that new entity; only the
+            // inspected size may fill a missing total. Other receipt fields belong to update.
+            val restarted = previous.bytes > 0 && update.bytes == 0L
+            val hint = if (restarted) expectedBytes else previous.total
+            return update.copy(total = update.total ?: if (complete) update.bytes
+                else hint?.takeIf { it >= update.bytes }, complete = complete)
+        }
         if (totalBytes() != null) {
             check(isCurrent()) { "Transfer superseded or cancelled" }
             publish(0)
@@ -152,9 +160,9 @@ class TransferCoordinator(private val maximumBytes: Long = Long.MAX_VALUE) {
             states[part.key] = transfer(part, old) { update, speed ->
                 check(isCurrent()) { "Transfer superseded or cancelled" }
                 require(update.key == part.key) { "Transfer update belongs to a different part" }
-                states[part.key] = retainTotal(update, states.getValue(part.key)); publish(speed)
+                states[part.key] = retainTotal(update, states.getValue(part.key), part.expectedBytes); publish(speed)
             }.also { require(it.key == part.key) { "Transfer completion belongs to a different part" } }
-                .let { retainTotal(it, states.getValue(part.key), complete = true) }
+                .let { retainTotal(it, states.getValue(part.key), part.expectedBytes, complete = true) }
             publish(0)
         }
     }
