@@ -33,6 +33,7 @@ class YouTubeClient(
     private val downloader: YouTubeDownloader? = null,
     private val onClose: () -> Unit = {},
     val platformName: String = "JVM",
+    private val playbackAdapter: YouTubePlaybackAdapter? = null,
 ) {
     private val compiler: YouTubePlayerProgramCompiler = playerRuntime?.let(::ContextYouTubePlayerProgramCompiler)
         ?: BoundedYouTubePlayerProgramCompiler()
@@ -48,6 +49,9 @@ class YouTubeClient(
     private var active = 0
     private val idle = CompletableDeferred<Unit>()
     private val closed = CompletableDeferred<Unit>()
+    private val playbackResources = mutableSetOf<OwnedPlaybackResource>()
+    private var openingPlaybackResources = 0
+    val supportsSabrPlayback: Boolean get() = playbackAdapter != null
 
     @OptIn(ExperimentalTime::class)
     @Throws(Exception::class)
@@ -116,6 +120,59 @@ class YouTubeClient(
         return request
     }
 
+    /**
+     * Adapt the exact static SABR plan to owned native loopback resources. The
+     * explicit caller policy is checked before each media request, not converted
+     * into a platform/integrity grant. No later format/video is selected here.
+     */
+    @Throws(Exception::class)
+    suspend fun openPlayback(request: SourcePlaybackRequest,
+        authorization: SourcePlaybackAuthorization): YouTubePlaybackResource {
+        var acquiredByClient: OwnedPlaybackResource? = null
+        try {
+            return operation {
+                request.requireStaticSabr()
+                validatePlan(request.plan)
+                val adapter = requireNotNull(playbackAdapter) { "Supply a native YouTubePlaybackAdapter for static SABR playback." }
+                lifecycle.withLock {
+                    check(playbackResources.size + openingPlaybackResources < 8) { "Close unused playback resources before opening another." }
+                    openingPlaybackResources++
+                }
+                try {
+                    val resource = adapter.open(request, authorization)
+                    val owned = OwnedPlaybackResource(resource)
+                    // Track before consulting host-supplied metadata. Even a
+                    // malformed adapter remains owned if its cleanup fails.
+                    withContext(NonCancellable) {
+                        lifecycle.withLock { playbackResources += owned }
+                        acquiredByClient = owned
+                    }
+                    val endpoints = resource.endpoints.toList()
+                    val tracks = listOfNotNull(request.plan.primary, request.plan.audio)
+                    require(endpoints.size == tracks.size && tracks.all { track ->
+                        endpoints.singleOrNull { it.role == track.role }?.let {
+                            it.lengthBytes == track.sizeBytes && it.mimeType == track.mimeType.substringBefore(';').trim().lowercase()
+                        } == true
+                    }) { "The native playback resource changed the selected track metadata." }
+                    owned.publishEndpoints(endpoints)
+                    owned
+                } finally {
+                    withContext(NonCancellable) { lifecycle.withLock { openingPlaybackResources-- } }
+                }
+            }
+        } catch (failure: Throwable) {
+            // Dispatchers.Default may cancel delivery after the adapter returned.
+            // Reclaim a registered resource that the caller never received.
+            withContext(NonCancellable) {
+                try { acquiredByClient?.close() }
+                catch (_: Throwable) {
+                    failure.addSuppressed(IllegalStateException("Could not close an undelivered native playback resource."))
+                }
+            }
+            throw failure
+        }
+    }
+
     /** Resolves selected manifests only; no media transfer begins until [download] is called. */
     @Throws(Exception::class)
     suspend fun plan(report: ExtractionReport, selection: YouTubeFormatSelection,
@@ -181,13 +238,46 @@ class YouTubeClient(
             if (!owner) { closed.await(); return@withContext }
             try {
                 idle.await()
-                try { programs.clear() } finally { onClose() }
+                try {
+                    var cleanupFailed = false
+                    for (resource in lifecycle.withLock { playbackResources.toList() }) {
+                        try { resource.close() } catch (_: Throwable) { cleanupFailed = true }
+                    }
+                    programs.clear()
+                    check(!cleanupFailed) { "Could not close every native playback resource." }
+                } finally { onClose() }
                 closed.complete(Unit)
             } catch (failure: Throwable) {
                 closed.completeExceptionally(failure)
                 throw failure
             }
         }
+    }
+
+    private inner class OwnedPlaybackResource(private val delegate: YouTubePlaybackResource) : YouTubePlaybackResource {
+        private var endpointSnapshot: List<YouTubePlaybackEndpoint> = emptyList()
+        override val endpoints: List<YouTubePlaybackEndpoint> get() = endpointSnapshot
+        fun publishEndpoints(endpoints: List<YouTubePlaybackEndpoint>) { endpointSnapshot = endpoints }
+        private val mutex = Mutex()
+        private var disposed = false
+        private var closeFailure: Throwable? = null
+        override suspend fun close() = withContext(NonCancellable) {
+            mutex.withLock {
+                closeFailure?.let { throw it }
+                if (!disposed) {
+                    try { delegate.close() }
+                    catch (failure: Throwable) {
+                        // Unknown native release is not permission to delete the
+                        // cache or forget its owner. Later closes must also fail.
+                        closeFailure = failure
+                        throw failure
+                    }
+                    disposed = true
+                    lifecycle.withLock { playbackResources -= this@OwnedPlaybackResource }
+                }
+            }
+        }
+        override fun toString() = "YouTubePlaybackResource(<redacted>)"
     }
 
     private class ClientOperation(val owner: YouTubeClient) : AbstractCoroutineContextElement(Key) {

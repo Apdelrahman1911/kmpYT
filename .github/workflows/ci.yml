@@ -2,6 +2,7 @@ name: Cross-platform CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -93,6 +94,13 @@ jobs:
             test -d "$sdk/build-tools/35.0.0"
             ci/gradle.sh :kmpyt:assembleRelease :kmpyt:lintRelease --stacktrace
           '
+      - name: Compile Android instrumented-test sources without starting a device
+        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
+        run: |
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            ci/gradle.sh :kmpyt:compileDebugAndroidTestKotlinAndroid --stacktrace
+          '
       - name: Required API instrumentation (fails before unaudited native launch)
         if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
         run: |
@@ -128,6 +136,13 @@ jobs:
             source ci/select-tools.sh
             xcodebuild -version
             ci/gradle.sh :kmpyt:linkDebugFrameworkIosX64 --stacktrace
+          '
+      - name: Compile iOS simulator test sources without starting CoreSimulator
+        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
+        run: |
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            ci/gradle.sh :kmpyt:compileTestKotlinIosX64 --stacktrace
           '
       - name: Required native iOS protocols and media processing
         if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}

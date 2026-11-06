@@ -42,7 +42,7 @@ class IosSabrResumeTest {
                 assertEquals(cut.toLong(), updates.first().bytesDownloaded)
                 assertTrue(updates.all { it.totalBytes == payload.size.toLong() })
                 assertContentEquals(payload, read(result.destinationPath))
-                assertEquals(listOf("output.mp4"), children(directory))
+                assertIosResumeResidue(directory, listOf("output.mp4"))
             } finally { http.close() }
         }
     }
@@ -92,12 +92,91 @@ class IosSabrResumeTest {
         }
     }
 
-    private suspend fun interrupt(directory: String, selected: PlannedDownload) {
+    @Test fun changedLocalSabrBytesAndMissingRangeHashesRestartWithoutBufferedAcknowledgements() = iosTest {
+        for (missingHash in listOf(false, true)) inIosTestDirectory { directory ->
+            val selected = plan()
+            interrupt(directory, selected)
+            if (missingHash) {
+                val path = "${working(directory)}/checkpoint.json"
+                val root = Json.parseToJsonElement(read(path).decodeToString()).jsonObject
+                val receipt = root.getValue("sabr").jsonObject
+                val track = receipt.getValue("tracks").jsonArray.single().jsonObject
+                val missing = JsonObject(root + ("sabr" to JsonObject(receipt +
+                    ("tracks" to JsonArray(listOf(JsonObject(track - "rangeDigests")))))))
+                val file = IosMediaFile(path, existing = true)
+                try { file.truncate(0); file.write(0, missing.toString().encodeToByteArray()); file.flush() } finally { file.close() }
+            } else {
+                val file = IosMediaFile("${working(directory)}/sabr-0.mp4", existing = true)
+                try {
+                    val first = file.read(0, 1).single()
+                    file.write(0, byteArrayOf((first.toInt() xor 1).toByte())); file.flush()
+                    assertEquals(cut.toLong(), file.length())
+                } finally { file.close() }
+            }
+            val http = HttpClient(MockEngine { request ->
+                assertEquals("1", request.url.parameters["rn"])
+                val fields = requestFields(request.body as OutgoingContent.ByteArrayContent)
+                assertTrue(fields.none { it.number == 3 })
+                assertAnonymous(fields)
+                respond(packet(0, payload.size, 0), headers = headersOf(HttpHeaders.ContentType, "application/vnd.yt-ump"))
+            })
+            val updates = mutableListOf<YouTubeDownloadProgress>()
+            try { IosYouTubeDownloader(http).download(selected, "$directory/output.mp4") { updates += it } }
+            finally { http.close() }
+            assertEquals(0L, updates.first().bytesDownloaded)
+            assertContentEquals(payload, read("$directory/output.mp4"))
+            assertIosResumeResidue(directory, listOf("output.mp4"))
+        }
+    }
+
+    @Test fun uncommittedSabrTailIsTruncatedBeforeTheNextRequestButVerifiedCoverageSurvives() = iosTest {
+        inIosTestDirectory { directory ->
+            val selected = plan()
+            interrupt(directory, selected)
+            val file = IosMediaFile("${working(directory)}/sabr-0.mp4", existing = true)
+            try { file.write(cut.toLong(), byteArrayOf(91, 92, 93)); file.flush() } finally { file.close() }
+            val http = HttpClient(MockEngine { request ->
+                val fields = requestFields(request.body as OutgoingContent.ByteArrayContent)
+                assertTrue(fields.any { it.number == 3 }); assertAnonymous(fields)
+                val retained = IosMediaFile("${working(directory)}/sabr-0.mp4", existing = true)
+                try { assertEquals(cut.toLong(), retained.length()) } finally { retained.close() }
+                respond(packet(cut, payload.size - cut, 1), headers = headersOf(HttpHeaders.ContentType, "application/vnd.yt-ump"))
+            })
+            try { IosYouTubeDownloader(http).download(selected, "$directory/output.mp4") {} }
+            finally { http.close() }
+            assertContentEquals(payload, read("$directory/output.mp4"))
+        }
+    }
+
+    @Test fun nativeSparseSabrReceiptDoesNotAcknowledgeHolesOrUseFileLengthAsProgress() = iosTest {
+        inIosTestDirectory { directory ->
+            val selected = plan()
+            interrupt(directory, selected, offset = cut, sequence = 1)
+            val file = IosMediaFile("${working(directory)}/sabr-0.mp4", existing = true)
+            try {
+                assertEquals(2L * cut, file.length())
+                file.write(0, ByteArray(cut) { 99 }); file.flush()
+            } finally { file.close() }
+            val http = HttpClient(MockEngine { request ->
+                val fields = requestFields(request.body as OutgoingContent.ByteArrayContent)
+                assertTrue(fields.any { it.number == 3 }); assertAnonymous(fields)
+                respond(packet(0, cut, 0) + packet(cut, cut, 1) + packet(2 * cut, payload.size - 2 * cut, 2),
+                    headers = headersOf(HttpHeaders.ContentType, "application/vnd.yt-ump"))
+            })
+            val updates = mutableListOf<YouTubeDownloadProgress>()
+            try { IosYouTubeDownloader(http).download(selected, "$directory/output.mp4") { updates += it } }
+            finally { http.close() }
+            assertEquals(cut.toLong(), updates.first().bytesDownloaded)
+            assertContentEquals(payload, read("$directory/output.mp4"))
+        }
+    }
+
+    private suspend fun interrupt(directory: String, selected: PlannedDownload, offset: Int = 0, sequence: Int = 0) {
         val policy = YouTubeUmpFraming.encodePart(35, YouTubeProtobufWire.encode(listOf(binary(7, "private-cookie".encodeToByteArray()))))
         val context = YouTubeUmpFraming.encodePart(57, YouTubeProtobufWire.encode(listOf(number(1, 7),
             binary(3, "private-context".encodeToByteArray()), number(4, 1), number(5, 0))))
         val http = HttpClient(MockEngine {
-            respond(packet(0, cut, 0) + policy + context, headers = headersOf(HttpHeaders.ContentType, "application/vnd.yt-ump"))
+            respond(policy + context + packet(offset, cut, sequence), headers = headersOf(HttpHeaders.ContentType, "application/vnd.yt-ump"))
         })
         try {
             assertFailsWith<CancellationException> {
@@ -110,7 +189,8 @@ class IosSabrResumeTest {
                     }
                 }
             }
-            assertContentEquals(payload.copyOfRange(0, cut), read("${working(directory)}/sabr-0.mp4"))
+            assertContentEquals(payload.copyOfRange(offset, offset + cut),
+                read("${working(directory)}/sabr-0.mp4").copyOfRange(offset, offset + cut))
         } finally { http.close() }
     }
 

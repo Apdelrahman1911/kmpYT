@@ -11,6 +11,43 @@ const offlineHtml = '<!doctype html><meta charset="utf-8"><meta http-equiv="Cont
 const output = value => process.stdout.write(JSON.stringify(value) + '\n');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const failure = code => Object.assign(new Error(code), { safeCode: code });
+const startupFailureCodes = new Set([
+  'OFFLINE_BROWSER_STARTUP_TIMEOUT', 'OFFLINE_BROWSER_SPAWN_FAILED',
+  'OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT', 'OFFLINE_BROWSER_ENDPOINT_FILE_INVALID', 'OFFLINE_PROFILE_INVALID'
+]);
+const startupGroups = Object.freeze({
+  spawn: ['OFFLINE_STARTUP_SPAWN_OBSERVED', 'OFFLINE_STARTUP_SPAWN_UNOBSERVED'],
+  child: ['OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED', 'OFFLINE_STARTUP_CHILD_EXIT_OBSERVED', 'OFFLINE_STARTUP_CHILD_UNCONFIRMED'],
+  stderr: ['OFFLINE_STARTUP_STDERR_NONE', 'OFFLINE_STARTUP_STDERR_SOME',
+    'OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT', 'OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT'],
+  port: ['OFFLINE_STARTUP_PORT_UNCHECKED', 'OFFLINE_STARTUP_PORT_MISSING', 'OFFLINE_STARTUP_PORT_ACCESS_DENIED',
+    'OFFLINE_STARTUP_PORT_BUSY', 'OFFLINE_STARTUP_PORT_INCOMPLETE_OR_UNRECOGNIZED',
+    'OFFLINE_STARTUP_PORT_VALID', 'OFFLINE_STARTUP_PORT_FILE_REJECTED']
+});
+const startupCodes = new Set(Object.values(startupGroups).flat());
+function safeStartupObservations(code, values) {
+  // A receipt is all-or-nothing. Never turn arbitrary helper/child text into a
+  // diagnostic, or retain a partially valid, duplicate or contradictory list.
+  if (!startupFailureCodes.has(code) || !Array.isArray(values) || values.length < 4 || values.length > 8 ||
+      values.some(value => typeof value !== 'string' || !startupCodes.has(value)) ||
+      new Set(values).size !== values.length) return undefined;
+  const count = group => values.filter(value => startupGroups[group].includes(value)).length;
+  if (count('spawn') !== 1 || count('child') !== 1 || count('stderr') !== 1 || count('port') < 1 ||
+      (values.includes('OFFLINE_STARTUP_PORT_UNCHECKED') && count('port') !== 1) ||
+      (values.includes('OFFLINE_STARTUP_SPAWN_UNOBSERVED') && values.includes('OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED')) ||
+      (values.includes('OFFLINE_STARTUP_SPAWN_OBSERVED') && values.includes('OFFLINE_STARTUP_CHILD_UNCONFIRMED')) ||
+      (code === 'OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT' && !values.includes('OFFLINE_STARTUP_CHILD_EXIT_OBSERVED')) ||
+      ((code === 'OFFLINE_BROWSER_ENDPOINT_FILE_INVALID') !== values.includes('OFFLINE_STARTUP_PORT_FILE_REJECTED')) ||
+      // A valid endpoint settles discovery successfully, never with one of the
+      // before-endpoint failure codes above. Success observations stay private.
+      values.includes('OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT') || values.includes('OFFLINE_STARTUP_PORT_VALID')) return undefined;
+  return [...values];
+}
+function failureResponse(error) {
+  const code = /^[A-Za-z0-9_$:-]{1,128}$/.test(error.safeCode || '') ? error.safeCode : 'OFFLINE_RUNTIME_FAILURE';
+  const startup = safeStartupObservations(code, error.startup);
+  return { ok: false, error: code, ...(startup ? { startup } : {}) };
+}
 // Codes name authored stages only; CDP messages, stderr, URLs and source values stay private.
 const requestStages = Object.freeze({
   'Target.createTarget': 'TARGET_CREATE', 'Target.attachToTarget': 'TARGET_ATTACH',
@@ -21,9 +58,112 @@ const requestStages = Object.freeze({
 });
 function ownedProfile() {
   try {
-    return profile && path.basename(profile).startsWith('kmpyt-player-') &&
-      fs.realpathSync(path.dirname(profile)) === fs.realpathSync(os.tmpdir());
+    if (!profile || !path.basename(profile).startsWith('kmpyt-player-')) return false;
+    const info = fs.lstatSync(profile);
+    return info.isDirectory() && !info.isSymbolicLink() &&
+      path.dirname(fs.realpathSync(profile)) === fs.realpathSync(os.tmpdir());
   } catch (_) { return false; }
+}
+function activePortEndpoint(text) {
+  // Chromium writes a port and browser UUID, not an arbitrary WebSocket URL.
+  // In particular do not permit credentials, another host, paths or query data.
+  const match = /^([1-9][0-9]{0,4})\r?\n(\/devtools\/browser\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\r?\n)?$/.exec(text);
+  if (!match || Number(match[1]) > 65535) return undefined;
+  return 'ws://127.0.0.1:' + match[1] + match[2];
+}
+function readActivePortEndpoint(observe = () => {}) {
+  if (!ownedProfile()) throw failure('OFFLINE_PROFILE_INVALID');
+  const filename = path.join(profile, 'DevToolsActivePort');
+  let descriptor;
+  try {
+    const before = fs.lstatSync(filename);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > 1024) {
+      throw failure('OFFLINE_BROWSER_ENDPOINT_FILE_INVALID');
+    }
+    descriptor = fs.openSync(filename, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const after = fs.fstatSync(descriptor);
+    if (!after.isFile() || after.nlink !== 1 || after.size > 1024 ||
+        before.dev !== after.dev || before.ino !== after.ino) throw failure('OFFLINE_BROWSER_ENDPOINT_FILE_INVALID');
+    const bytes = Buffer.alloc(1025);
+    const length = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+    if (length > 1024) throw failure('OFFLINE_BROWSER_ENDPOINT_FILE_INVALID');
+    // An incomplete write is not an endpoint. Poll again within the original
+    // startup bound; a full UUID prevents accepting a partially written path.
+    const endpoint = activePortEndpoint(bytes.subarray(0, length).toString('utf8'));
+    observe(endpoint ? 'OFFLINE_STARTUP_PORT_VALID' : 'OFFLINE_STARTUP_PORT_INCOMPLETE_OR_UNRECOGNIZED');
+    return endpoint;
+  } catch (error) {
+    if (error.safeCode) { observe('OFFLINE_STARTUP_PORT_FILE_REJECTED'); throw error; }
+    const retryable = error.code === 'ENOENT' ? 'OFFLINE_STARTUP_PORT_MISSING' :
+      error.code === 'EBUSY' ? 'OFFLINE_STARTUP_PORT_BUSY' :
+        ['EACCES', 'EPERM'].includes(error.code) ? 'OFFLINE_STARTUP_PORT_ACCESS_DENIED' : undefined;
+    if (retryable) { observe(retryable); return undefined; }
+    observe('OFFLINE_STARTUP_PORT_FILE_REJECTED');
+    throw failure('OFFLINE_BROWSER_ENDPOINT_FILE_INVALID');
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+function discoverBrowserEndpoint(child) {
+  return new Promise((resolve, reject) => {
+    let text = '', settled = false, pollTimer;
+    let spawned = false, exited = false, stderr = 'OFFLINE_STARTUP_STDERR_NONE';
+    const portObservations = new Set();
+    const finish = (error, endpoint) => {
+      if (settled) return;
+      settled = true;
+      // Snapshot event/field observations only: no extra I/O or post-deadline
+      // probes. Null exit fields before a spawn event do not prove a live child.
+      if (error) error.startup = Object.freeze([
+        spawned ? 'OFFLINE_STARTUP_SPAWN_OBSERVED' : 'OFFLINE_STARTUP_SPAWN_UNOBSERVED',
+        exited || child.exitCode !== null || child.signalCode !== null ? 'OFFLINE_STARTUP_CHILD_EXIT_OBSERVED' :
+          spawned ? 'OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED' : 'OFFLINE_STARTUP_CHILD_UNCONFIRMED',
+        stderr, ...(portObservations.size ? portObservations : ['OFFLINE_STARTUP_PORT_UNCHECKED'])
+      ]);
+      clearTimeout(timer); clearTimeout(pollTimer);
+      child.removeListener('spawn', onSpawn);
+      child.removeListener('exit', onExit);
+      child.stderr.removeListener('data', onData);
+      child.stderr.resume(); // Drain without retaining or disclosing later logs.
+      error ? reject(error) : resolve(endpoint);
+    };
+    // Cold startup remains separate from CDP/JS limits. Never extend this bound
+    // for missing stderr, incomplete files or an unresponsive browser.
+    const timer = setTimeout(() => finish(failure('OFFLINE_BROWSER_STARTUP_TIMEOUT')), 30000);
+    const onSpawn = () => { spawned = true; };
+    const onExit = () => { exited = true; finish(failure('OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT')); };
+    const onData = data => {
+      if (data.length && stderr === 'OFFLINE_STARTUP_STDERR_NONE') stderr = 'OFFLINE_STARTUP_STDERR_SOME';
+      if (child.exitCode !== null || child.signalCode !== null) return onExit();
+      text = (text + data.toString()).slice(-16000);
+      const lines = text.split('\n');
+      // Chromium's stderr announcement is newline-terminated. Never accept an
+      // unfinished line or a prefix of an invalid UUID/path across pipe chunks.
+      text = lines.pop();
+      for (const line of lines) {
+        const match = /^DevTools listening on ws:\/\/127\.0\.0\.1:([0-9]+)(\/\S+)\r?$/.exec(line);
+        const endpoint = match && activePortEndpoint(match[1] + '\n' + match[2]);
+        if (endpoint) { stderr = 'OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT'; return finish(undefined, endpoint); }
+        if (line.startsWith('DevTools listening on ')) stderr = 'OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT';
+      }
+    };
+    // Leave the once-error handler attached after success so a later process
+    // error cannot become an unhandled EventEmitter error containing paths.
+    child.once('error', () => finish(failure('OFFLINE_BROWSER_SPAWN_FAILED')));
+    child.once('spawn', onSpawn);
+    child.once('exit', onExit);
+    child.stderr.on('data', onData);
+    const poll = () => {
+      if (settled) return;
+      if (child.exitCode !== null || child.signalCode !== null) return onExit();
+      try {
+        const endpoint = readActivePortEndpoint(code => portObservations.add(code));
+        if (endpoint) return finish(undefined, endpoint);
+      } catch (error) { return finish(error); }
+      pollTimer = setTimeout(poll, 25);
+    };
+    poll();
+  });
 }
 async function request(method, params = {}, sessionId, stage = requestStages[method] || 'REQUEST') {
   const id = ++counter;
@@ -48,18 +188,10 @@ async function start(executable, suppliedProfile) {
     '--disable-extensions', '--disable-features=MediaRouter,OptimizationHints',
     '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', 'about:blank'
   ], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
-  const endpoint = await new Promise((resolve, reject) => {
-    let text = '';
-    // Cold browser installation/profile startup is separate from CDP and JS execution limits.
-    const timer = setTimeout(() => reject(failure('OFFLINE_BROWSER_STARTUP_TIMEOUT')), 30000);
-    browser.once('error', () => { clearTimeout(timer); reject(failure('OFFLINE_BROWSER_SPAWN_FAILED')); });
-    browser.once('exit', () => { clearTimeout(timer); reject(failure('OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT')); });
-    browser.stderr.on('data', data => {
-      text = (text + data.toString()).slice(-16000);
-      const match = /DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[a-zA-Z0-9-]+)/.exec(text);
-      if (match) { clearTimeout(timer); resolve(match[1]); }
-    });
-  });
+  // This profile was empty before spawn: never reuse a prior browser's port.
+  // The owned file is Chromium's supported discovery channel for ChromeDriver
+  // and Telemetry, including when a Windows GUI executable has no usable stderr.
+  const endpoint = await discoverBrowserEndpoint(browser);
   try { socket = new WebSocket(endpoint); }
   catch (_) { throw failure('OFFLINE_CDP_CONNECTION_FAILED'); }
   await new Promise((resolve, reject) => {
@@ -157,7 +289,7 @@ lines.on('line', line => {
       } else if (command.action === 'close') {
         await close(); output({ ok: true }); process.exit(0);
       } else throw failure('OFFLINE_INPUT_INVALID');
-    } catch (error) { output({ ok: false, error: /^[A-Za-z0-9_$:-]{1,128}$/.test(error.safeCode || '') ? error.safeCode : 'OFFLINE_RUNTIME_FAILURE' }); }
+    } catch (error) { output(failureResponse(error)); }
   });
 });
 lines.on('close', () => { chain.finally(close).finally(() => process.exit(0)); });

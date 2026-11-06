@@ -16,7 +16,7 @@ The shared library inspects public videos, discovers formats, searches and brows
 | JVM desktop | Isolated Chromium controlled by Node.js 22 | Caller-installed FFmpeg |
 | iOS | Nonpersistent WKWebView with external requests blocked | AVFoundation |
 
-Public player programs are versioned by their actual source URL and reused within a bounded cache. Video metadata and signed resource URLs remain fresh. Available combined transfer sizes are reported before downloading; unknown lengths remain unknown. All three platforms support validated checkpoint resume. There is no fixed 512 MiB library limit.
+Public player programs are versioned by their actual source URL and reused within a bounded cache. Video metadata and signed resource URLs remain fresh. Available combined transfer sizes are reported before downloading; unknown lengths remain unknown. All three platforms provide checkpoint-resume implementations; target-specific verification limits are recorded below. There is no fixed 512 MiB library limit.
 
 ## Build and integration
 
@@ -50,9 +50,129 @@ try {
 
 Call these suspending methods from a coroutine. Reuse a client to benefit from its player cache, then close it when its owner ends. Desktop execution requires Node.js 22 and Chrome/Chromium or Edge; set `KMPYT_NODE` and `KMPYT_CHROMIUM` for nonstandard locations. Pass an FFmpeg executable path when combining separate tracks.
 
+For application-owned runtime provisioning, pass `runtimeOptions = DesktopYouTubeRuntimeOptions(
+nodeExecutable = absoluteNodePath, chromiumExecutable = absoluteChromiumPath,
+temporaryDirectory = absolutePrivateTempPath)` to `createJvmYouTubeClient`. Explicit executable
+paths must already exist and be executable; the private temporary directory must exist and be
+writable. Invalid explicit paths fail rather than silently using another installation. The
+default factory/constructor and environment lookups remain available. Only child-process
+`TMPDIR`/`TMP`/`TEMP` change, matching the Java helper/profile directory; no application-wide
+environment or JVM property is modified. Chromium's sandbox and offline network restrictions
+remain required; these options do not add a no-sandbox mode or install runtime dependencies.
+
 Inspect `report.media` to present formats. When a response supplies HLS/DASH catalogues, call `expandFormats(report)` before selecting their tracks; this fetches manifest metadata only. `playbackPlan(report, selection)` provides portable progressive/SABR source contracts. `search`, `channel`, `playlist`, `more` and `captions` expose browsing and subtitle data. Swift callers use `try await` for suspending operations and handle exported errors with `do`/`catch`.
 
-Retry a cancelled or interrupted download with the same selection and destination to resume validated private progress. On iOS, HTTP resume requires a strong response validator; changed or unverifiable resources restart safely. Refreshed signing parameters can retain progress when the selected media, resource scope and validator still match. SABR checkpoints retain byte receipts and start a fresh protocol session; a changed source generation restarts. iOS checkpoints contain hashes and byte counts rather than signed URLs, headers or session tokens. The host app owns background scheduling and must keep the destination directory available.
+Search submits its **complete query verbatim**, including surrounding whitespace, up to 16,384
+well-formed UTF-16 code units. Oversized/invalid queries and titles are rejected, not shortened.
+`YouTubeBrowsePage.query` records that submitted query; `firstEntry` records the leading content
+entry **before** unavailable/unsupported filtering in the UI-oriented `items` list. Check its
+typed `issue` and nullable kind/identity; never substitute `items.first()` when the first result
+matters. Private videos, unknown cards, advertisements and unrecognized shelves cannot silently
+promote a later video. A navigable album/playlist/channel shelf is a collection result, not one
+of its child tracks. Channels/playlists may be browsed, but are not single-media playback or
+download representations. Browse receipts preserve complete titles and stable public identities;
+they do not certify playback authorization or recording/album equivalence.
+
+### Owned native SABR playback resources
+
+SABR source URLs are POST protocol endpoints, not ordinary MP4/M4A URLs. For an actual
+selected static SABR `SourcePlaybackRequest`, native client factories expose
+`supportsSabrPlayback` and `suspend openPlayback(request, authorization)`. The caller must
+provide its real `SourcePlaybackAuthorization`; no implicit authorization/integrity issuer
+is installed. The existing `YouTubeSabrStreamingSession` is the sole media ingestion engine.
+
+```kotlin
+val resource = youtube.openPlayback(selectedSabrRequest, applicationAuthorization)
+try {
+    // Give the native decoder the exact endpoint for the selected AUDIO/VIDEO role.
+    // Never pass it the original SABR endpoint or persist/log the capability URL.
+    nativePlayer.prepare(resource.endpoints)
+    // Keep resource alive throughout playback, seeks and native callbacks.
+} finally {
+    nativePlayer.release() // Stop native access before releasing its private cache.
+    resource.close()
+}
+```
+
+The owned endpoint binds only numeric IPv4 loopback, uses a random 256-bit capability route,
+and supports exact GET/HEAD/single byte ranges with no-store responses. It serves only verified
+cached coverage, not sparse-file length, and rechecks the caller policy on actual media requests.
+It has bounded headers, connections, chunks and timeouts. `YouTubeNativePlaybackLimits` defaults
+to a 1-GiB static cache budget and four connections per resource; the client permits at most
+eight active/opening resources. Seeking waits for whole-track ingestion to reach the requested
+bytes; there is no invented live window or server-time-seek protocol. Loopback remains **remote
+source playback**, not an offline download.
+
+`resource.close()` cancels/joins owned readers and ingestion, closes listeners and removes its
+private cache. Client close also disposes any remaining resources before its transport. Unknown
+native release stays a failure on repeated close, never a successful deletion authorization.
+Custom hosts can inject `createJvmYouTubeSabrPlaybackAdapter`,
+`createAndroidYouTubeSabrPlaybackAdapter` or `createIosYouTubeSabrPlaybackAdapter`; they retain
+ownership of the HTTP client passed to those adapter factories. Mobile hosts must explicitly
+permit only the required local native transport according to their platform security policy.
+
+The 2026-11-06 focused JVM run passed 103 tests with explicit FFmpeg, including real loopback
+POST-to-range byte integrity and authored AAC decode/seek to a null sink. The later scoped run
+below also compiled Android production and instrumented-test sources; no Android instrumentation
+or iOS adapter execution is established by these Linux runs.
+These tests do not establish authorized live YouTube playback, audible output or app completion.
+
+Retry a cancelled or interrupted download with the same selection and destination to resume
+validated private progress. JVM/Android schema-3 checkpoints retain schema-2 **standalone
+progressive** signing-URL refresh only when the selected media/format, exact origin/path/content
+query, strong quoted ETag, actual redirected response scope and committed-prefix SHA-256 still
+match. Uncommitted tails are truncated; retained complete parts are revalidated too. Query
+order, duplicate/empty pairs and raw encoding remain identity-bearing. Only documented exact
+lowercase signing keys on Googlevideo (or explicit authored loopback tests) are excluded.
+Changed/unverifiable identity restarts; legacy schema-1 checkpoints require the exact old plan.
+Multi-resource plans retain their exact-plan bindings rather than borrowing this progressive
+identity rule. iOS has a separate checkpoint implementation; its retained-byte hashing,
+redirect/scope and storage parity repair is source-reviewed, not compiled or executed for this change.
+
+JVM/Android checkpoint roots must remain caller-private. Platform no-follow guards now inspect
+the full ancestry before destination/private-file access: JVM NIO rejects links, special files
+and reparse attributes; Android uses API-21+ `Os.lstat`, not API-26 NIO. Only the caller-supplied
+parent is canonicalized; a linked destination leaf is never resolved into a writable caller file.
+Oversized or linked private trees fail before reset/cleanup, receipt hashing or media publication.
+**Linux regression and Android compilation results do not establish actual Windows junction
+safety or hostile same-user concurrent-rename protection.** After success, media/checkpoint data
+is purged **while holding the OS lock**; the empty reusable `.<destination-name>.kmpyt/lock` inode
+and its parent remain.
+Do not unlink/recreate that lock while any process may reuse the destination: doing so can let
+two processes lock different inodes for one path. A host may remove a retired private generation
+only under a stronger external lifetime fence proving that no current or future writer can
+reuse it. The host owns background scheduling and persistent job state, not these checkpoint files.
+
+New JVM/Android SABR schema-3 persistence stores only source/plan digests and bounded track byte
+geometry, completed-segment receipts and SHA-256 range hashes. Every retained range is verified
+through at most 64-KiB reads; sparse holes and uncommitted tails do not become coverage. Exact
+inspected source generation/configuration, client, role, format, size and representation metadata
+must still match. Restore starts a **fresh anonymous session** (request number 1), without saved
+cookies, contexts or redirects. Signed-URL renewal is not treated as equivalent SABR generation.
+Externally supplied SABR checkpoints are rejected because they have no adapter-owned track files.
+Legacy SABR schema-1/2 files serialized transient endpoint/configuration/session state; they are
+purged under the stable lock before callbacks or network requests, never replayed or re-saved.
+Raw `SabrTransferCheckpoint` remains a sensitive in-memory protocol object, not a safe persistence
+format. No implicit authorization or integrity grant is added.
+
+The authored iOS schema-2 repair uses the same raw resource identity and SABR byte receipts,
+hashes retained HTTP prefixes and sparse SABR coverage, and revalidates final-response scope and
+strong validators before HTTP append. Schema-less legacy iOS checkpoints still decode as schema 1
+and reset. Bounded regular-file/no-follow checks and stable owner/lock inodes protect private state.
+An earlier dependent media/checkpoint/owner close uncertainty vetoes deletion and keeps the held
+OS lock until process exit; a later error from an already-attempted lock release cannot establish
+continued cross-process exclusion. Numeric descriptors are never retried after uncertain close.
+Three authored native-lock helper regressions use real independent file descriptions and injected
+uncertainty reports, not real close syscall faults. Neither these tests nor the larger Apple repair
+have been compiled/executed; store deletion-veto and sticky ownership wiring are source-reviewed.
+
+The 2026-11-06 scoped Linux JVM privacy/transfer/path run completed **147 tests: 146 passed,
+0 failures/errors, 1 Windows-only junction test skipped**, with explicit FFmpeg. It includes
+9 actual-file SABR receipt cases, 7 receipt/hash cases and 4 raw resource-identity cases. Android
+production and instrumented-test source compilation also passed, including 3 new no-follow
+tests; **0 Android instrumentation tests executed**. The selection overlaps the earlier 103- and
+143-test runs; do not add those totals. Apple compilation, actual Windows execution, live-source
+media access and physical audio playback remain separate unverified gates.
 
 ## Current limitations
 

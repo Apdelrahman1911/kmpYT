@@ -25,7 +25,8 @@ if [ "$(uname -s)" = Darwin ]; then
     [ -d "$DEVELOPER_DIR" ] || { printf '%s\n' 'Pinned existing Xcode missing; no xcode-select/install attempted.' >&2; return 1; }
 fi
 if [ "${1:-}" = jvm ]; then
-    export KMPYT_NODE="$(command -v node)"
+    # The executable itself, not a possible PATH shim/cmd launcher on Windows.
+    export KMPYT_NODE="$(node -p 'process.execPath')"
     node -e 'if (+process.versions.node.split(".")[0] < 22) process.exit(1)'
     KMPYT_FFMPEG="$(command -v ffmpeg || true)"
     if [ -z "$KMPYT_FFMPEG" ]; then
@@ -52,7 +53,10 @@ PY
         export KMPYT_NODE="$(cygpath -m "$KMPYT_NODE")"
         export KMPYT_FFMPEG="$(cygpath -m "$KMPYT_FFMPEG")"
         export KMPYT_CHROMIUM="$(cygpath -m "$KMPYT_CHROMIUM")"
-    else
+    fi
+    python3 -B "$KMPYT_CI_PROJECT_ROOT/ci/js-tool-provenance.py" \
+        --node "$KMPYT_NODE" --node-version "$(node -p 'process.version')" --browser "$KMPYT_CHROMIUM"
+    if ! command -v cygpath >/dev/null 2>&1; then
         export KMPYT_CI_BROWSER="$KMPYT_CHROMIUM"
         export KMPYT_CHROMIUM="$KMPYT_CI_PROJECT_ROOT/ci/chromium.sh"
     fi

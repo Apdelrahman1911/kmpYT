@@ -5,8 +5,11 @@ package dev.kmpyt
 import dev.kmpyt.extraction.*
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.*
+import io.ktor.client.plugins.defaultRequest
+import io.ktor.client.request.header
 import io.ktor.http.*
 import kotlinx.coroutines.*
+import kotlinx.serialization.json.*
 import platform.Foundation.*
 import kotlin.test.*
 
@@ -18,13 +21,14 @@ class IosDownloadResumeTest {
 
     @Test fun interruptedDirectDownloadResumesAcrossInstancesAndSignedUrlRefreshWithoutLeakingRequestData() = iosTest {
         inIosTestDirectory { directory ->
-            val first = plan(url = "https://fixture.invalid/video?itag=136&sig=SECRET_OLD&expires=1")
+            val first = plan(url = "https://rr1.googlevideo.com/video?itag=136&sig=SECRET_OLD&expire=4000000000")
+                .copy(inspectionUrl = "https://www.youtube.com/watch?v=AUTHORED001")
             interrupt(directory, first)
             val text = checkpointText(directory)
             listOf("https", "fixture.invalid", "SECRET_OLD", "private-validator", "User-Agent").forEach {
                 assertFalse(it in text, "Checkpoint must contain fingerprints, not request/validator values.")
             }
-            val refreshed = first.copy(primary = first.primary.copy(url = "https://fixture.invalid/video?itag=136&sig=SECRET_NEW&expires=2"))
+            val refreshed = first.copy(primary = first.primary.copy(url = "https://rr1.googlevideo.com/video?itag=136&sig=SECRET_NEW&expire=4000003600"))
             val updates = mutableListOf<YouTubeDownloadProgress>()
             val http = HttpClient(MockEngine { request ->
                 assertEquals("bytes=$cut-", request.headers[HttpHeaders.Range])
@@ -38,7 +42,7 @@ class IosDownloadResumeTest {
                 assertEquals(cut.toLong(), updates.first().bytesDownloaded)
                 assertTrue(updates.all { it.totalBytes == bytes.size.toLong() })
                 assertContentEquals(bytes, read(result.destinationPath))
-                assertEquals(listOf("output.mp4"), children(directory))
+                assertIosResumeResidue(directory, listOf("output.mp4"))
             } finally { http.close() }
         }
     }
@@ -132,7 +136,7 @@ class IosDownloadResumeTest {
                 assertEquals(replacement.size.toLong(), resumedUpdates.last().totalBytes)
                 assertEquals(replacement.size.toLong(), result.bytesWritten)
                 assertContentEquals(replacement, read(result.destinationPath))
-                assertEquals(listOf("output.mp4"), children(directory))
+                assertIosResumeResidue(directory, listOf("output.mp4"))
             } finally { resumed.close() }
         }
     }
@@ -141,7 +145,7 @@ class IosDownloadResumeTest {
         for (tag in listOf(null, "W/$validator", "\"malformed\" \"tag\"")) {
             inIosTestDirectory { directory ->
                 interrupt(directory, plan(), tag = tag)
-                assertTrue(children(directory).isEmpty())
+                assertIosResumeResidue(directory)
                 val http = HttpClient(MockEngine { request ->
                     assertNull(request.headers[HttpHeaders.Range])
                     respond(bytes, HttpStatusCode.OK, mediaHeaders(bytes.size, validator))
@@ -258,7 +262,7 @@ class IosDownloadResumeTest {
             })
             try {
                 assertFailsWith<IllegalStateException> { IosYouTubeDownloader(http).download(plan(), "$directory/output.mp4") {} }
-                assertTrue(children(directory).isEmpty())
+                assertIosResumeResidue(directory)
             } finally { http.close() }
         }
     }
@@ -371,7 +375,7 @@ class IosDownloadResumeTest {
                     } finally { release.complete(Unit) }
                     assertContentEquals(bytes, read(first.await().destinationPath))
                 }
-                assertEquals(listOf("output.mp4"), children(directory))
+                assertIosResumeResidue(directory, listOf("output.mp4"))
             } finally { release.complete(Unit); http.close() }
         }
     }
@@ -399,7 +403,176 @@ class IosDownloadResumeTest {
             val retried = IosDownloadResumeStore.open("$directory/output.mp4", iosSelectionDigest(plan()))
             try { retried.load(plan(), TransferPlanning.parts(plan())); assertTrue(retried.parts.isEmpty()) }
             finally { retried.close() }
-            assertTrue(children(directory).isEmpty())
+            assertIosResumeResidue(directory)
+        }
+    }
+
+    @Test fun sameLengthCorruptedPrivatePrefixCannotBeReusedWithAMatchingServerValidator() = iosTest {
+        inIosTestDirectory { directory ->
+            val selected = plan()
+            interrupt(directory, selected)
+            val file = IosMediaFile(savedPath(directory), existing = true)
+            try {
+                val byte = file.read(0, 1).single()
+                file.write(0, byteArrayOf((byte.toInt() xor 1).toByte())); file.flush()
+                assertEquals(cut.toLong(), file.length())
+            } finally { file.close() }
+            val http = HttpClient(MockEngine { request ->
+                assertNull(request.headers[HttpHeaders.Range], "A matching ETag does not authenticate changed local bytes.")
+                respond(bytes, headers = mediaHeaders(bytes.size, validator))
+            })
+            val updates = mutableListOf<YouTubeDownloadProgress>()
+            try { IosYouTubeDownloader(http).download(selected, "$directory/output.mp4") { updates += it } }
+            finally { http.close() }
+            assertEquals(0L, updates.first().bytesDownloaded)
+            assertContentEquals(bytes, read("$directory/output.mp4"))
+            assertIosResumeResidue(directory, listOf("output.mp4"))
+        }
+    }
+
+    @Test fun arbitrarySigningParametersRawQueryEncodingAndDifferentCdnHostsNeverShareAReceipt() = iosTest {
+        val cases = listOf(
+            "https://fixture.invalid/video?sig=old" to "https://fixture.invalid/video?sig=new",
+            "https://fixture.invalid/video?a=1&b=2" to "https://fixture.invalid/video?b=2&a=1",
+            "https://fixture.invalid/video?q=+" to "https://fixture.invalid/video?q=%20",
+            "https://fixture.invalid/video?a=1&&b=2" to "https://fixture.invalid/video?a=1&b=2",
+            "https://rr1.googlevideo.com/video?itag=136&sig=old" to "https://rr2.googlevideo.com/video?itag=136&sig=new",
+        )
+        for ((original, changed) in cases) inIosTestDirectory { directory ->
+            val first = plan(url = original).let {
+                if ("googlevideo.com" in original) it.copy(inspectionUrl = "https://www.youtube.com/watch?v=AUTHORED001") else it
+            }
+            interrupt(directory, first)
+            val refreshed = first.copy(primary = first.primary.copy(url = changed))
+            val http = HttpClient(MockEngine { request ->
+                assertNull(request.headers[HttpHeaders.Range])
+                respond(bytes, headers = mediaHeaders(bytes.size, validator))
+            })
+            try { IosYouTubeDownloader(http).download(refreshed, "$directory/output.mp4") {} }
+            finally { http.close() }
+            assertContentEquals(bytes, read("$directory/output.mp4"))
+        }
+    }
+
+    @Test fun aChangedFinalRedirectScopeWithTheSameEtagRestartsBeforeAnyResponseBytesAppend() = iosTest {
+        inIosTestDirectory { directory ->
+            val selected = plan(url = "https://fixture.invalid/start")
+            val first = HttpClient(MockEngine { request ->
+                when (request.url.encodedPath) {
+                    "/start" -> respond(ByteArray(0), HttpStatusCode.Found, headersOf(HttpHeaders.Location, "/first"))
+                    "/first" -> respond(bytes.copyOf(cut), headers = mediaHeaders(bytes.size, validator))
+                    else -> error("Unplanned fixture request")
+                }
+            }) { followRedirects = true }
+            try {
+                assertFailsWith<IllegalStateException> { IosYouTubeDownloader(first).download(selected, "$directory/output.mp4") {} }
+            } finally { first.close() }
+            val replacement = bytes.copyOf().also { it[10] = (it[10].toInt() xor 1).toByte() }
+            val requests = mutableListOf<Pair<String, String?>>()
+            val http = HttpClient(MockEngine { request ->
+                val range = request.headers[HttpHeaders.Range]
+                requests += request.url.encodedPath to range
+                when (request.url.encodedPath) {
+                    "/start" -> respond(ByteArray(0), HttpStatusCode.Found, headersOf(HttpHeaders.Location, "/second"))
+                    "/second" -> if (range != null) respond(replacement.copyOfRange(cut, replacement.size), HttpStatusCode.PartialContent,
+                        mediaHeaders(replacement.size - cut, validator, "bytes $cut-${replacement.lastIndex}/${replacement.size}"))
+                    else respond(replacement, headers = mediaHeaders(replacement.size, validator))
+                    else -> error("Unplanned fixture request")
+                }
+            }) { followRedirects = true }
+            try { IosYouTubeDownloader(http).download(selected, "$directory/output.mp4") {} }
+            finally { http.close() }
+            assertEquals(listOf("/start" to "bytes=$cut-", "/second" to "bytes=$cut-", "/start" to null, "/second" to null), requests)
+            assertContentEquals(replacement, read("$directory/output.mp4"), "A new final response scope cannot inherit the old prefix.")
+        }
+    }
+
+    @Test fun callerDefaultHeadersAndAutomaticRedirectsCannotBypassExplicitTransportPolicy() = iosTest {
+        inIosTestDirectory { directory ->
+            var requests = 0
+            val http = HttpClient(MockEngine { request ->
+                requests++
+                assertEquals("fixture.invalid", request.url.host)
+                assertNull(request.headers["X-Caller-Session"])
+                respond(ByteArray(0), HttpStatusCode.Found, headersOf(HttpHeaders.Location, "http://127.0.0.1/private"))
+            }) {
+                followRedirects = true
+                defaultRequest { header("X-Caller-Session", "authored-private-session") }
+            }
+            try {
+                assertFailsWith<IllegalArgumentException> { IosYouTubeDownloader(http).download(plan(), "$directory/output.mp4") {} }
+                assertEquals(1, requests, "The forbidden destination must fail before a second engine request.")
+                assertFalse(NSFileManager.defaultManager.fileExistsAtPath("$directory/output.mp4"))
+                assertIosResumeResidue(directory)
+            } finally { http.close() }
+        }
+    }
+
+    @Test fun explicitSourceHeadersStayOnTheirOriginalOriginAcrossRedirects() = iosTest {
+        inIosTestDirectory { directory ->
+            val selected = plan(url = "https://fixture.invalid/start").copy(requestHeaders = mapOf("X-Source-Header" to "authored-source"))
+            val requests = mutableListOf<String>()
+            val http = HttpClient(MockEngine { request ->
+                requests += request.url.host + request.url.encodedPath
+                assertNull(request.headers["X-Caller-Session"])
+                assertEquals(if (request.url.host == "fixture.invalid") "authored-source" else null, request.headers["X-Source-Header"])
+                when (request.url.encodedPath) {
+                    "/start" -> respond(ByteArray(0), HttpStatusCode.Found, headersOf(HttpHeaders.Location, "/hop"))
+                    "/hop" -> respond(ByteArray(0), HttpStatusCode.Found, headersOf(HttpHeaders.Location, "https://other.invalid/final"))
+                    "/final" -> respond(bytes, headers = mediaHeaders(bytes.size, validator))
+                    else -> error("Unplanned fixture request")
+                }
+            }) {
+                followRedirects = true
+                defaultRequest { header("X-Caller-Session", "authored-private-session") }
+            }
+            try { IosYouTubeDownloader(http).download(selected, "$directory/output.mp4") {} }
+            finally { http.close() }
+            assertEquals(listOf("fixture.invalid/start", "fixture.invalid/hop", "other.invalid/final"), requests)
+            assertContentEquals(bytes, read("$directory/output.mp4"))
+        }
+    }
+
+    @Test fun absentOrLegacySchemaIsResetRatherThanReceivingTheNewDefaultVersion() = iosTest {
+        for (absent in listOf(false, true)) inIosTestDirectory { directory ->
+            val selected = plan()
+            interrupt(directory, selected)
+            val root = Json.parseToJsonElement(checkpointText(directory)).jsonObject
+            assertEquals(2, root.getValue("schema").jsonPrimitive.int)
+            val legacy = if (absent) JsonObject(root - "schema") else JsonObject(root + ("schema" to JsonPrimitive(1)))
+            val file = IosMediaFile("${working(directory)}/checkpoint.json", existing = true)
+            try { file.truncate(0); file.write(0, legacy.toString().encodeToByteArray()); file.flush() }
+            finally { file.close() }
+            val http = HttpClient(MockEngine { request ->
+                assertNull(request.headers[HttpHeaders.Range])
+                respond(bytes, headers = mediaHeaders(bytes.size, validator))
+            })
+            val updates = mutableListOf<YouTubeDownloadProgress>()
+            try { IosYouTubeDownloader(http).download(selected, "$directory/output.mp4") { updates += it } }
+            finally { http.close() }
+            assertEquals(0L, updates.first().bytesDownloaded)
+            assertContentEquals(bytes, read("$directory/output.mp4"))
+        }
+    }
+
+    @Test fun aCancelledLoadKeepsThePriorDurableReceiptInsteadOfDiscardingItsUninitializedState() = iosTest {
+        inIosTestDirectory { directory ->
+            val selected = plan()
+            interrupt(directory, selected)
+            val checkpoint = checkpointText(directory)
+            val prefix = read(savedPath(directory))
+            val store = IosDownloadResumeStore.open("$directory/output.mp4", iosSelectionDigest(selected))
+            try {
+                coroutineScope {
+                    launch {
+                        currentCoroutineContext().cancel()
+                        assertFailsWith<CancellationException> { store.load(selected, TransferPlanning.parts(selected)) }
+                    }.join()
+                }
+            } finally { store.close() }
+            assertEquals(checkpoint, checkpointText(directory))
+            assertContentEquals(prefix, read(savedPath(directory)))
+            assertEquals(cut.toLong(), savedPart(directory, selected).bytes)
         }
     }
 

@@ -59,7 +59,7 @@ class PublicYouTubeBrowseServiceTest {
         val playlist = """{"playlistRenderer":{"playlistId":"$playlistId","title":{"simpleText":"Actual playlist"},"videoCountText":{"runs":[{"text":"12 videos"}]}}}"""
         val transport = Transport { ResearchResponse(it.url, 200, initial("${video()},$channel,$playlist")) }
         val page = PublicYouTubeBrowseService(transport).search(" cats & music ")
-        assertEquals("cats & music", Url(transport.requests.single().url).parameters["search_query"])
+        assertEquals(" cats & music ", Url(transport.requests.single().url).parameters["search_query"])
         assertEquals(listOf(YouTubeBrowseKind.VIDEO, YouTubeBrowseKind.CHANNEL, YouTubeBrowseKind.PLAYLIST), page.items.map { it.kind })
         assertEquals("3:42", page.items[0].durationText)
         assertEquals("https://i.ytimg.com/vi/$id/hqdefault.jpg", page.items[0].thumbnailUrl)

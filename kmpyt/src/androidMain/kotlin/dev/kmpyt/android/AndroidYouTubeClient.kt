@@ -29,5 +29,6 @@ fun createAndroidYouTubeClient(context: Context): YouTubeClient {
         engine { connectTimeout = 15_000; socketTimeout = 20_000 }
     }
     return YouTubeClient(KtorResearchTransport(http, maximumBytes = 8_000_000), AndroidYouTubeJavaScriptRuntime(context),
-        AndroidYouTubeDownloader(http), onClose = http::close, platformName = "Android")
+        AndroidYouTubeDownloader(http), onClose = http::close, platformName = "Android",
+        playbackAdapter = createAndroidYouTubeSabrPlaybackAdapter(context, http))
 }

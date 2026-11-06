@@ -17,9 +17,8 @@ import kotlinx.serialization.json.*
 /** Public page data only. No browser cookies, account headers or invented client profiles. */
 class PublicYouTubeBrowseService(private val transport: ResearchTransport) : YouTubeBrowseService {
     override suspend fun search(query: String): YouTubeBrowsePage {
-        val text = query.trim()
-        require(text.length in 1..256 && text.none { it.code < 32 }) { "Enter a search phrase of 1–256 characters." }
-        return open("$ORIGIN/results?search_query=${text.encodeURLParameter()}")
+        require(YouTubeBrowseText.isCompleteTitle(query)) { "Enter a complete search phrase of 1–16384 valid UTF-16 code units." }
+        return open("$ORIGIN/results?search_query=${query.encodeURLParameter()}")
     }
 
     override suspend fun home(): YouTubeBrowsePage = open("$ORIGIN/")
@@ -27,17 +26,19 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
     override suspend fun open(url: String): YouTubeBrowsePage {
         val source = canonicalBrowseUrl(url)
         val title = defaultTitle(source)
+        val query = Url(source).parameters["search_query"]
         val reply = fetchPage(source)
-        if (reply.response == null) return YouTubeBrowsePage(title, emptyList(), sourceUrl = source, notice = reply.notice)
+        if (reply.response == null) return YouTubeBrowsePage(title, emptyList(), sourceUrl = source, notice = reply.notice, query = query)
         val response = reply.response
         val data = initialData(response.body)
             ?: return YouTubeBrowsePage(title, emptyList(), sourceUrl = source,
-                notice = "YouTube did not return readable public results. Try searching, or open this page in YouTube.")
+                notice = "YouTube did not return readable public results. Try searching, or open this page in YouTube.", query = query)
         val parsed = parse(data, source)
         val context = parsed.token?.let {
             declaredContext(response.body, source, parsed.endpoint)
         }
         return assemble(source, pageTitle(data) ?: title, parsed, context).copy(
+            query = query,
             channelId = data.obj("metadata")?.obj("channelMetadataRenderer")?.text("externalId")
                 ?.takeIf { Regex("UC[A-Za-z0-9_-]{22}").matches(it) })
     }
@@ -101,8 +102,8 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
             parsed.unavailable > 0 -> "Unavailable entries were omitted from this public list."
             else -> null
         }
-        return YouTubeBrowsePage(title.take(300), items, parsed.token.takeIf { context != null && !parsed.truncated },
-            source, notice, context.takeUnless { parsed.truncated })
+        return YouTubeBrowsePage(title, items, parsed.token.takeIf { context != null && !parsed.truncated },
+            source, notice, context.takeUnless { parsed.truncated }, firstEntry = parsed.firstEntry)
     }
 
     private data class Fetch(val response: ResearchResponse? = null, val notice: String? = null)
@@ -160,7 +161,7 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
         ?.let { runCatching { Json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
 
     private data class Parsed(val items: List<YouTubeBrowseItem>, val token: String?, val endpoint: String?,
-        val unavailable: Int, val truncated: Boolean)
+        val unavailable: Int, val truncated: Boolean, val firstEntry: YouTubeBrowseEntry?)
 
     private fun parse(data: JsonObject, source: String): Parsed {
         val items = mutableListOf<YouTubeBrowseItem>()
@@ -169,6 +170,10 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
         var visited = 0
         var unavailable = 0
         var truncated = false
+        var firstEntry: YouTubeBrowseEntry? = null
+        fun unknown(issue: YouTubeBrowseEntryIssue) {
+            if (firstEntry == null) firstEntry = YouTubeBrowseEntry(null, null, null, null, issue)
+        }
         fun continuation(value: JsonObject) {
             val command = value.obj("continuationEndpoint") ?: value
             val actual = command.obj("continuationCommand")?.text("token")
@@ -177,43 +182,102 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
             token = actual
             endpoint = command.obj("commandMetadata")?.obj("webCommandMetadata")?.text("apiUrl")
         }
-        fun visit(value: JsonElement, depth: Int) {
-            if (depth > 64 || ++visited > MAX_NODES) { truncated = true; return }
+        fun visit(value: JsonElement, depth: Int, entryPosition: Boolean = false) {
+            if (depth > 64 || ++visited > MAX_NODES) {
+                truncated = true
+                unknown(YouTubeBrowseEntryIssue.PARSE_LIMIT)
+                return
+            }
             when (value) {
-                is JsonArray -> value.forEach { visit(it, depth + 1) }
+                is JsonArray -> value.forEach { visit(it, depth + 1, entryPosition = true) }
                 is JsonObject -> {
-                    if (value.keys.any { it in AD_RENDERERS }) return
+                    if (value.keys.any { it in AD_RENDERERS }) {
+                        unknown(YouTubeBrowseEntryIssue.UNSUPPORTED)
+                        return
+                    }
                     value.obj("continuationItemRenderer")?.let { continuation(it); return }
                     if (value.containsKey("nextContinuationData")) { continuation(value); return }
+                    value.entries.firstOrNull { it.key in SHELF_RENDERERS }?.let { (key, child) ->
+                        if (child !is JsonObject) { unknown(YouTubeBrowseEntryIssue.INVALID_METADATA); return }
+                        val shelf = readItem(key, child, source)
+                        // A navigable album/channel/playlist shelf is itself a collection result.
+                        // Never replace that first result with one of its child video tiles.
+                        val collection = shelf.entry.kind in setOf(YouTubeBrowseKind.CHANNEL, YouTubeBrowseKind.PLAYLIST)
+                        if (firstEntry == null) firstEntry = if (collection) shelf.entry else
+                            YouTubeBrowseEntry(null, null, shelf.entry.title, null,
+                                shelf.entry.issue?.takeIf { it != YouTubeBrowseEntryIssue.INVALID_METADATA }
+                                    ?: YouTubeBrowseEntryIssue.UNSUPPORTED)
+                        if (collection) {
+                            if (shelf.item != null && items.size < MAX_PAGE_ITEMS) items += shelf.item
+                            else if (shelf.item != null) truncated = true else unavailable++
+                            return
+                        }
+                        // An unrecognized shelf may still expose child rows in the browsing UI,
+                        // but its UNKNOWN leading receipt remains authoritative for selection.
+                    }
                     for ((key, child) in value) {
-                        if (key in ITEM_RENDERERS && child is JsonObject) {
+                        if (key in ITEM_RENDERERS) {
+                            if (child !is JsonObject) { unknown(YouTubeBrowseEntryIssue.INVALID_METADATA); return }
                             if (items.size >= MAX_PAGE_ITEMS) { truncated = true; return }
                             val result = readItem(key, child, source)
-                            if (result != null) items += result else unavailable++
+                            if (firstEntry == null) firstEntry = result.entry
+                            if (result.item != null) items += result.item else unavailable++
                             return
                         }
                     }
                     val tab = value.obj("tabRenderer")
                     if (tab != null && tab["selected"] == JsonPrimitive(false)) return
+                    // Unknown content cards are not permission to select a later video. Only
+                    // explicitly recognized list/layout wrappers may be flattened. Non-content
+                    // metadata and control renderers below are ignored, never treated as cards.
+                    if (value.keys.any { it in NON_CONTENT_RENDERERS }) return
+                    if (value.keys.any { (it.endsWith("Renderer") || it.endsWith("ViewModel")) &&
+                            it !in CONTENT_CONTAINERS } || entryPosition && value.keys.none { it in CONTENT_CONTAINERS }) {
+                        unknown(YouTubeBrowseEntryIssue.UNSUPPORTED)
+                        return
+                    }
+                    // In a search response, secondary panels are not members of the ordered
+                    // primary result list. Do not walk a header/sidebar's navigation metadata.
+                    value.obj("twoColumnSearchResultsRenderer")?.let {
+                        val primary = it["primaryContents"]
+                        if (primary == null) unknown(YouTubeBrowseEntryIssue.INVALID_METADATA)
+                        else visit(primary, depth + 1)
+                        return
+                    }
+                    value.entries.firstOrNull { it.key in RESULT_CHILDREN }?.let { (key, child) ->
+                        val container = child as? JsonObject
+                        if (container == null) unknown(YouTubeBrowseEntryIssue.INVALID_METADATA)
+                        else {
+                            val content = RESULT_CHILDREN.getValue(key).firstNotNullOfOrNull { container[it] }
+                            if (content == null) unknown(YouTubeBrowseEntryIssue.INVALID_METADATA)
+                            else visit(content, depth + 1)
+                        }
+                        return
+                    }
                     value.values.forEach { visit(it, depth + 1) }
                 }
-                else -> Unit
+                else -> if (entryPosition) unknown(YouTubeBrowseEntryIssue.INVALID_METADATA)
             }
         }
         // Skip headers, menus and account actions; only actual content/continuation regions are result lists.
-        listOf("contents", "continuationContents", "onResponseReceivedActions", "onResponseReceivedCommands", "onResponseReceivedEndpoints")
-            .mapNotNull { data[it] }.forEach { visit(it, 0) }
-        return Parsed(items, token, endpoint, unavailable, truncated)
+        val regions = listOf("contents", "continuationContents", "onResponseReceivedActions", "onResponseReceivedCommands", "onResponseReceivedEndpoints")
+            .mapNotNull { data[it] }
+        if (regions.isEmpty()) unknown(YouTubeBrowseEntryIssue.INVALID_METADATA)
+        regions.forEach { visit(it, 0) }
+        return Parsed(items, token, endpoint, unavailable, truncated, firstEntry)
     }
 
-    private fun readItem(renderer: String, value: JsonObject, source: String): YouTubeBrowseItem? {
-        if (value["isPlayable"] == JsonPrimitive(false) || value["unplayableText"] != null) return null
+    private data class ItemRead(val item: YouTubeBrowseItem?, val entry: YouTubeBrowseEntry)
+
+    private fun readItem(renderer: String, value: JsonObject, source: String): ItemRead {
         val metadata = value.obj("metadata")?.obj("lockupMetadataViewModel")
         val overlay = value.obj("overlayMetadata")
-        val title = displayText(value["title"]) ?: displayText(value["headline"])
-            ?: displayText(metadata?.get("title")) ?: displayText(overlay?.get("primaryText")) ?: return null
-        if (title.trim().lowercase() in setOf("[private video]", "[deleted video]", "private video", "deleted video")) return null
-        val nav = value.obj("navigationEndpoint") ?: value.obj("onTap")?.obj("innertubeCommand")
+        val titleText = completeText(value["title"] ?: value["headline"]
+            ?: metadata?.get("title") ?: overlay?.get("primaryText"))
+        val title = titleText.value
+        val unavailable = value["isPlayable"] == JsonPrimitive(false) || value["unplayableText"] != null ||
+            title?.trim()?.lowercase() in setOf("[private video]", "[deleted video]", "private video", "deleted video")
+        val nav = value.obj("navigationEndpoint") ?: value.obj("endpoint") ?: value.obj("onTap")?.obj("innertubeCommand")
             ?: value.obj("rendererContext")?.obj("commandContext")?.obj("onTap")?.obj("innertubeCommand")
         val contentType = value.text("contentType").orEmpty()
         val contentId = value.text("contentId")
@@ -222,36 +286,44 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
             ?: contentId?.takeIf { contentType.endsWith("_VIDEO") || VIDEO_ID.matches(it) }
         val channelId = value.text("channelId") ?: nav?.obj("browseEndpoint")?.text("browseId")?.takeIf { it.startsWith("UC") }
         val playlistId = value.text("playlistId") ?: nav?.obj("watchPlaylistEndpoint")?.text("playlistId")
+            ?: nav?.obj("watchEndpoint")?.text("playlistId")
             ?: contentId?.takeIf { contentType.endsWith("_PLAYLIST") }
             ?: nav?.obj("browseEndpoint")?.text("browseId")?.takeIf { it.startsWith("VL") }?.removePrefix("VL")
         val kind = when {
             renderer in CHANNEL_RENDERERS -> YouTubeBrowseKind.CHANNEL
             renderer in PLAYLIST_RENDERERS || contentType.endsWith("_PLAYLIST") -> YouTubeBrowseKind.PLAYLIST
+            renderer in SHELF_RENDERERS && playlistId != null -> YouTubeBrowseKind.PLAYLIST
             videoId != null -> YouTubeBrowseKind.VIDEO
             playlistId != null -> YouTubeBrowseKind.PLAYLIST
             channelId != null -> YouTubeBrowseKind.CHANNEL
-            else -> return null
+            else -> null
         }
+        fun invalid() = ItemRead(null, YouTubeBrowseEntry(kind, null, title, null,
+            titleText.issue ?: YouTubeBrowseEntryIssue.INVALID_METADATA))
         val id: String
         val url: String
         when (kind) {
             YouTubeBrowseKind.VIDEO -> {
-                id = videoId?.takeIf(VIDEO_ID::matches) ?: return null
+                id = videoId?.takeIf(VIDEO_ID::matches) ?: return invalid()
                 url = "$ORIGIN/watch?v=$id"
             }
             YouTubeBrowseKind.PLAYLIST -> {
-                id = (playlistId ?: nav?.obj("watchEndpoint")?.text("playlistId"))?.takeIf(PLAYLIST_ID::matches) ?: return null
+                id = (playlistId ?: nav?.obj("watchEndpoint")?.text("playlistId"))?.takeIf(PLAYLIST_ID::matches) ?: return invalid()
                 url = "$ORIGIN/playlist?list=$id"
             }
             YouTubeBrowseKind.CHANNEL -> {
-                id = channelId?.takeIf(CHANNEL_ID::matches) ?: return null
+                id = channelId?.takeIf(CHANNEL_ID::matches) ?: return invalid()
                 val supplied = nav?.obj("browseEndpoint")?.text("canonicalBaseUrl")
                     ?: nav?.obj("commandMetadata")?.obj("webCommandMetadata")?.text("url")
                 val channelUrl = supplied?.let { runCatching { canonicalBrowseUrl(EmbeddedData.absolute(source, it)) }.getOrNull() }
                 url = channelUrl?.takeIf { Url(it).encodedPath.let { path -> path.startsWith("/@") || path.startsWith("/channel/") } }
                     ?: "$ORIGIN/channel/$id/videos"
             }
+            null -> return invalid()
         }
+        val issue = titleText.issue ?: YouTubeBrowseEntryIssue.UNAVAILABLE.takeIf { unavailable }
+        val entry = YouTubeBrowseEntry(kind, id, title, url, issue)
+        if (issue != null || title == null) return ItemRead(null, entry)
         val subtitleParts = listOfNotNull(displayText(value["ownerText"]), displayText(value["shortBylineText"]),
             displayText(value["longBylineText"]), displayText(value["viewCountText"]), displayText(value["publishedTimeText"]),
             displayText(value["subscriberCountText"]), displayText(value["videoCountText"]), displayText(overlay?.get("secondaryText")))
@@ -265,17 +337,43 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
             val status = (element as? JsonObject)?.obj("thumbnailOverlayTimeStatusRenderer")
             displayText(status?.get("text"))
         } ?: nestedText(value.obj("contentImage"), "thumbnailBadgeViewModel", "text")
-        return YouTubeBrowseItem(id, title.take(500), url, kind,
+        return ItemRead(YouTubeBrowseItem(id, title, url, kind,
             thumbnail(value["thumbnail"] ?: value["thumbnails"] ?: value["contentImage"]),
-            subtitleParts.distinct().joinToString(" · ").take(700).ifBlank { null }, duration?.take(80))
+            subtitleParts.distinct().joinToString(" · ").take(700).ifBlank { null }, duration?.take(80)), entry)
     }
 
-    private fun displayText(value: JsonElement?): String? = when (value) {
-        is JsonPrimitive -> value.takeIf { it.isString }?.content
-        is JsonObject -> value.text("simpleText") ?: value.text("content")
-            ?: value.array("runs")?.take(50)?.joinToString("") { (it as? JsonObject)?.text("text").orEmpty() }
-        else -> null
-    }?.trim()?.takeIf { it.isNotEmpty() && it.length <= 4000 && it.none { c -> c.code == 0 } }
+    private data class CompleteText(val value: String?, val issue: YouTubeBrowseEntryIssue? = null)
+
+    private fun completeText(value: JsonElement?): CompleteText {
+        fun rejected(issue: YouTubeBrowseEntryIssue = YouTubeBrowseEntryIssue.INVALID_METADATA) = CompleteText(null, issue)
+        val raw = when (value) {
+            is JsonPrimitive -> value.takeIf { it.isString }?.content ?: return rejected()
+            is JsonObject -> {
+                val primitive = value["simpleText"] ?: value["content"]
+                if (primitive != null) (primitive as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return rejected()
+                else {
+                    val runs = value.array("runs") ?: return rejected()
+                    if (runs.size > YouTubeBrowseText.MAX_TITLE_LENGTH) return rejected(YouTubeBrowseEntryIssue.TEXT_LIMIT)
+                    val builder = StringBuilder()
+                    for (run in runs) {
+                        val text = (run as? JsonObject)?.get("text") as? JsonPrimitive ?: return rejected()
+                        if (!text.isString) return rejected()
+                        if (text.content.length > YouTubeBrowseText.MAX_TITLE_LENGTH - builder.length) {
+                            return rejected(YouTubeBrowseEntryIssue.TEXT_LIMIT)
+                        }
+                        builder.append(text.content)
+                    }
+                    builder.toString()
+                }
+            }
+            else -> return rejected()
+        }
+        if (raw.length > YouTubeBrowseText.MAX_TITLE_LENGTH) return rejected(YouTubeBrowseEntryIssue.TEXT_LIMIT)
+        if (!YouTubeBrowseText.isCompleteTitle(raw)) return rejected()
+        return CompleteText(raw)
+    }
+
+    private fun displayText(value: JsonElement?): String? = completeText(value).value?.trim()
 
     private fun nestedText(value: JsonElement?, renderer: String, key: String): String? {
         fun visit(node: JsonElement?, depth: Int): String? {
@@ -315,9 +413,10 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
 
     private fun pageTitle(data: JsonObject): String? {
         val metadata = data.obj("metadata")
-        return displayText(metadata?.obj("playlistMetadataRenderer")?.get("title"))
-            ?: displayText(metadata?.obj("channelMetadataRenderer")?.get("title"))
-            ?: displayText(data.obj("header")?.obj("pageHeaderRenderer")?.get("pageTitle"))
+        val supplied = metadata?.obj("playlistMetadataRenderer")?.get("title")
+            ?: metadata?.obj("channelMetadataRenderer")?.get("title")
+            ?: data.obj("header")?.obj("pageHeaderRenderer")?.get("pageTitle") ?: return null
+        return requireNotNull(completeText(supplied).value) { "YouTube returned an invalid or oversized complete page title." }
     }
 
     private fun declaredContext(body: String, source: String, endpoint: String?): YouTubeBrowseContinuation? {
@@ -384,6 +483,7 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
         private const val MAX_TOTAL_ITEMS = 5_000
         private const val MAX_PAGES = 100
         private const val MAX_TOKEN = 16_384
+        private const val MAX_SEARCH_URL = 200_000
         private const val PAGE_TRUNCATED_NOTICE = "YouTube returned more results than this page limit. Some entries were omitted; refine your search or open the full list in YouTube."
         private val VIDEO_ID = Regex("[A-Za-z0-9_-]{11}")
         private val PLAYLIST_ID = Regex("[A-Za-z0-9_-]{2,200}")
@@ -395,6 +495,35 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
         private val ITEM_RENDERERS = CHANNEL_RENDERERS + PLAYLIST_RENDERERS + setOf("videoRenderer", "gridVideoRenderer", "compactVideoRenderer",
             "playlistVideoRenderer", "playlistPanelVideoRenderer", "reelItemRenderer", "shortsLockupViewModel", "lockupViewModel", "videoWithContextRenderer")
         private val AD_RENDERERS = setOf("adSlotRenderer", "adPlacementRenderer", "inFeedAdLayoutRenderer", "promotedVideoRenderer", "promotedSparklesWebRenderer", "displayAdRenderer")
+        private val SHELF_RENDERERS = setOf("shelfRenderer", "richShelfRenderer", "reelShelfRenderer")
+        private val RESULT_CHILDREN = mapOf(
+            "sectionListRenderer" to listOf("contents"),
+            "itemSectionRenderer" to listOf("contents"),
+            "richGridRenderer" to listOf("contents"),
+            "richItemRenderer" to listOf("content"),
+            "richSectionRenderer" to listOf("content"),
+            "shelfRenderer" to listOf("content"),
+            "richShelfRenderer" to listOf("contents"),
+            "reelShelfRenderer" to listOf("items"),
+            "horizontalListRenderer" to listOf("items"),
+            "expandedShelfContentsRenderer" to listOf("items"),
+            "verticalListRenderer" to listOf("items"),
+            "gridRenderer" to listOf("items"),
+            "playlistVideoListRenderer" to listOf("contents"),
+            "playlistPanelRenderer" to listOf("contents"),
+            "tabRenderer" to listOf("content"),
+            "twoColumnBrowseResultsRenderer" to listOf("tabs"),
+            "singleColumnBrowseResultsRenderer" to listOf("tabs"),
+        )
+        private val CONTENT_CONTAINERS = RESULT_CHILDREN.keys + setOf(
+            "twoColumnSearchResultsRenderer", "appendContinuationItemsAction", "reloadContinuationItemsCommand",
+            "sectionListContinuation", "itemSectionContinuation", "gridContinuation", "playlistVideoListContinuation",
+            "richGridContinuation", "continuations", "contents", "continuationItems",
+        )
+        private val NON_CONTENT_RENDERERS = setOf(
+            "messageRenderer", "searchHeaderRenderer", "chipCloudRenderer", "feedFilterChipBarRenderer",
+            "searchSubMenuRenderer", "menuRenderer", "sortFilterSubMenuRenderer",
+        )
         private val PUBLIC_CLIENT_FIELDS = setOf("clientName", "clientVersion", "hl", "gl", "userAgent", "platform", "osName", "osVersion", "browserName", "browserVersion", "visitorData")
         private val CONFIG_FIELDS = setOf("INNERTUBE_CONTEXT", "INNERTUBE_CLIENT_NAME", "INNERTUBE_CLIENT_VERSION", "INNERTUBE_CONTEXT_CLIENT_NAME", "INNERTUBE_API_KEY")
 
@@ -416,16 +545,17 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
 
         /** Canonicalizes only public browsing pages; watch links belong to source inspection. */
         fun canonicalBrowseUrl(input: String): String {
-            require(input.length <= 2000) { "YouTube link is too long." }
+            require(input.length <= MAX_SEARCH_URL) { "YouTube link is too long." }
             val url = runCatching { Url(input.trim()) }.getOrNull()
                 ?: throw IllegalArgumentException("Enter a YouTube channel, playlist or search link.")
             require(publicOrigin(url)) { "Use an HTTPS YouTube channel, playlist or search link." }
             val path = url.encodedPath.trimEnd('/').ifEmpty { "/" }
+            require(path == "/results" || input.length <= 2000) { "YouTube link is too long." }
             return when (path) {
                 "/" -> "$ORIGIN/"
                 "/results" -> {
-                    val query = url.parameters.getAll("search_query")?.singleOrNull()?.trim()
-                    require(query != null && safeText(query, 256)) { "The YouTube search link has no valid query." }
+                    val query = url.parameters.getAll("search_query")?.singleOrNull()
+                    require(query != null && YouTubeBrowseText.isCompleteTitle(query)) { "The YouTube search link has no valid complete query." }
                     "$ORIGIN/results?search_query=${query.encodeURLParameter()}"
                 }
                 "/playlist" -> {
