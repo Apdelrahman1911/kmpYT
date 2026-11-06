@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Source inside ci/scoped.sh; select existing read-only tools, never install.
+# Source inside ci/scoped.sh; prefer existing read-only tools. Missing FFmpeg
+# is prepared reproducibly inside this repository, never installed globally.
 set -euo pipefail
 : "${KMPYT_CI_SCOPED_ENV:?Use ci/scoped.sh first}"
 case "$(uname -m)" in
@@ -19,11 +20,21 @@ for candidate in "${candidates[@]}"; do
 done
 version="$(java -XshowSettings:properties -version 2>&1 | sed -n 's/^[[:space:]]*java.specification.version = //p')"
 [ "$version" = 17 ] || { printf 'Existing JDK17 required; observed %s. No install attempted.\n' "$version" >&2; return 1; }
+if [ "$(uname -s)" = Darwin ]; then
+    export DEVELOPER_DIR=/Applications/Xcode_26.0.1.app/Contents/Developer
+    [ -d "$DEVELOPER_DIR" ] || { printf '%s\n' 'Pinned existing Xcode missing; no xcode-select/install attempted.' >&2; return 1; }
+fi
 if [ "${1:-}" = jvm ]; then
     export KMPYT_NODE="$(command -v node)"
     node -e 'if (+process.versions.node.split(".")[0] < 22) process.exit(1)'
-    export KMPYT_FFMPEG="$(command -v ffmpeg)"
-    [ -f "$KMPYT_FFMPEG" ] || { printf '%s\n' 'Existing FFmpeg required; skipped media tests are not success.' >&2; return 1; }
+    KMPYT_FFMPEG="$(command -v ffmpeg || true)"
+    if [ -z "$KMPYT_FFMPEG" ]; then
+        KMPYT_FFMPEG="$(python3 -B "$KMPYT_CI_PROJECT_ROOT/ci/ffmpeg-tool.py")"
+    fi
+    export KMPYT_FFMPEG
+    [ -f "$KMPYT_FFMPEG" ] || { printf '%s\n' 'FFmpeg preparation failed; skipped media tests are not success.' >&2; return 1; }
+    if command -v cygpath >/dev/null 2>&1; then KMPYT_FFMPEG="$(cygpath -m "$KMPYT_FFMPEG")"; fi
+    python3 -B "$KMPYT_CI_PROJECT_ROOT/ci/ffmpeg-tool.py" --verify "$KMPYT_FFMPEG"
     KMPYT_CHROMIUM="$(python3 -B - <<'PY'
 import os,shutil
 from pathlib import Path
@@ -45,8 +56,4 @@ PY
         export KMPYT_CI_BROWSER="$KMPYT_CHROMIUM"
         export KMPYT_CHROMIUM="$KMPYT_CI_PROJECT_ROOT/ci/chromium.sh"
     fi
-fi
-if [ "$(uname -s)" = Darwin ]; then
-    export DEVELOPER_DIR=/Applications/Xcode_26.0.1.app/Contents/Developer
-    [ -d "$DEVELOPER_DIR" ] || { printf '%s\n' 'Pinned existing Xcode missing; no xcode-select/install attempted.' >&2; return 1; }
 fi
