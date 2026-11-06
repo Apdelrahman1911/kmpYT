@@ -48,6 +48,17 @@ Call these suspending methods from a coroutine. Reuse a client to benefit from i
 
 Inspect `report.media` to present formats. When a response supplies HLS/DASH catalogues, call `expandFormats(report)` before selecting their tracks; this fetches manifest metadata only. `playbackPlan(report, selection)` provides portable progressive/SABR source contracts. `search`, `channel`, `playlist`, `more` and `captions` expose browsing and subtitle data. Swift callers use `try await` for suspending operations and handle exported errors with `do`/`catch`.
 
+Search submits its **complete query verbatim**, including surrounding whitespace, up to 16,384
+well-formed UTF-16 code units. Oversized/invalid queries and titles are rejected, not shortened.
+`YouTubeBrowsePage.query` records that submitted query; `firstEntry` records the leading content
+entry **before** unavailable/unsupported filtering in the UI-oriented `items` list. Check its
+typed `issue` and nullable kind/identity; never substitute `items.first()` when the first result
+matters. Private videos, unknown cards, advertisements and unrecognized shelves cannot silently
+promote a later video. A navigable album/playlist/channel shelf is a collection result, not one
+of its child tracks. Channels/playlists may be browsed, but are not single-media playback or
+download representations. Browse receipts preserve complete titles and stable public identities;
+they do not certify playback authorization or recording/album equivalence.
+
 Retry a cancelled or interrupted download with the same selection and destination to resume validated private progress. On iOS, HTTP resume requires a strong response validator; changed or unverifiable resources restart safely. Refreshed signing parameters can retain progress when the selected media, resource scope and validator still match. SABR checkpoints retain byte receipts and start a fresh protocol session; a changed source generation restarts. iOS checkpoints contain hashes and byte counts rather than signed URLs, headers or session tokens. The host app owns background scheduling and must keep the destination directory available.
 
 ## Current limitations
