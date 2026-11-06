@@ -27,6 +27,9 @@ class ToolingTests(unittest.TestCase):
         for path in (ROOT/'ci').glob('*.sh'):
             subprocess.run(['bash','-n',str(path)],check=True)
 
+    def test_browser_endpoint_fixture_regressions_without_a_browser(self):
+        subprocess.run(['node','--test',str(ROOT/'kmpyt/src/jvmTest/resources/youtube/chromium-runtime-endpoint.test.cjs')],check=True)
+
     def test_homes_and_parent_are_preserved(self):
         before=dict(os.environ)
         names=['HOME','GRADLE_USER_HOME','KONAN_DATA_DIR','TMPDIR','TMP','TEMP','ANDROID_USER_HOME','GIT_CONFIG_GLOBAL']
