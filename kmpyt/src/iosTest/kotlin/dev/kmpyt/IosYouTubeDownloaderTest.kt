@@ -62,7 +62,7 @@ class IosYouTubeDownloaderTest {
                     assertFailsWith<IllegalStateException> {
                         IosYouTubeDownloader(http).download(plan(IosAuthoredMedia.video.size.toLong(), null), "$directory/rejected.mp4") {}
                     }
-                    assertTrue(children(directory).isEmpty())
+                    assertIosResumeResidue(directory)
                 } finally { http.close() }
             }
             val bytes = IosAuthoredMedia.video
@@ -78,7 +78,7 @@ class IosYouTubeDownloaderTest {
                     IosYouTubeDownloader(http).download(selected.copy(primary = selected.primary.copy(segments = listOf(range))),
                         "$directory/invalid-range.mp4") {}
                 }
-                assertTrue(children(directory).isEmpty())
+                assertIosResumeResidue(directory, stores = 2)
             } finally { http.close() }
         }
     }
@@ -113,7 +113,7 @@ class IosYouTubeDownloaderTest {
                 assertEquals(0L, updates.first().bytesDownloaded)
                 val asset = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(result.destinationPath), options = null)
                 assertEquals(1, asset.tracksWithMediaType(AVMediaTypeVideo).size)
-                assertEquals(listOf("sabr.mp4"), children(directory))
+                assertIosResumeResidue(directory, listOf("sabr.mp4"))
             } finally { http.close() }
         }
     }
@@ -143,7 +143,7 @@ class IosYouTubeDownloaderTest {
                 assertEquals(1, asset.tracksWithMediaType(AVMediaTypeVideo).size)
                 assertEquals(1, asset.tracksWithMediaType(AVMediaTypeAudio).size)
                 assertTrue(CMTimeGetSeconds(asset.duration) in 0.5..1.0)
-                assertEquals(listOf("combined.mp4"), children(directory))
+                assertIosResumeResidue(directory, listOf("combined.mp4"))
             } finally { http.close() }
         }
     }
@@ -173,7 +173,7 @@ class IosYouTubeDownloaderTest {
                 assertFailsWith<IllegalStateException> {
                     IosYouTubeDownloader(http).download(plan(bytes.size.toLong(), null), "$directory/truncated.mp4") {}
                 }
-                assertTrue(children(directory).isEmpty())
+                assertIosResumeResidue(directory)
             } finally { http.close() }
             val cancellingHttp = HttpClient(MockEngine {
                 respond(bytes, HttpStatusCode.OK, headersOf(HttpHeaders.ContentLength, bytes.size.toString()))
@@ -184,7 +184,7 @@ class IosYouTubeDownloaderTest {
                         if (it.bytesDownloaded > 0) throw CancellationException("test cancellation")
                     }
                 }
-                assertTrue(children(directory).isEmpty())
+                assertIosResumeResidue(directory, stores = 2)
             } finally { cancellingHttp.close() }
         }
     }

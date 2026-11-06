@@ -40,9 +40,10 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
         val store = IosDownloadResumeStore.open(destinationPath, iosSelectionDigest(plan))
         val files = mutableListOf<IosMediaFile>()
         var published = false
+        var failure: Throwable? = null
         try {
             require(!manager.fileExistsAtPath(store.destination)) { "The destination already exists; choose another file." }
-            store.load(plan, parts)
+            store.load(plan, parts, allowLocalHttp)
             val paths: List<String>
             if (plan.primary.transport == TransportKind.SABR) {
                 require(plan.requestHeaders.isEmpty()) { "SABR uses its source-declared anonymous client headers." }
@@ -53,6 +54,7 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
                 requireIosStorage(store.directory, total - retained)
                 onProgress(YouTubeDownloadProgress(retained, total))
                 val transfer = YouTubeSabrTransfer(http)
+                var transferFailure: Throwable? = null
                 try {
                     val sizes = representations.associate { requireNotNull(it.sabr).formatId to requireNotNull(it.sizeBytes) }
                     val sinks = representations.mapIndexed { index, representation -> representation.role to files[index] }.toMap()
@@ -61,11 +63,13 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
                         onCheckpoint = resume::save,
                         onProgress = { onProgress(YouTubeDownloadProgress(it.bytesWritten, it.totalBytes)) },
                         nowEpochMs = { (NSDate().timeIntervalSince1970 * 1000).toLong() })
-                } catch (cancelled: CancellationException) { throw cancelled }
-                catch (failure: Exception) {
-                    files.firstNotNullOfOrNull { it.storageFailure }?.let { throw it }
-                    throw failure
-                } finally { transfer.close() }
+                } catch (error: Throwable) {
+                    val original = if (error is CancellationException) error
+                        else files.firstNotNullOfOrNull { it.storageFailure } ?: error
+                    if (original !== error) original.addSuppressed(error)
+                    transferFailure = original
+                    throw original
+                } finally { iosCleanup(transferFailure, { transfer.close() }) }
                 files.forEach { it.flush(); it.close() }
                 paths = files.map { it.path }
             } else {
@@ -106,7 +110,11 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
             if (remux) {
                 requireIosStorage(store.directory, checkedIosSum(paths.map { requireNotNull(store.fileLength(it)) }))
                 IosMediaMuxer.mux(paths[0], plan.primary.role, paths.getOrNull(1), output)
-                IosMediaFile(output, existing = true).let { file -> try { file.flush() } finally { file.close() } }
+                val file = IosMediaFile(output, existing = true)
+                var flushFailure: Throwable? = null
+                try { file.flush() }
+                catch (error: Throwable) { flushFailure = error; throw error }
+                finally { iosCleanup(flushFailure, { file.close() }) }
             }
             currentCoroutineContext().ensureActive()
             val written = store.fileLength(output) ?: 0
@@ -117,9 +125,15 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
             YouTubeDownloadResult(destinationPath, written,
                 if (remux) if (plan.primary.role == TrackRole.AUDIO) "audio/mp4" else "video/mp4"
                 else plan.primary.mimeType.substringBefore(';'))
-        } finally {
-            files.forEach { it.close() }
-            store.close(completed = published)
+        } catch (error: Throwable) { failure = error; throw error }
+        finally {
+            withContext(NonCancellable) {
+                val closedFiles = iosCleanupFailure(failure,
+                    *files.map<IosMediaFile, () -> Unit> { file -> { file.close() } }.toTypedArray())
+                val cleanupFailure = iosCleanupFailure(closedFiles,
+                    { store.close(completed = published, priorFailure = closedFiles) })
+                if (failure == null) cleanupFailure?.let { throw it }
+            }
         }
     }
 
@@ -134,10 +148,12 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
         val total = checkedIosSum(sizes)
         requireIosStorage(store.directory, total)
         val destination = IosMediaFile("${store.directory}/assembled-$track.mp4", total)
+        var destinationFailure: Throwable? = null
         try {
             var position = 0L
             parts.forEachIndexed { index, part ->
                 val source = IosMediaFile(store.partPath(part.key), existing = true)
+                var sourceFailure: Throwable? = null
                 try {
                     var offset = 0L
                     while (offset < sizes[index]) {
@@ -145,11 +161,13 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
                         destination.write(position, bytes)
                         offset += bytes.size; position += bytes.size
                     }
-                } finally { source.close() }
+                } catch (error: Throwable) { sourceFailure = error; throw error }
+                finally { iosCleanup(sourceFailure, { source.close() }) }
             }
             check(position == total)
             destination.flush()
             return destination.path
-        } finally { destination.close() }
+        } catch (error: Throwable) { destinationFailure = error; throw error }
+        finally { iosCleanup(destinationFailure, { destination.close() }) }
     }
 }

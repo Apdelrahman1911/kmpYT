@@ -10,7 +10,56 @@ import platform.Foundation.*
 import platform.posix.*
 
 /** Local failures deliberately are not network IOExceptions: SABR must never retry a failed disk write. */
-internal class IosMediaStorageException(message: String) : Exception(message)
+internal class IosMediaStorageException(message: String, val releaseUncertain: Boolean = false) : Exception(message)
+
+/** Close uncertainty can be suppressed under the original transfer failure, but must still veto deletion. */
+internal fun iosReleaseUncertain(failure: Throwable?): Boolean {
+    val pending = mutableListOf<Throwable>().apply { failure?.let(::add) }
+    val visited = mutableListOf<Throwable>()
+    while (pending.isNotEmpty()) {
+        val next = pending.removeAt(pending.lastIndex)
+        if (visited.any { it === next }) continue
+        if (visited.size >= 256) return true // An excessive failure graph is not proof of released ownership.
+        visited += next
+        if (next is IosMediaStorageException && next.releaseUncertain) return true
+        next.cause?.let(pending::add)
+        pending.addAll(next.suppressedExceptions)
+    }
+    return false
+}
+
+/** Attempt every independent cleanup and preserve the original failure, including close uncertainty. */
+internal fun iosCleanupFailure(primary: Throwable?, vararg actions: () -> Unit): Throwable? {
+    var failure = primary
+    actions.forEach { action ->
+        try { action() }
+        catch (error: Throwable) {
+            if (failure == null) failure = error else if (failure !== error) failure!!.addSuppressed(error)
+        }
+    }
+    return failure
+}
+
+internal fun iosCleanup(primary: Throwable?, vararg actions: () -> Unit) {
+    val failure = iosCleanupFailure(primary, *actions)
+    if (primary == null) failure?.let { throw it }
+}
+
+internal suspend fun iosCleanupFailureAsync(primary: Throwable?, vararg actions: suspend () -> Unit): Throwable? {
+    var failure = primary
+    actions.forEach { action ->
+        try { action() }
+        catch (error: Throwable) {
+            if (failure == null) failure = error else if (failure !== error) failure!!.addSuppressed(error)
+        }
+    }
+    return failure
+}
+
+internal suspend fun iosCleanupAsync(primary: Throwable?, vararg actions: suspend () -> Unit) {
+    val failure = iosCleanupFailureAsync(primary, *actions)
+    if (primary == null) failure?.let { throw it }
+}
 
 internal fun requireIosStorage(path: String, additionalBytes: Long) {
     require(additionalBytes >= 0)
@@ -29,12 +78,21 @@ internal fun checkedIosSum(values: Iterable<Long>): Long = values.fold(0L) { tot
 /** Bounded buffers, 64-bit offsets and errno-based failures avoid Objective-C file-write exceptions. */
 internal class IosMediaFile(val path: String, private val expected: Long? = null,
     private val durableWrites: Boolean = false, existing: Boolean = false) : YouTubeSabrTrackSink {
-    private var descriptor = open(path, O_RDWR or O_NOFOLLOW or (if (existing) 0 else (O_CREAT or O_EXCL)), 384)
+    private var descriptor = open(path, O_RDWR or O_NOFOLLOW or O_NONBLOCK or (if (existing) 0 else (O_CREAT or O_EXCL)), 384)
     private var storageAllowance = 0L
     private var closeFailure: IosMediaStorageException? = null
     var storageFailure: IosMediaStorageException? = null
         private set
-    init { if (descriptor < 0) throw IosMediaStorageException("Could not create private media storage.") }
+    init {
+        if (descriptor < 0) throw IosMediaStorageException("Could not create private media storage.")
+        try {
+            memScoped {
+                val info = alloc<stat>()
+                if (fstat(descriptor, info.ptr) != 0 || (info.st_mode.toInt() and S_IFMT) != S_IFREG)
+                    throw IosMediaStorageException("Private media storage must be a regular file.")
+            }
+        } catch (failure: Throwable) { iosCleanup(failure, { close() }); throw failure }
+    }
 
     override suspend fun size(): Long {
         currentCoroutineContext().ensureActive()
@@ -118,7 +176,7 @@ internal class IosMediaFile(val path: String, private val expected: Long? = null
             // A failed close leaves descriptor ownership uncertain. Do not
             // retry a numeric descriptor that the OS may already have reused.
             if (platform.posix.close(owned) != 0) {
-                val failure = IosMediaStorageException("Could not confirm release of private media storage.")
+                val failure = IosMediaStorageException("Could not confirm release of private media storage.", releaseUncertain = true)
                 closeFailure = failure
                 throw failure
             }

@@ -127,7 +127,7 @@ lowercase signing keys on Googlevideo (or explicit authored loopback tests) are 
 Changed/unverifiable identity restarts; legacy schema-1 checkpoints require the exact old plan.
 Multi-resource plans retain their exact-plan bindings rather than borrowing this progressive
 identity rule. iOS has a separate checkpoint implementation; its retained-byte hashing,
-redirect/scope and storage parity repair is under review, not compiled or executed for this change.
+redirect/scope and storage parity repair is source-reviewed, not compiled or executed for this change.
 
 JVM/Android checkpoint roots must remain caller-private. Platform no-follow guards now inspect
 the full ancestry before destination/private-file access: JVM NIO rejects links, special files
@@ -154,6 +154,17 @@ Legacy SABR schema-1/2 files serialized transient endpoint/configuration/session
 purged under the stable lock before callbacks or network requests, never replayed or re-saved.
 Raw `SabrTransferCheckpoint` remains a sensitive in-memory protocol object, not a safe persistence
 format. No implicit authorization or integrity grant is added.
+
+The authored iOS schema-2 repair uses the same raw resource identity and SABR byte receipts,
+hashes retained HTTP prefixes and sparse SABR coverage, and revalidates final-response scope and
+strong validators before HTTP append. Schema-less legacy iOS checkpoints still decode as schema 1
+and reset. Bounded regular-file/no-follow checks and stable owner/lock inodes protect private state.
+An earlier dependent media/checkpoint/owner close uncertainty vetoes deletion and keeps the held
+OS lock until process exit; a later error from an already-attempted lock release cannot establish
+continued cross-process exclusion. Numeric descriptors are never retried after uncertain close.
+Three authored native-lock helper regressions use real independent file descriptions and injected
+uncertainty reports, not real close syscall faults. Neither these tests nor the larger Apple repair
+have been compiled/executed; store deletion-veto and sticky ownership wiring are source-reviewed.
 
 The 2026-11-06 scoped Linux JVM privacy/transfer/path run completed **147 tests: 146 passed,
 0 failures/errors, 1 Windows-only junction test skipped**, with explicit FFmpeg. It includes

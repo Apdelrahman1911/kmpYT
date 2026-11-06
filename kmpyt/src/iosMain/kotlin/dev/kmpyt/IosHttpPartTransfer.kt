@@ -5,6 +5,7 @@ package dev.kmpyt
 import dev.kmpyt.downloads.DownloadProtocol
 import dev.kmpyt.extraction.*
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -18,16 +19,30 @@ import platform.Foundation.NSURL
 import platform.Foundation.timeIntervalSince1970
 
 /** A response validator is checked before an existing file is opened for appending. */
-internal class IosHttpPartTransfer(private val http: HttpClient, private val store: IosDownloadResumeStore,
+internal class IosHttpPartTransfer(private val client: HttpClient, private val store: IosDownloadResumeStore,
     private val plan: PlannedDownload, private val allowLocalHttp: Boolean) {
     suspend fun fetch(part: TransferPart, progress: suspend (PartState, Long) -> Unit): PartState {
+        // Share the engine only. Caller redirect/default-header/cookie/retry plugins must not
+        // bypass explicit resource policy or leak a protected session across an HTTP redirect.
+        val http = HttpClient(client.engine) {
+            followRedirects = false
+            expectSuccess = false
+            install(HttpTimeout) { connectTimeoutMillis = 20_000; socketTimeoutMillis = 45_000 }
+        }
+        var failure: Throwable? = null
+        return try { fetch(http, part, progress) }
+        catch (error: Throwable) { failure = error; throw error }
+        finally { iosCleanup(failure, { http.close() }) }
+    }
+
+    private suspend fun fetch(http: HttpClient, part: TransferPart, progress: suspend (PartState, Long) -> Unit): PartState {
         var previous = store.parts.singleOrNull { it.key == part.key }
         var url = part.resource.url
         val originalOrigin = ResearchAccess.origin(url)
         var redirects = 0
         var restarted = false
         val resourceDigest = iosDigest(part.resource.url)
-        val scopeDigest = iosResourceScope(part, plan.mediaId)
+        val scopeDigest = iosResourceScope(part, plan.mediaId, allowLocalHttp)
         while (true) {
             currentCoroutineContext().ensureActive()
             UrlPolicy.validate(url, allowLocalHttp)?.let { throw IllegalArgumentException(it) }
@@ -56,6 +71,10 @@ internal class IosHttpPartTransfer(private val http: HttpClient, private val sto
                         ?: error("The media redirect has an invalid destination.")
                     return@execute
                 }
+                val responseUrl = response.call.request.url.toString()
+                UrlPolicy.validate(responseUrl, allowLocalHttp)?.let { throw IllegalArgumentException(it) }
+                YouTubeDownloadPolicy.requireResource(responseUrl, plan.inspectionUrl, plan.mediaId)
+                val responseScope = iosResourceScope(responseUrl, plan.mediaId, allowLocalHttp)
                 val validator = iosResponseValidator(response.headers[HttpHeaders.ETag],
                     response.headers[HttpHeaders.LastModified], response.headers[HttpHeaders.Date])
                 if (status == 416 && resuming) {
@@ -67,7 +86,7 @@ internal class IosHttpPartTransfer(private val http: HttpClient, private val sto
                     if (status in setOf(401, 403, 410)) "The media link is no longer available. Inspect the video again and retry."
                     else "The media server returned HTTP $status."
                 }
-                if (resuming && (status != 206 || validator == null || validator != old!!.validator)) {
+                if (resuming && (status != 206 || validator == null || validator != old!!.validator || responseScope != old.responseScope)) {
                     // No response body bytes may be joined to a different or unverifiable entity.
                     reset = true
                     return@execute
@@ -118,7 +137,8 @@ internal class IosHttpPartTransfer(private val http: HttpClient, private val sto
                     check(total == old!!.bytes && store.fileLength(store.partPath(part.key)) == old.bytes) {
                         "The completed private track no longer matches its checkpoint."
                     }
-                    val complete = old.copy(resourceDigest = resourceDigest, total = total, complete = true, objectTotalBytes = objectTotal)
+                    val complete = old.copy(resourceDigest = resourceDigest, total = total, complete = true,
+                        objectTotalBytes = objectTotal, responseScope = responseScope)
                     store.savePart(complete)
                     result = complete.state()
                     return@execute
@@ -132,14 +152,20 @@ internal class IosHttpPartTransfer(private val http: HttpClient, private val sto
                 var complete = false
                 var oversized = false
                 var failure: Throwable? = null
+                var digest: IosResumeSha256? = null
+                var prefixVerified = false
                 var lastTime = NSDate().timeIntervalSince1970
                 var lastBytes = bytes
                 fun saved(done: Boolean = false) = IosSavedPart(part.key, resourceDigest, scopeDigest, bytes,
-                    if (done) bytes else total, done, validator, objectTotal)
+                    if (done) bytes else total, done, validator, objectTotal,
+                    prefixDigest = requireNotNull(digest).snapshot(), responseScope = responseScope)
                 suspend fun commit() { file.flush(); store.savePart(saved()) }
                 try {
                     if (resuming) check(file.length() == retained) { "The private media file changed while resuming." }
                     else { file.truncate(0); file.flush() }
+                    digest = iosPrefixHasher(file, retained)
+                    if (resuming) check(requireNotNull(digest).snapshot() == old!!.prefixDigest) { "The retained private media prefix changed while resuming." }
+                    prefixVerified = true
                     commit()
                     progress(saved().state(), 0)
                     val channel = response.bodyAsChannel()
@@ -155,6 +181,7 @@ internal class IosHttpPartTransfer(private val http: HttpClient, private val sto
                                 error("The source sent more media than its reported length.")
                             }
                             file.write(bytes, buffer, count)
+                            requireNotNull(digest).update(buffer, count)
                             bytes += count
                             val now = NSDate().timeIntervalSince1970
                             if (lastBytes == retained || now - lastTime >= 0.4) {
@@ -175,15 +202,24 @@ internal class IosHttpPartTransfer(private val http: HttpClient, private val sto
                     failure = error
                     throw error
                 } finally {
-                    try {
-                        if (!complete) withContext(NonCancellable) {
-                            if (!oversized && bytes > 0 && validator != null) commit()
-                            else store.resetPart(part.key)
-                        }
-                    } catch (cleanup: Throwable) {
-                        // The previous atomic checkpoint remains valid if committing newer bytes fails.
-                        if (failure == null) throw cleanup
-                    } finally { file.close() }
+                    withContext(NonCancellable) {
+                        var discardAfterClose = false
+                        var cleanupFailure = iosCleanupFailureAsync(failure,
+                            {
+                                // A cancelled prefix-validation hash leaves the previous receipt intact.
+                                // Never reopen/reset checkpoint files after an earlier unconfirmed close.
+                                if (!iosReleaseUncertain(failure) && !complete && digest != null) {
+                                    if (prefixVerified && !oversized && bytes > 0 && validator != null) commit()
+                                    else discardAfterClose = true
+                                }
+                            },
+                            { file.close() },
+                        )
+                        // Unlink only after the owned media handle is definitely released.
+                        if (discardAfterClose && !iosReleaseUncertain(cleanupFailure))
+                            cleanupFailure = iosCleanupFailureAsync(cleanupFailure, { store.resetPart(part.key) })
+                        if (failure == null) cleanupFailure?.let { throw it }
+                    }
                 }
             }
             result?.let { return it }

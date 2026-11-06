@@ -3,15 +3,17 @@
 package dev.kmpyt
 
 import dev.kmpyt.extraction.*
-import io.ktor.http.Url
+import dev.kmpyt.internal.SabrSavedReceipt
+import dev.kmpyt.internal.SabrSavedTrack
+import dev.kmpyt.internal.resumeResourceIdentity
 import kotlinx.cinterop.*
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
-import platform.CoreCrypto.CC_SHA256
-import platform.CoreCrypto.CC_SHA256_DIGEST_LENGTH
 import platform.Foundation.*
 import platform.posix.*
 
@@ -19,22 +21,15 @@ import platform.posix.*
 @Serializable internal data class IosResumeValidator(val kind: String, val digest: String)
 @Serializable internal data class IosSavedPart(val key: String, val resourceDigest: String, val scopeDigest: String, val bytes: Long = 0,
     val total: Long? = null, val complete: Boolean = false, val validator: IosResumeValidator? = null,
-    val objectTotalBytes: Long? = null)
-@Serializable internal data class IosSavedSabrTrack(val index: Int, val expectedBytes: Long,
-    val coverage: List<SabrTransferByteRange>, val completedSegments: List<SabrTransferSegment>)
-@Serializable internal data class IosSavedSabr(val sourceDigest: String, val tracks: List<IosSavedSabrTrack>)
+    val objectTotalBytes: Long? = null, val prefixDigest: String? = null, val responseScope: String? = null)
+internal typealias IosSavedSabrTrack = SabrSavedTrack
+internal typealias IosSavedSabr = SabrSavedReceipt
+// The old writer omitted its default schema=1. Keep that decoding default so a
+// schema-less legacy checkpoint cannot accidentally be interpreted as schema 2.
 @Serializable private data class IosSavedDownload(val schema: Int = 1, val selectionDigest: String,
     val parts: List<IosSavedPart> = emptyList(), val sabr: IosSavedSabr? = null)
 
-internal fun iosDigest(text: String): String {
-    val bytes = text.encodeToByteArray()
-    val buffer = bytes.takeIf { it.isNotEmpty() } ?: byteArrayOf(0)
-    val digest = ByteArray(CC_SHA256_DIGEST_LENGTH)
-    buffer.usePinned { input -> digest.usePinned { output ->
-        CC_SHA256(input.addressOf(0), bytes.size.convert(), output.addressOf(0).reinterpret())
-    } }
-    return digest.joinToString("") { (it.toInt() and 255).toString(16).padStart(2, '0') }
-}
+internal fun iosDigest(text: String): String = IosResumeSha256().apply { update(text.encodeToByteArray()) }.snapshot()
 
 internal fun iosSelectionDigest(plan: PlannedDownload): String {
     fun track(value: Representation): JsonObject {
@@ -57,19 +52,10 @@ internal fun iosSelectionDigest(plan: PlannedDownload): String {
     }.toString())
 }
 
-internal fun iosResourceScope(part: TransferPart, mediaId: String): String {
-    val url = Url(part.resource.url)
-    val googleVideo = url.host == "googlevideo.com" || url.host.endsWith(".googlevideo.com")
-    val signing = setOf("sig", "signature", "expire", "expires") + if (googleVideo)
-        setOf("lsig", "sparams", "lsparams", "n", "ei", "ip", "ipbits", "spc", "pot") else emptySet()
-    return iosDigest(buildJsonObject {
-        put("media", mediaId)
-        put("origin", "${url.protocol.name}://${if (googleVideo) "googlevideo.com" else url.host}:${url.port}")
-        put("path", url.encodedPath)
-        put("query", JsonObject(url.parameters.entries().filterNot { it.key.lowercase() in signing }.sortedBy { it.key }
-            .associate { it.key to JsonArray(it.value.map(::JsonPrimitive)) }))
-    }.toString())
-}
+internal fun iosResourceScope(part: TransferPart, mediaId: String, allowLocalHttp: Boolean = false): String =
+    iosResourceScope(part.resource.url, mediaId, allowLocalHttp)
+internal fun iosResourceScope(url: String, mediaId: String, allowLocalHttp: Boolean = false): String =
+    iosDigest(resumeResourceIdentity(url, mediaId, allowLocalHttp))
 
 internal fun iosResponseValidator(etag: String?, modified: String?, date: String?): IosResumeValidator? {
     val tag = etag?.trim()?.takeIf { it.length in 2..8192 && it.startsWith('"') && it.endsWith('"') &&
@@ -89,51 +75,70 @@ internal fun iosResponseValidator(etag: String?, modified: String?, date: String
     return if (served - last >= 60) IosResumeValidator("last-modified", iosDigest(last.toLong().toString())) else null
 }
 
-/** A stable app-private staging directory and advisory lock survive process termination. */
+/**
+ * Stable caller-private storage. The reusable lock inode/parent are never unlinked by this store,
+ * including on success. Earlier dependent close uncertainty retains the held OS lock until process
+ * exit, not just an in-process destination fence. Same-user hostile directory mutation is outside
+ * this ownership contract; a lock-release syscall error cannot prove continued cross-process fencing.
+ */
 internal class IosDownloadResumeStore private constructor(val destination: String, val directory: String,
     private val lockDescriptor: Int, private val selectionDigest: String) {
-    private val manager = NSFileManager.defaultManager
     private val json = Json { ignoreUnknownKeys = false }
-    private var saved = IosSavedDownload(selectionDigest = selectionDigest)
+    private var saved = IosSavedDownload(schema = 2, selectionDigest = selectionDigest)
+    private var loaded = false
     private var closed = false
+    private var closeFailure: Throwable? = null
+    private var ownershipFailure: Throwable? = null
     val parts: List<IosSavedPart> get() = saved.parts
     val sabr: IosSavedSabr? get() = saved.sabr
 
-    suspend fun load(plan: PlannedDownload, allowedParts: List<TransferPart>) = withContext(NonCancellable) {
+    suspend fun load(plan: PlannedDownload, allowedParts: List<TransferPart>, allowLocalHttp: Boolean = false) = ownedIo {
+        checkUsable()
         val decoded = try {
             read("checkpoint.json", MAX_CHECKPOINT)?.decodeToString()?.let { json.decodeFromString(IosSavedDownload.serializer(), it) }
         } catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) { null }
+        catch (invalid: IllegalArgumentException) { if (iosReleaseUncertain(invalid)) throw invalid else null }
         val allowed = allowedParts.associateBy { it.key }
-        val valid = decoded != null && decoded.schema == 1 && decoded.selectionDigest == selectionDigest &&
+        val valid = decoded != null && decoded.schema == 2 && decoded.selectionDigest == selectionDigest &&
             decoded.parts.map { it.key }.distinct().size == decoded.parts.size && decoded.parts.all {
                 it.key in allowed && it.bytes >= 0 && (it.total == null || it.total >= it.bytes) &&
                     (it.objectTotalBytes == null || it.objectTotalBytes >= 0) &&
                     (!it.complete || it.total == it.bytes) && DIGEST.matches(it.resourceDigest) && DIGEST.matches(it.scopeDigest) &&
-                    (it.validator == null || it.validator.kind in setOf("etag", "last-modified") && DIGEST.matches(it.validator.digest))
+                    (it.validator == null || it.validator.kind in setOf("etag", "last-modified") && DIGEST.matches(it.validator.digest)) &&
+                    (it.bytes == 0L || it.prefixDigest?.let(DIGEST::matches) == true && it.responseScope?.let(DIGEST::matches) == true)
             } && (decoded.sabr == null || DIGEST.matches(decoded.sabr.sourceDigest))
         if (!valid) {
-            clearMedia()
-            saved = IosSavedDownload(selectionDigest = selectionDigest)
-            return@withContext
+            withContext(NonCancellable) { clearMedia() }
+            saved = IosSavedDownload(schema = 2, selectionDigest = selectionDigest)
+            loaded = true
+            return@ownedIo
         }
-        saved = requireNotNull(decoded)
+        val candidate = requireNotNull(decoded)
         val retained = mutableListOf<IosSavedPart>()
-        for (part in saved.parts) {
+        for (part in candidate.parts) {
+            currentCoroutineContext().ensureActive()
             val path = partPath(part.key)
             val length = fileLength(path)
-            if (part.scopeDigest != iosResourceScope(allowed.getValue(part.key), plan.mediaId) ||
+            if (part.scopeDigest != iosResourceScope(allowed.getValue(part.key), plan.mediaId, allowLocalHttp) ||
                 part.bytes <= 0 || part.validator == null || length == null || length < part.bytes ||
                 allowed.getValue(part.key).expectedBytes?.let { part.total != null && part.total != it || part.bytes > it } == true) {
-                manager.removeItemAtPath(path, null)
+                remove(path)
                 continue
             }
-            if (length > part.bytes) IosMediaFile(path, existing = true).let { file ->
-                try { file.truncate(part.bytes); file.flush() } finally { file.close() }
-            }
-            retained += part
+            val file = IosMediaFile(path, existing = true)
+            var failure: Throwable? = null
+            val digest = try {
+                // Only the acknowledged prefix can survive an interrupted checkpoint commit.
+                if (length > part.bytes) { file.truncate(part.bytes); file.flush() }
+                iosPrefixHasher(file, part.bytes).snapshot()
+            } catch (error: Throwable) { failure = error; throw error }
+            finally { iosCleanup(failure, { file.close() }) }
+            if (digest != part.prefixDigest) { remove(path); continue }
+            retained += part.copy(complete = false) // Even a fully retained file is response-revalidated.
         }
-        saved = saved.copy(parts = retained)
+        // A cancelled hash must not leave the default empty saved state authorizing deletion.
+        saved = candidate.copy(parts = retained)
+        loaded = true
         removeProcessingFiles()
     }
 
@@ -142,85 +147,120 @@ internal class IosDownloadResumeStore private constructor(val destination: Strin
         return "$directory/part-$key.mp4"
     }
 
-    fun fileLength(path: String): Long? {
-        val attributes = manager.attributesOfItemAtPath(path, null) ?: return null
-        if (attributes[NSFileType] != NSFileTypeRegular) return null
-        return (attributes[NSFileSize] as? NSNumber)?.longLongValue?.takeIf { it >= 0 }
-    }
+    fun fileLength(path: String): Long? = regularLength(path)
 
     suspend fun savePart(value: IosSavedPart) = withContext(NonCancellable) {
-        saved = saved.copy(parts = saved.parts.filterNot { it.key == value.key } + value)
-        persist()
+        checkUsable()
+        update(saved.copy(parts = saved.parts.filterNot { it.key == value.key } + value))
     }
 
     suspend fun resetPart(key: String) = withContext(NonCancellable) {
-        saved = saved.copy(parts = saved.parts.filterNot { it.key == key })
-        persist()
-        manager.removeItemAtPath(partPath(key), null)
+        checkUsable()
+        update(saved.copy(parts = saved.parts.filterNot { it.key == key }))
+        remove(partPath(key))
     }
 
     suspend fun saveSabr(value: IosSavedSabr) = withContext(NonCancellable) {
-        if (saved.sabr != value) { saved = saved.copy(sabr = value); persist() }
+        checkUsable()
+        if (saved.sabr != value) update(saved.copy(sabr = value))
     }
 
-    suspend fun resetSabr() = withContext(NonCancellable) {
-        saved = saved.copy(sabr = null)
-        persist()
-        listOf("sabr-0.mp4", "sabr-1.mp4").forEach { manager.removeItemAtPath("$directory/$it", null) }
+    suspend fun resetSabr(removeFiles: Boolean = true) = withContext(NonCancellable) {
+        checkUsable()
+        update(saved.copy(sabr = null))
+        if (removeFiles) removeChildren(listOf("sabr-0.mp4", "sabr-1.mp4"))
     }
 
-    private suspend fun persist() {
-        val bytes = json.encodeToString(IosSavedDownload.serializer(), saved).encodeToByteArray()
+    private suspend fun update(next: IosSavedDownload) = ownedIo {
+        checkUsable()
+        check(loaded)
+        val bytes = json.encodeToString(IosSavedDownload.serializer(), next).encodeToByteArray()
         check(bytes.size <= MAX_CHECKPOINT) { "The download checkpoint exceeds its metadata bound." }
+        checkedChildren(directory)
         val temporary = "$directory/checkpoint.tmp"
-        manager.removeItemAtPath(temporary, null)
+        remove(temporary)
         val file = IosMediaFile(temporary)
-        try { file.write(0, bytes); file.flush() } finally { file.close() }
+        var failure: Throwable? = null
+        try { file.write(0, bytes); file.flush() }
+        catch (error: Throwable) { failure = error; throw error }
+        finally { iosCleanup(failure, { file.close() }) }
         if (rename(temporary, "$directory/checkpoint.json") != 0) throw IosMediaStorageException("Could not commit the download checkpoint.")
-        val fd = platform.posix.open(directory, O_RDONLY)
+        val fd = platform.posix.open(directory, O_RDONLY or O_NOFOLLOW)
         if (fd < 0) throw IosMediaStorageException("Could not open the checkpoint directory for commit.")
+        failure = null
         try {
             if (fsync(fd) != 0) throw IosMediaStorageException("Could not commit the checkpoint directory.")
-        } finally { platform.posix.close(fd) }
+        } catch (error: Throwable) { failure = error; throw error }
+        finally { iosCleanup(failure, { iosCloseCheckpointDescriptor(fd) }) }
+        saved = next
     }
 
-    private suspend fun read(name: String, maximum: Int): ByteArray? {
+    private suspend fun read(name: String, maximum: Int): ByteArray? = ownedIo {
         val path = "$directory/$name"
-        val size = fileLength(path) ?: return null
-        require(size <= maximum)
+        val size = fileLength(path) ?: return@ownedIo null
+        require(size <= maximum) { "The private checkpoint exceeds its size bound." }
         val file = IosMediaFile(path, existing = true)
-        return try { file.read(0, size.toInt()) } finally { file.close() }
+        var failure: Throwable? = null
+        try { file.read(0, size.toInt()) }
+        catch (error: Throwable) { failure = error; throw error }
+        finally { iosCleanup(failure, { file.close() }) }
+    }
+
+    private fun checkUsable() {
+        check(!closed)
+        ownershipFailure?.let { throw it }
+    }
+
+    private suspend fun <T> ownedIo(block: suspend () -> T): T {
+        checkUsable()
+        return try { block() }
+        catch (error: Throwable) {
+            // The protocol engine may publish one final checkpoint after a callback fails.
+            // Never reopen or replace files whose earlier descriptor release was unconfirmed.
+            if (iosReleaseUncertain(error) && ownershipFailure == null) ownershipFailure = error
+            throw error
+        }
     }
 
     private fun clearMedia() {
-        children().filter { it != "owner" && it != "lock" }.forEach { manager.removeItemAtPath("$directory/$it", null) }
+        removeChildren(checkedChildren(directory).filter { it != "owner" && it != "lock" })
     }
 
     private fun removeProcessingFiles() {
-        children().filter { it.startsWith("assembled-") || it == "output.mp4" || it == "checkpoint.tmp" }
-            .forEach { manager.removeItemAtPath("$directory/$it", null) }
+        removeChildren(checkedChildren(directory).filter { it.startsWith("assembled-") || it == "output.mp4" || it == "checkpoint.tmp" })
     }
 
-    private fun children(): List<String> = manager.contentsOfDirectoryAtPath(directory, null).orEmpty().map { it as String }
+    private fun removeChildren(names: List<String>) =
+        iosCleanup(null, *names.map<String, () -> Unit> { name -> { remove("$directory/$name") } }.toTypedArray())
 
-    fun close(completed: Boolean = false, discard: Boolean = false) {
-        if (closed) return
+    fun close(completed: Boolean = false, discard: Boolean = false, priorFailure: Throwable? = null) {
+        if (closed) { closeFailure?.let { throw it }; return }
         closed = true
+        var released = false
+        val earlierOwnershipFailure = priorFailure?.takeIf(::iosReleaseUncertain) ?: ownershipFailure
+        val unconfirmedMediaRelease = earlierOwnershipFailure != null
         try {
-            removeProcessingFiles()
-            val useful = saved.parts.any { it.bytes > 0 && it.validator != null } ||
-                saved.sabr?.tracks?.any { it.coverage.isNotEmpty() } == true
-            if (completed || discard || !useful) manager.removeItemAtPath(directory, null)
-        } finally {
-            flock(lockDescriptor, LOCK_UN)
-            close(lockDescriptor)
-            destinations.lock()
-            try { activeDestinations.remove(destination) } finally { destinations.unlock() }
+            val cleanupFailure = iosCleanupFailure(earlierOwnershipFailure,
+                { if (!unconfirmedMediaRelease) removeProcessingFiles() },
+                {
+                    val useful = !loaded || saved.parts.any { it.bytes > 0 && it.validator != null && it.prefixDigest != null } ||
+                        saved.sabr?.tracks?.any { it.coverage.isNotEmpty() } == true
+                    if (!unconfirmedMediaRelease && (completed || discard || !useful)) clearMedia()
+                },
+            )
+            val result = iosReleaseCheckpointLock(lockDescriptor, held = true, earlierFailure = cleanupFailure)
+            released = result.descriptorReleased
+            result.failure?.let { throw it }
+        } catch (error: Throwable) { closeFailure = error; throw error }
+        finally {
+            // Neither dependent uncertainty nor an uncertain lock close authorizes an in-process owner.
+            if (released && !unconfirmedMediaRelease && !iosReleaseUncertain(closeFailure)) unregister(destination)
         }
     }
 
     companion object {
         private const val MAX_CHECKPOINT = 8_000_000
+        private const val MAX_ENTRIES = 8_192
         private const val OWNER = "kmpyt-ios-resume-v1"
         private val DIGEST = Regex("[0-9a-f]{64}")
         private val destinations = NSLock()
@@ -239,46 +279,91 @@ internal class IosDownloadResumeStore private constructor(val destination: Strin
             try { check(activeDestinations.add(destination)) { "Another download is already using this destination." } }
             finally { destinations.unlock() }
             var fd = -1
+            var heldLock = false
             try {
                 val directory = canonicalParent.trimEnd('/') + "/.kmpyt-" + iosDigest(destination)
-                if (!manager.fileExistsAtPath(directory)) check(manager.createDirectoryAtPath(directory, false, null, null)) {
-                    "Could not create private download storage."
-                }
+                if (mkdir(directory, 448.convert()) != 0 && errno != EEXIST) throw IosMediaStorageException("Could not create private download storage.")
                 check(canonical(directory) == directory) { "The checkpoint directory must not be a symbolic link." }
-                fd = open("$directory/lock", O_CREAT or O_RDWR or O_NOFOLLOW, 384)
-                check(fd >= 0 && flock(fd, LOCK_EX or LOCK_NB) == 0) { "Another download is already using this destination." }
+                // Reject FIFO/symlink/special entries and excessive trees BEFORE opening anything writable.
+                checkedChildren(directory)
+                fd = platform.posix.open("$directory/lock", O_CREAT or O_RDWR or O_NOFOLLOW or O_NONBLOCK, 384)
+                check(fd >= 0) { "Could not open the private checkpoint lock." }
                 memScoped {
                     val held = alloc<stat>()
                     val current = alloc<stat>()
                     check(fstat(fd, held.ptr) == 0 && lstat("$directory/lock", current.ptr) == 0 &&
+                        (held.st_mode.toInt() and S_IFMT) == S_IFREG &&
                         held.st_dev == current.st_dev && held.st_ino == current.st_ino) {
                         "The destination's private storage changed while acquiring its lock. Retry the download."
                     }
                 }
+                check(flock(fd, LOCK_EX or LOCK_NB) == 0) { "Another download is already using this destination." }
+                heldLock = true
                 val store = IosDownloadResumeStore(destination, directory, fd, selectionDigest)
-                val names = store.children()
-                check(names.all { it in setOf("owner", "lock", "checkpoint.json", "checkpoint.tmp", "output.mp4") ||
-                    Regex("(?:part-\\d+-\\d+|sabr-[01]|assembled-[01])\\.mp4").matches(it) }) {
-                    "The reserved download directory contains unrelated files."
-                }
-                check(names.all { store.fileLength("$directory/$it") != null }) {
-                    "The reserved download directory contains a non-regular file."
-                }
+                val names = checkedChildren(directory)
                 val owner = store.read("owner", 128)?.decodeToString()
                 if (owner == null) {
                     check(names.all { it == "lock" }) { "The reserved download directory has no valid owner marker." }
-                    val file = IosMediaFile("$directory/owner")
-                    try { withContext(NonCancellable) { file.write(0, OWNER.encodeToByteArray()); file.flush() } }
-                    catch (failure: Throwable) { manager.removeItemAtPath("$directory/owner", null); throw failure }
-                    finally { file.close() }
+                    withContext(NonCancellable) {
+                        val file = IosMediaFile("$directory/owner")
+                        var failure: Throwable? = null
+                        var released = false
+                        try { file.write(0, OWNER.encodeToByteArray()); file.flush() }
+                        catch (error: Throwable) { failure = error; throw error }
+                        finally {
+                            iosCleanup(failure,
+                                { file.close(); released = true },
+                                { if (failure != null && released && !iosReleaseUncertain(failure)) remove("$directory/owner") },
+                            )
+                        }
+                    }
                 } else check(owner == OWNER) { "The reserved download directory belongs to another format." }
                 return store
             } catch (failure: Throwable) {
-                if (fd >= 0) { flock(fd, LOCK_UN); close(fd) }
-                destinations.lock()
-                try { activeDestinations.remove(destination) } finally { destinations.unlock() }
-                throw failure
+                val result = iosReleaseCheckpointLock(fd, heldLock, failure)
+                if (result.descriptorReleased && !iosReleaseUncertain(result.failure)) unregister(destination)
+                throw requireNotNull(result.failure)
             }
+        }
+
+        private fun unregister(destination: String) {
+            destinations.lock()
+            try { activeDestinations.remove(destination) } finally { destinations.unlock() }
+        }
+
+        private fun checkedChildren(directory: String): List<String> {
+            memScoped {
+                val info = alloc<stat>()
+                check(lstat(directory, info.ptr) == 0 && (info.st_mode.toInt() and S_IFMT) == S_IFDIR) {
+                    "The checkpoint root must be a private directory."
+                }
+            }
+            val names = NSFileManager.defaultManager.contentsOfDirectoryAtPath(directory, null)
+                ?.map { it as String } ?: throw IosMediaStorageException("Could not inspect private checkpoint storage.")
+            check(names.size <= MAX_ENTRIES && names.all { it.length <= 96 &&
+                (it in setOf("owner", "lock", "checkpoint.json", "checkpoint.tmp", "output.mp4") ||
+                    Regex("(?:part-\\d+-\\d+|sabr-[01]|assembled-[01])\\.mp4").matches(it)) }) {
+                "The reserved download directory contains unrelated or excessive files."
+            }
+            names.forEach { check(regularLength("$directory/$it") != null) { "The checkpoint entry disappeared while inspecting storage." } }
+            return names
+        }
+
+        private fun regularLength(path: String): Long? = memScoped {
+            val info = alloc<stat>()
+            if (lstat(path, info.ptr) != 0) {
+                if (errno == ENOENT) return@memScoped null
+                throw IosMediaStorageException("Could not inspect private media storage.")
+            }
+            check((info.st_mode.toInt() and S_IFMT) == S_IFREG && info.st_size >= 0) {
+                "The reserved download directory contains a non-regular file."
+            }
+            info.st_size
+        }
+
+        private fun remove(path: String) {
+            if (regularLength(path) == null) return
+            if (unlink(path) != 0 && errno != ENOENT) throw IosMediaStorageException("Could not remove private checkpoint data.")
         }
 
         private fun canonical(path: String): String = memScoped {
