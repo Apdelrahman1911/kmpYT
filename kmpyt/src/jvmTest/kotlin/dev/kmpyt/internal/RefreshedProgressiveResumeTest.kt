@@ -18,7 +18,10 @@ import okio.Buffer
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.TimeUnit
+import org.junit.Assume
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -279,7 +282,7 @@ class RefreshedProgressiveResumeTest {
                     assertFalse(fixture.output.exists())
                     if (entry != "lock") assertFalse(File(storage, "lock").exists())
                     assertEquals(listOf(entry), storage.listFiles()!!.map { it.name })
-                } finally { check(link.delete()) }
+                } finally { Files.delete(link.toPath()) }
             }
         }
     }
@@ -302,7 +305,7 @@ class RefreshedProgressiveResumeTest {
                 assertEquals(originalCheckpoint, fixture.checkpoint.readText())
                 assertEquals(1, fixture.server.requestCount)
                 assertFalse(fixture.output.exists())
-            } finally { check(link.delete()) }
+            } finally { Files.delete(link.toPath()) }
         }
     }
 
@@ -320,7 +323,7 @@ class RefreshedProgressiveResumeTest {
                 assertTrue(File(storage, "0-0").isFile)
                 assertTrue(File(nested, "primary").isFile)
                 assertTrue(lock.isFile)
-            } finally { check(link.delete()) }
+            } finally { Files.delete(link.toPath()) }
             deleteCheckpointTree(storage, keepLock = true)
             assertEquals(listOf("lock"), storage.listFiles()!!.map { it.name })
             deleteCheckpointTree(storage)
@@ -333,12 +336,16 @@ class RefreshedProgressiveResumeTest {
             fixture.interrupt()
             val storage = fixture.checkpoint.parentFile
             val lock = File(storage, "lock")
-            val identity = assertNotNull(Files.readAttributes(lock.toPath(), "basic:fileKey")["fileKey"])
+            // Windows BasicFileAttributes.fileKey is null. A caller-owned hard-link witness
+            // retains the original file even if a broken cleanup unlinks/recreates `lock`.
+            val witness = File(fixture.directory, "lock-identity-witness")
+            Files.createLink(witness.toPath(), lock.toPath())
+            assertTrue(Files.isSameFile(witness.toPath(), lock.toPath()))
             fixture.resume()
             fixture.request()
             assertContentEquals(fixture.body, fixture.output.readBytes())
             assertEquals(listOf("lock"), storage.listFiles()!!.map { it.name })
-            assertEquals(identity, Files.readAttributes(lock.toPath(), "basic:fileKey")["fileKey"])
+            assertTrue(Files.isSameFile(witness.toPath(), lock.toPath()), "Completion replaced the reusable lock file")
             // A later owner must lock the same inode, not race a stale cleanup
             // that removed/recreated the path after releasing its OS lock.
             check(fixture.output.delete())
@@ -346,7 +353,78 @@ class RefreshedProgressiveResumeTest {
             assertNull(fixture.request().getHeader("Range"))
             assertContentEquals(fixture.body, fixture.output.readBytes())
             assertEquals(listOf("lock"), storage.listFiles()!!.map { it.name })
-            assertEquals(identity, Files.readAttributes(lock.toPath(), "basic:fileKey")["fileKey"])
+            assertTrue(Files.isSameFile(witness.toPath(), lock.toPath()), "A later owner replaced the reusable lock file")
+        }
+    }
+
+    @Test fun missingLeafCannotHideALinkedPrivateAncestor(): Unit = runBlocking {
+        ResumeFixture().use { fixture ->
+            val outside = File(fixture.directory, "caller-owned").apply { check(mkdir()) }
+            val marker = File(outside, "keep.txt").apply { writeText("authored retained marker") }
+            val link = File(fixture.directory, "linked-private-parent")
+            Files.createSymbolicLink(link.toPath(), outside.toPath())
+            try {
+                assertFailsWith<IllegalStateException> {
+                    requirePrivateCheckpointPath(File(link, "missing/leaf"), allowMissing = true)
+                }
+                assertEquals("authored retained marker", marker.readText())
+                assertFalse(File(outside, "missing").exists())
+                assertEquals(0, fixture.server.requestCount)
+            } finally { Files.delete(link.toPath()) }
+            val absent = File(fixture.directory, "ordinary-new/leaf")
+            requirePrivateCheckpointPath(absent, allowMissing = true)
+            assertFalse(absent.exists())
+            assertFailsWith<IllegalStateException> { requirePrivateCheckpointPath(absent) }
+        }
+    }
+
+    @Test fun existingAndDanglingDestinationLinksCannotBeCanonicalizedIntoCallerFiles(): Unit = runBlocking {
+        for (exists in listOf(true, false)) ResumeFixture().use { fixture ->
+            val outside = File(fixture.directory, "caller-owned").apply { check(mkdir()) }
+            val target = File(outside, "keep.m4a")
+            if (exists) target.writeText("authored caller data")
+            Files.createSymbolicLink(fixture.output.toPath(), target.toPath())
+            try {
+                assertFailsWith<IllegalStateException> { fixture.resume() }
+                assertTrue(Files.isSymbolicLink(fixture.output.toPath()))
+                assertEquals(0, fixture.server.requestCount)
+                assertFalse(fixture.checkpoint.parentFile.exists())
+                if (exists) assertEquals("authored caller data", target.readText()) else assertFalse(target.exists())
+            } finally { Files.delete(fixture.output.toPath()) }
+        }
+    }
+
+    @Test fun windowsJunctionCheckpointNeverTraversesOrDeletesTheCallerTree(): Unit = runBlocking {
+        Assume.assumeTrue("Windows junction-specific regression", System.getProperty("os.name").startsWith("Windows", true))
+        ResumeFixture().use { fixture ->
+            fixture.interrupt()
+            val checkpoint = fixture.checkpoint.readText()
+            val retainedPrefix = fixture.part.readBytes()
+            val outside = File(fixture.directory, "caller-owned").apply { check(mkdir()) }
+            val marker = File(outside, "keep.txt").apply { writeText("authored retained marker") }
+            val junction = File(fixture.checkpoint.parentFile, "processing-stale")
+            val process = ProcessBuilder("cmd.exe", "/d", "/c", "mklink", "/J", junction.path, outside.path)
+                .directory(fixture.directory).redirectErrorStream(true).start()
+            try {
+                assertTrue(process.waitFor(10, TimeUnit.SECONDS), "Owned junction creation timed out")
+                assertEquals(0, process.exitValue(), "Could not create the test-owned Windows junction")
+            } finally { if (process.isAlive) process.destroyForcibly().waitFor() }
+            try {
+                val attributes = Files.readAttributes(junction.toPath(), BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+                assertFalse(attributes.isSymbolicLink, "A symbolic link is not this junction regression")
+                assertTrue(attributes.isOther, "The actual junction must expose its reparse attribute")
+                assertFailsWith<IllegalStateException> { fixture.resume() }
+                assertFailsWith<IllegalStateException> { deleteCheckpointTree(fixture.checkpoint.parentFile, keepLock = true) }
+                assertFailsWith<IllegalStateException> {
+                    requirePrivateCheckpointPath(File(junction, "missing/leaf"), allowMissing = true)
+                }
+                assertEquals("authored retained marker", marker.readText())
+                assertEquals(checkpoint, fixture.checkpoint.readText())
+                assertContentEquals(retainedPrefix, fixture.part.readBytes())
+                assertEquals(1, fixture.server.requestCount)
+                assertFalse(fixture.output.exists())
+                assertFalse(File(outside, "missing").exists())
+            } finally { Files.delete(junction.toPath()) }
         }
     }
 

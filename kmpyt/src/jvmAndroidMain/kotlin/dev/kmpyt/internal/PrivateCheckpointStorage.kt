@@ -5,7 +5,7 @@ import kotlinx.coroutines.ensureActive
 import java.io.File
 
 /**
- * API-23-compatible checks for caller-private checkpoint storage. Never recurse
+ * Platform no-follow checks for caller-private checkpoint storage. Never recurse
  * through a link, including a dangling one, when inspecting or deleting state.
  * The directory must remain private to this process/caller; java.io cannot make
  * a concurrent hostile same-user filesystem mutation race-free on every target.
@@ -28,9 +28,7 @@ internal suspend fun checkpointTree(directory: File): List<File> {
 }
 
 private fun requireCheckpointEntry(file: File) {
-    check(file.canonicalFile == file.absoluteFile && (file.isFile || file.isDirectory)) {
-        "Private download checkpoint storage contains a link or unsupported entry."
-    }
+    requirePrivateCheckpointPath(file)
 }
 
 /** Validate the entire tree before the first deletion, then remove only those entries. */
@@ -39,7 +37,7 @@ internal suspend fun deleteCheckpointTree(directory: File, keepLock: Boolean = f
     for (entry in entries.asReversed()) {
         currentCoroutineContext().ensureActive()
         if (keepLock && (entry == directory || entry.parentFile == directory && entry.name == "lock")) continue
-        // Recheck the canonical parent/entry before each operation. File.delete
+        // Recheck the no-follow parent/entry before each operation. File.delete
         // never follows a directory link and refuses unexpected new children.
         requireCheckpointEntry(entry)
         check(entry.delete()) { "Could not release private download checkpoint storage." }
