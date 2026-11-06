@@ -12,190 +12,151 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  license:
+    if: ${{ github.event.repository.private == false }}
+    name: License and provenance policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1; reviewed credential path
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+          submodules: false
+      - name: Verify complete approved MIT grant and retained third-party notices
+        run: ci/scoped.sh python3 -B ci/verify-license.py
+      - name: Check scoped tooling and fail-closed native preflights
+        run: ci/scoped.sh python3 -B ci/test-tooling.py
+
   jvm:
-    name: JVM (${{ matrix.os }})
+    if: ${{ github.event.repository.private == false }}
+    name: JVM (${{ matrix.check_name }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-15-intel]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+        include:
+          # Preserve existing status-check names; pin actual standard labels.
+          - {check_name: ubuntu-latest, runner: ubuntu-24.04}
+          - {check_name: windows-latest, runner: windows-2022}
+          - {check_name: macos-15-intel, runner: macos-15-intel}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        id: checkout
         with:
-          distribution: temurin
-          java-version: '17'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Select configured Node runtime
-        shell: bash
-        run: node -e "require('node:fs').appendFileSync(process.env.GITHUB_ENV, 'KMPYT_NODE=' + process.execPath + '\n')"
-      - uses: gradle/actions/setup-gradle@v4
-      - name: Install Linux media tooling
-        if: runner.os == 'Linux'
+          persist-credentials: false
+          set-safe-directory: false
+          submodules: false
+      - name: Verify shared and desktop code using existing read-only tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          echo "KMPYT_FFMPEG=$(command -v ffmpeg)" >> "$GITHUB_ENV"
-      - name: Install macOS media tooling
-        if: runner.os == 'macOS'
-        run: |
-          command -v ffmpeg || brew install ffmpeg
-          echo "KMPYT_FFMPEG=$(command -v ffmpeg)" >> "$GITHUB_ENV"
-      - name: Install Windows media tooling
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { choco install ffmpeg --yes --no-progress }
-          $mediaTool = (Get-Command ffmpeg -ErrorAction Stop).Source
-          "KMPYT_FFMPEG=$mediaTool" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Verify shared and desktop code
-        shell: bash
-        run: ./gradlew :kmpyt:jvmTest :kmpyt:jvmJar --stacktrace
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: jvm-reports-${{ matrix.os }}
-          path: |
-            kmpyt/build/reports/tests/
-            kmpyt/build/test-results/
-            kmpyt/build/libs/*.jar
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh jvm
+            ci/gradle.sh :kmpyt:jvmTest :kmpyt:jvmJar --stacktrace
+            python3 -B ci/summary.py --require-executed
+          '
+      - name: Summarize without artifact/cache uploads
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        env:
+          KMPYT_CI_JOB_STATUS: ${{ job.status }}
+        run: ci/scoped.sh python3 -B ci/summary.py
 
   android:
+    if: ${{ github.event.repository.private == false }}
     name: Android API ${{ matrix.api }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         api: [29, 35]
+    env:
+      KMPYT_ANDROID_TEST_API: ${{ matrix.api }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        id: checkout
         with:
-          distribution: temurin
-          java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
-      - name: Enable emulator acceleration
+          persist-credentials: false
+          set-safe-directory: false
+          submodules: false
+      - name: Build and lint Android with read-only installed SDK
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: ${{ matrix.api }}
-          target: google_apis
-          arch: x86_64
-          disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          script: ./gradlew :kmpyt:connectedDebugAndroidTest :kmpyt:assembleRelease :kmpyt:lintRelease --stacktrace
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: android-reports-api-${{ matrix.api }}
-          path: |
-            kmpyt/build/reports/
-            kmpyt/build/outputs/androidTest-results/
-            kmpyt/build/outputs/aar/
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+            test -f "$sdk/platforms/android-36/android.jar"
+            test -d "$sdk/build-tools/35.0.0"
+            ci/gradle.sh :kmpyt:assembleRelease :kmpyt:lintRelease --stacktrace
+          '
+      - name: Required API instrumentation (fails before unaudited native launch)
+        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
+        run: |
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            ci/native-boundary.sh android
+            ci/gradle.sh :kmpyt:connectedDebugAndroidTest --stacktrace
+            python3 -B ci/summary.py --require-executed
+          '
+      - name: Summarize without artifact/cache uploads
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        env:
+          KMPYT_CI_JOB_STATUS: ${{ job.status }}
+        run: ci/scoped.sh python3 -B ci/summary.py
 
   apple:
+    if: ${{ github.event.repository.private == false }}
     name: iOS simulator and XCFramework
     runs-on: macos-15-intel
-    # Cold Intel builds compile tests and link three optimized release targets.
     timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        id: checkout
         with:
-          distribution: temurin
-          java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
-      - name: Select installed Apple tooling
+          persist-credentials: false
+          set-safe-directory: false
+          submodules: false
+      - name: Build simulator framework using pinned read-only Xcode
         run: |
-          if [ -d /Applications/Xcode_16.4.app ]; then
-            sudo xcode-select -s /Applications/Xcode_16.4.app
-          fi
-          xcodebuild -version
-          echo "XCODE_VERSION=$(xcodebuild -version | head -n 1 | cut -d ' ' -f 2)" >> "$GITHUB_ENV"
-          if [ "$(uname -m)" = arm64 ]; then
-            echo 'IOS_TEST_TASK=iosSimulatorArm64Test' >> "$GITHUB_ENV"
-            echo 'IOS_FRAMEWORK_TASK=linkDebugFrameworkIosSimulatorArm64' >> "$GITHUB_ENV"
-            echo "KMPYT_FRAMEWORK=$GITHUB_WORKSPACE/kmpyt/build/bin/iosSimulatorArm64/debugFramework/KmpYT.framework" >> "$GITHUB_ENV"
-          else
-            echo 'IOS_TEST_TASK=iosX64Test' >> "$GITHUB_ENV"
-            echo 'IOS_FRAMEWORK_TASK=linkDebugFrameworkIosX64' >> "$GITHUB_ENV"
-            echo "KMPYT_FRAMEWORK=$GITHUB_WORKSPACE/kmpyt/build/bin/iosX64/debugFramework/KmpYT.framework" >> "$GITHUB_ENV"
-          fi
-          xcrun simctl list devices available
-          python3 - <<'PY'
-          import json, os, subprocess
-          devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"]))["devices"]
-          candidates = [d for runtime, values in devices.items() if ".iOS-" in runtime for d in values if d.get("isAvailable") and d["name"].startswith("iPhone")]
-          if not candidates:
-              raise SystemExit("No available iPhone simulator was installed on the runner")
-          selected = candidates[0]
-          with open(os.environ["GITHUB_ENV"], "a") as output:
-              output.write("IOS_DEVICE=" + selected["udid"] + "\n")
-          print("Selected simulator:", selected["name"], selected["udid"])
-          PY
-      - name: Restore Kotlin Native toolchain
-        id: konan
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.konan
-          key: konan-v2-${{ runner.os }}-${{ runner.arch }}-2.2.21-${{ env.XCODE_VERSION }}
-      - name: Boot the selected simulator
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            xcodebuild -version
+            ci/gradle.sh :kmpyt:linkDebugFrameworkIosX64 --stacktrace
+          '
+      - name: Required native iOS protocols and media processing
+        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
         run: |
-          xcrun simctl boot "$IOS_DEVICE" || true
-          xcrun simctl bootstatus "$IOS_DEVICE" -b
-      - name: Test native iOS protocols and media processing
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            ci/native-boundary.sh ios
+            ci/gradle.sh :kmpyt:iosX64Test "-PiosSimulatorDevice=$IOS_DEVICE" --stacktrace
+          '
+      - name: Required WebKit UIKit-hosted tests
+        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
         run: |
-          set -o pipefail
-          mkdir -p kmpyt/build/reports
-          ./gradlew ":kmpyt:$IOS_TEST_TASK" "-PiosSimulatorDevice=$IOS_DEVICE" --stacktrace 2>&1 | tee kmpyt/build/reports/ios-native-build.log
-      - name: Upload native test diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-native-test-reports
-          path: |
-            kmpyt/build/reports/ios-native-build.log
-            kmpyt/build/reports/tests/
-            kmpyt/build/test-results/
-      - name: Build the simulator framework for hosted tests
-        id: framework
-        if: always() && !cancelled()
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            ci/native-boundary.sh ios
+            command -v xcodegen
+            export KMPYT_FRAMEWORK="$KMPYT_CI_PROJECT_ROOT/kmpyt/build/bin/iosX64/debugFramework/KmpYT.framework"
+            xcodegen generate --spec ci/ios-host/project.yml --project ci/ios-host
+            xcodebuild -project ci/ios-host/KmpYTHost.xcodeproj -scheme KmpYTHost -configuration Debug -destination "id=$IOS_DEVICE" -derivedDataPath "$KMPYT_CI_WORK_ROOT/xcode/DerivedData" -resultBundlePath "$KMPYT_CI_WORK_ROOT/xcode/results/ios-host.xcresult" -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO test
+          '
+      - name: Assemble release XCFramework independently of runtime boundary
+        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
         run: |
-          set -o pipefail
-          mkdir -p kmpyt/build/reports
-          ./gradlew ":kmpyt:$IOS_FRAMEWORK_TASK" --stacktrace 2>&1 | tee kmpyt/build/reports/ios-framework-build.log
-      - name: Test WebKit in a UIKit application host
-        if: ${{ !cancelled() && steps.framework.outcome == 'success' }}
-        run: |
-          command -v xcodegen || brew install xcodegen
-          xcodegen generate --spec ci/ios-host/project.yml --project ci/ios-host
-          xcodebuild -project ci/ios-host/KmpYTHost.xcodeproj -scheme KmpYTHost -configuration Debug -destination "id=$IOS_DEVICE" -derivedDataPath kmpyt/build/iosHost -resultBundlePath kmpyt/build/reports/ios-host.xcresult -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO test
-      - name: Assemble the release XCFramework
-        run: ./gradlew :kmpyt:assembleKmpYTReleaseXCFramework --stacktrace
-      - name: Save Kotlin Native toolchain
-        # Do not keep an immutable partial cache from a failed first build.
-        if: success() && steps.konan.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.konan
-          key: ${{ steps.konan.outputs.cache-primary-key }}
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ios-framework-and-reports
-          path: |
-            kmpyt/build/XCFrameworks/
-            kmpyt/build/reports/ios-*-build.log
-            kmpyt/build/reports/tests/
-            kmpyt/build/test-results/
-            kmpyt/build/reports/ios-host.xcresult/
-            kmpyt/build/bin/**/debugFramework/KmpYT.framework/Headers/
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            ci/gradle.sh :kmpyt:assembleKmpYTReleaseXCFramework --stacktrace
+          '
+      - name: Summarize without artifact/cache uploads
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        env:
+          KMPYT_CI_JOB_STATUS: ${{ job.status }}
+        run: ci/scoped.sh python3 -B ci/summary.py

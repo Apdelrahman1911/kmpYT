@@ -1,5 +1,9 @@
 # kmpYT
 
+Licensed under the [MIT License](LICENSE). Retain its copyright and permission
+notice when redistributing. See [third-party notices and the ownership audit](THIRD_PARTY_NOTICES.md)
+for dependency, fixture, runtime and GPLv3 compatibility details.
+
 A standalone Kotlin Multiplatform YouTube library for Android, JVM desktop and iOS, extracted from ClearMedia's independently implemented YouTube engine.
 
 The shared library inspects public videos, discovers formats, searches and browses channels/playlists, loads captions, prepares playback/transfer plans and coordinates compatible video/audio downloads. Platform adapters provide offline JavaScript execution, file I/O and media combining. Application screens, databases, advertisements and account UI are outside the library.
