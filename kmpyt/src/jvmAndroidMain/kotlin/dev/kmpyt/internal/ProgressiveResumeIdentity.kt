@@ -4,12 +4,9 @@ import dev.kmpyt.extraction.PlannedDownload
 import dev.kmpyt.extraction.Representation
 import dev.kmpyt.extraction.TransportKind
 import dev.kmpyt.extraction.YouTubeDownloadPolicy
-import io.ktor.http.Url
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -42,28 +39,9 @@ internal fun progressiveSelectionDigest(plan: PlannedDownload): String? {
 
 /** ETags are resource-scoped: changing host, port, path or content query invalidates reuse. */
 internal fun progressiveResourceScope(resource: String, mediaId: String, allowLocalHttp: Boolean): String {
-    val (url, uri) = try { Url(resource) to URI(resource) }
+    try { URI(resource) }
     catch (_: Exception) { error("The media resource does not have a valid URI identity.") }
-    val host = url.host.lowercase()
-    val googleVideo = host == "googlevideo.com" || host.endsWith(".googlevideo.com")
-    // Explicit loopback transports exercise the same policy using authored resources.
-    val loopbackFixture = allowLocalHttp && url.protocol.name == "http" && host in setOf("127.0.0.1", "localhost", "::1", "[::1]")
-    val signing = if (googleVideo || loopbackFixture) setOf(
-        "sig", "signature", "lsig", "expire", "expires", "sparams", "lsparams", "n", "ei", "ip", "ipbits", "spc", "pot",
-    ) else emptySet()
-    return resumeDigest(buildJsonObject {
-        put("media", mediaId)
-        put("origin", "${url.protocol.name}://$host:${url.port}")
-        put("path", uri.rawPath)
-        put("fragment", uri.rawFragment)
-        // A server may distinguish pair order, duplicates, empty pairs, casing,
-        // '+' and percent escapes. Do not parse/group/sort the content query.
-        // Only the documented exact lowercase signing names may disappear;
-        // encoded aliases conservatively require a restart as well.
-        put("query", uri.rawQuery?.let { query ->
-            JsonArray(query.split('&').filterNot { it.substringBefore('=') in signing }.map(::JsonPrimitive))
-        } ?: JsonNull)
-    }.toString())
+    return resumeDigest(resumeResourceIdentity(resource, mediaId, allowLocalHttp))
 }
 
 /** Do not promote a weak ETag or an unqualified Last-Modified date to a strong validator. */

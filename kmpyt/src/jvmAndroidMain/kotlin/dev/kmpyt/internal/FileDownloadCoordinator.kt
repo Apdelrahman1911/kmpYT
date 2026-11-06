@@ -32,6 +32,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
         require(destinationPath.isNotBlank()) { "Choose a destination file." }
         YouTubeDownloadPolicy.requirePlan(input)
         require(input.credentialRef == null) { "This adapter supports anonymous inspected resources; account credentials are not accepted." }
+        require(input.sabrCheckpoint == null) { "An external SABR checkpoint has no owned track files. Retry the original destination instead." }
         YouTubeFormatCapabilities.downloadProblem(input.primary, input.audio, platformName)?.let { error(it) }
         val destination = File(destinationPath).canonicalFile
         val key = destination.path.let { if (System.getProperty("os.name").orEmpty().startsWith("Windows", true)) it.lowercase(Locale.ROOT) else it }
@@ -65,28 +66,32 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                     json.decodeFromString(FileCheckpoint.serializer(), checkpointFile.readText())
                 }.getOrNull()
                 val restored = decoded?.takeIf {
-                    // Legacy checkpoints have no scoped validator/prefix receipts. They
-                    // remain reusable only with the original complete plan digest.
+                    // Raw legacy SABR checkpoints contain endpoint/configuration/session
+                    // state and no local byte hashes. Purge them, never replay or re-save.
+                    if (input.primary.transport == TransportKind.SABR) it.schema == 3 && it.planDigest == digest
+                    else
+                    // Legacy progressive checkpoints remain exact-plan only.
                     when (it.schema) {
                         1 -> it.planDigest == digest
-                        2 -> if (selectionDigest == null) it.planDigest == digest
+                        2, 3 -> if (selectionDigest == null) it.planDigest == digest
                             else it.selectionDigest == selectionDigest && it.resourceScopes == resourceScopes
                         else -> false
                     }
                 }
                 if (restored == null) deleteCheckpointTree(directory, keepLock = true)
-                var plan = input.copy(sabrCheckpoint = restored?.sabrCheckpoint)
+                val sabrReceipts = if (input.primary.transport == TransportKind.SABR) SabrFileReceipts(directory, input) else null
+                val sabrCheckpoint = sabrReceipts?.restore(restored?.sabrReceipt)
+                var plan = input.copy(sabrCheckpoint = sabrCheckpoint)
                 val strictResume = selectionDigest != null && restored?.schema != 1
                 var prefixDigests = restored?.prefixDigests.orEmpty()
                 var responseScopes = restored?.responseScopes.orEmpty()
                 val expectedParts = if (plan.primary.transport == TransportKind.SABR) emptyMap()
                     else TransferPlanning.parts(plan).associateBy { it.key }
-                var states = restored?.parts.orEmpty().mapNotNull { state ->
+                var states = if (sabrReceipts != null) sabrCheckpoint?.partStates(plan).orEmpty() else restored?.parts.orEmpty().mapNotNull { state ->
                     val file = File(directory, state.key)
                     // Only keys authored by TransferPlanning are allowed to name local files.
                     require(Regex("\\d+-\\d+").matches(state.key)) { "Invalid local checkpoint resource key." }
-                    if (!file.isFile || file.canonicalFile != file.absoluteFile) null else if (plan.primary.transport == TransportKind.SABR) state
-                    else {
+                    if (!file.isFile || file.canonicalFile != file.absoluteFile) null else {
                         val expected = requireNotNull(expectedParts[state.key]) { "The checkpoint does not belong to the selected media parts." }.expectedBytes
                         val length = file.length()
                         if (expected != null && (length > expected || state.total != null && state.total != expected ||
@@ -123,7 +128,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                         "Checkpoint files cannot be symbolic links."
                     }
                     val bytes = json.encodeToString(FileCheckpoint.serializer(),
-                        FileCheckpoint(digest, parts, updated.sabrCheckpoint, schema = 2,
+                        FileCheckpoint(digest, parts, sabrReceipt = updated.sabrCheckpoint?.let { requireNotNull(sabrReceipts).snapshot(it) }, schema = 3,
                             selectionDigest = selectionDigest, resourceScopes = resourceScopes,
                             prefixDigests = prefixDigests.filterKeys { key -> parts.any { it.key == key && it.bytes > 0 } },
                             responseScopes = responseScopes.filterKeys { key -> parts.any { it.key == key && it.bytes > 0 } })).encodeToByteArray()
@@ -222,7 +227,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
     }
 
     @Serializable private data class FileCheckpoint(val planDigest: String, val parts: List<PartState>,
-        val sabrCheckpoint: SabrTransferCheckpoint? = null, val schema: Int = 1,
+        val sabrReceipt: SabrSavedReceipt? = null, val schema: Int = 1,
         val selectionDigest: String? = null, val resourceScopes: Map<String, String> = emptyMap(),
         val prefixDigests: Map<String, String> = emptyMap(), val responseScopes: Map<String, String> = emptyMap())
 }

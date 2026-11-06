@@ -39,7 +39,11 @@ data class SabrTransferTrackCheckpoint(val role: TrackRole, val formatId: SabrFo
 data class SabrTransferContextCheckpoint(val type: Int, val value: ByteArray) {
     override fun toString() = "SabrTransferContextCheckpoint(type=$type, bytes=${value.size}, payload=redacted)"
 }
-/** Store opaque cookie/context state app-privately, never in diagnostics or exports. */
+/**
+ * Transient protocol state, including sensitive endpoint/configuration/cookie/context data.
+ * Do not log, export or use its serialization as a privacy-safe durable file receipt. Native
+ * download adapters persist independently hashed byte receipts and restart anonymous sessions.
+ */
 @Serializable
 data class SabrTransferCheckpoint(val videoId: String, val selectedAudio: SabrFormatId?,
     val selectedVideo: SabrFormatId?, val clientInfo: SabrClientInfo,

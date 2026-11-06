@@ -16,7 +16,7 @@ The shared library inspects public videos, discovers formats, searches and brows
 | JVM desktop | Isolated Chromium controlled by Node.js 22 | Caller-installed FFmpeg |
 | iOS | Nonpersistent WKWebView with external requests blocked | AVFoundation |
 
-Public player programs are versioned by their actual source URL and reused within a bounded cache. Video metadata and signed resource URLs remain fresh. Available combined transfer sizes are reported before downloading; unknown lengths remain unknown. All three platforms support validated checkpoint resume. There is no fixed 512 MiB library limit.
+Public player programs are versioned by their actual source URL and reused within a bounded cache. Video metadata and signed resource URLs remain fresh. Available combined transfer sizes are reported before downloading; unknown lengths remain unknown. All three platforms provide checkpoint-resume implementations; target-specific verification limits are recorded below. There is no fixed 512 MiB library limit.
 
 ## Build and integration
 
@@ -117,25 +117,44 @@ and the Android resume mirror are authored, not yet platform-compiled/executed f
 These tests do not establish authorized live YouTube playback, audible output or app completion.
 
 Retry a cancelled or interrupted download with the same selection and destination to resume
-validated private progress. JVM/Android schema-2 checkpoints additionally permit **standalone
+validated private progress. JVM/Android schema-3 checkpoints retain schema-2 **standalone
 progressive** signing-URL refresh only when the selected media/format, exact origin/path/content
 query, strong quoted ETag, actual redirected response scope and committed-prefix SHA-256 still
 match. Uncommitted tails are truncated; retained complete parts are revalidated too. Query
 order, duplicate/empty pairs and raw encoding remain identity-bearing. Only documented exact
 lowercase signing keys on Googlevideo (or explicit authored loopback tests) are excluded.
 Changed/unverifiable identity restarts; legacy schema-1 checkpoints require the exact old plan.
-SABR and multi-resource plans retain their existing exact-plan/generation bindings rather than
-borrowing this progressive identity rule. iOS has a separate checkpoint implementation; these
-new JVM/Android prefix/scope guarantees are not a claim of iOS parity.
+Multi-resource plans retain their exact-plan bindings rather than borrowing this progressive
+identity rule. iOS has a separate checkpoint implementation; its retained-byte hashing,
+redirect/scope and storage parity repair is under review, not compiled or executed for this change.
 
-JVM/Android checkpoint roots must remain caller-private. Symlinks, special files and oversized
-trees fail before reset/cleanup. After success, media/checkpoint data is purged **while holding
+JVM/Android checkpoint roots must remain caller-private. Linux JVM regressions reject symlinks,
+special files and oversized trees before reset/cleanup. **A Windows audit found that canonical
+path equality alone does not reject junctions/reparse points; a platform no-follow repair is
+separate and Windows safety is not yet verified.** After success, media/checkpoint data is purged **while holding
 the OS lock**; the empty reusable `.<destination-name>.kmpyt/lock` inode and its parent remain.
 Do not unlink/recreate that lock while any process may reuse the destination: doing so can let
 two processes lock different inodes for one path. A host may remove a retired private generation
 only under a stronger external lifetime fence proving that no current or future writer can
-reuse it. The host owns background scheduling and persistent job state. Checkpoints contain
-hashes/receipts, not signed URLs or an application library database.
+reuse it. The host owns background scheduling and persistent job state, not these checkpoint files.
+
+New JVM/Android SABR schema-3 persistence stores only source/plan digests and bounded track byte
+geometry, completed-segment receipts and SHA-256 range hashes. Every retained range is verified
+through at most 64-KiB reads; sparse holes and uncommitted tails do not become coverage. Exact
+inspected source generation/configuration, client, role, format, size and representation metadata
+must still match. Restore starts a **fresh anonymous session** (request number 1), without saved
+cookies, contexts or redirects. Signed-URL renewal is not treated as equivalent SABR generation.
+Externally supplied SABR checkpoints are rejected because they have no adapter-owned track files.
+Legacy SABR schema-1/2 files serialized transient endpoint/configuration/session state; they are
+purged under the stable lock before callbacks or network requests, never replayed or re-saved.
+Raw `SabrTransferCheckpoint` remains a sensitive in-memory protocol object, not a safe persistence
+format. No implicit authorization or integrity grant is added.
+
+The 2026-11-06 scoped Linux JVM privacy/transfer run passed **143 tests, 0 failures/errors/skips**
+with explicit FFmpeg. It includes 8 actual-file SABR receipt cases, 7 receipt/hash cases and 4 raw
+resource-identity cases. It overlaps the earlier 103-test selection; do not add those totals.
+This does not establish Android/Apple compilation, Windows safety, live-source media access or
+physical audio playback.
 
 ## Current limitations
 
