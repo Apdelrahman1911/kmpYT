@@ -214,7 +214,7 @@ class ToolingTests(unittest.TestCase):
         paths=('kmpyt/src/jvmMain/resources/youtube/chromium-runtime.cjs',
             'kmpyt/src/jvmMain/kotlin/dev/kmpyt/jvm/DesktopYouTubeJavaScriptRuntime.kt','ci/summary.py')
         codes=[set(re.findall(r'''['"](OFFLINE_STARTUP_[A-Z0-9_]+)['"]''',(ROOT/path).read_text())) for path in paths]
-        self.assertEqual(len(codes[0]),20)
+        self.assertEqual(len(codes[0]),22)
         self.assertEqual(codes[0],codes[1]); self.assertEqual(codes[0],codes[2])
 
     def test_browser_endpoint_fixture_regressions_without_a_browser(self):
@@ -399,10 +399,14 @@ printf 'SELECTED_NODE=%s\nSELECTED_BROWSER=%s\n' "$KMPYT_NODE" "$KMPYT_CHROMIUM"
         prefix='\tSuppressed: dev.kmpyt.jvm.DesktopYouTubeJavaScriptRuntime$StartupObservationReceipt: KMPYT_BROWSER_STARTUP_V1['
         def receipt(code,values): return prefix+code+';'+','.join(values)+']'
         cases=[(timeout,receipt(timeout,baseline),baseline)]
-        for token in ('DEVTOOLS_BIND','PORT_WRITE','PROFILE_LOCK','PROCESS_SINGLETON'):
+        for token in ('DEVTOOLS_BIND','PORT_WRITE','PROFILE_LOCK','PROCESS_SINGLETON','DEVTOOLS_POLICY','DEVTOOLS_DATA_DIR'):
             values=[*baseline[:2],'OFFLINE_STARTUP_STDERR_'+token+'_MESSAGE',baseline[3]]
             cases.append((timeout,receipt(timeout,values),values))
             cases.append((timeout,receipt(timeout,baseline+[values[2]]),[]))
+            # Exact whole tokens only; these are never new primary failure codes.
+            for invalid in (values[2][:-1],values[2]+'_PRIVATE',values[2]+' authored-secret'):
+                cases.append((timeout,receipt(timeout,[*baseline[:2],invalid,baseline[3]]),[]))
+            cases.append((values[2],receipt(values[2],values),[]))
         for changed in ([],baseline+['OFFLINE_STARTUP_PRIVATE_VALUE'],baseline+['authored-secret'],
             baseline+[baseline[-1]],['OFFLINE_STARTUP_PORT_MISSING']*9,
             baseline+['OFFLINE_STARTUP_SPAWN_OBSERVED'],baseline+['OFFLINE_STARTUP_CHILD_EXIT_OBSERVED'],

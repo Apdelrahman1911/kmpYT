@@ -405,10 +405,12 @@ const stderrMessages = [
   ['Cannot start http server for devtools.', 'OFFLINE_STARTUP_STDERR_DEVTOOLS_BIND_MESSAGE'],
   ['Error writing DevTools active port to file ', 'OFFLINE_STARTUP_STDERR_PORT_WRITE_MESSAGE'],
   ['Lock file can not be created', 'OFFLINE_STARTUP_STDERR_PROFILE_LOCK_MESSAGE'],
-  ['Failed to create a ProcessSingleton for your profile directory.', 'OFFLINE_STARTUP_STDERR_PROCESS_SINGLETON_MESSAGE']
+  ['Failed to create a ProcessSingleton for your profile directory.', 'OFFLINE_STARTUP_STDERR_PROCESS_SINGLETON_MESSAGE'],
+  ['DevTools remote debugging is disallowed by the system admin.', 'OFFLINE_STARTUP_STDERR_DEVTOOLS_POLICY_MESSAGE'],
+  ['DevTools remote debugging requires a non-default data directory. Specify this using --user-data-dir.', 'OFFLINE_STARTUP_STDERR_DEVTOOLS_DATA_DIR_MESSAGE']
 ];
 
-test('four fixed stderr literals classify complete split lines without retaining private prefixes or suffixes', async t => {
+test('six fixed stderr literals classify complete split lines without retaining private prefixes or suffixes', async t => {
   for (const [literal, code] of stderrMessages) {
     const f = fixture(t), pending = f.discoverBrowserEndpoint(f.child);
     const split = Math.floor(literal.length / 2);
@@ -432,7 +434,11 @@ test('first classified complete line is sticky and fixed table order breaks same
   for (const [data, expected] of [
     [stderrMessages[2][0] + '\n' + stderrMessages[0][0] + '\n', stderrMessages[2][1]],
     [invalid + stderrMessages[1][0] + 'authored-secret\n' + invalid, stderrMessages[1][1]],
-    [stderrMessages[3][0] + ' ' + stderrMessages[0][0] + '\n', stderrMessages[0][1]]
+    [stderrMessages[3][0] + ' ' + stderrMessages[0][0] + '\n', stderrMessages[0][1]],
+    [stderrMessages[4][0] + '\n' + stderrMessages[0][0] + '\n', stderrMessages[4][1]],
+    [invalid + stderrMessages[5][0] + '\n' + invalid, stderrMessages[5][1]],
+    [stderrMessages[5][0] + '\n' + stderrMessages[4][0] + '\n', stderrMessages[5][1]],
+    [stderrMessages[5][0] + ' ' + stderrMessages[4][0] + '\n', stderrMessages[4][1]]
   ]) {
     const f = fixture(t), pending = f.discoverBrowserEndpoint(f.child);
     f.child.stderr.emit('data', Buffer.from(data));
@@ -443,10 +449,8 @@ test('first classified complete line is sticky and fixed table order breaks same
 });
 
 test('partial lookalike and discarded over-bound stderr cannot manufacture a classified message', async t => {
-  for (const data of [stderrMessages[0][0], stderrMessages[0][0].toUpperCase() + '\n',
-    stderrMessages[0][0].slice(0, -1) + '\n',
-    stderrMessages[0][0] + 'authored-secret'.repeat(2000) + '\n',
-    'OFFLINE_STARTUP_STDERR_DEVTOOLS_BIND_MESSAGE\n']) {
+  for (const [literal, code] of stderrMessages) for (const data of [literal, literal.toUpperCase() + '\n',
+    literal.slice(0, -1) + '\n', literal + 'authored-secret'.repeat(2000) + '\n', code + '\n']) {
     const f = fixture(t), pending = f.discoverBrowserEndpoint(f.child);
     f.child.stderr.emit('data', Buffer.from(data));
     f.clock.advance(30000);
@@ -455,10 +459,52 @@ test('partial lookalike and discarded over-bound stderr cannot manufacture a cla
   }
 });
 
-test('valid stderr or owned-file endpoint still wins after a classified message', async t => {
-  for (const via of ['stderr', 'file']) {
+test('Chrome156 restriction classifiers do not accept changed meaning or interrupted source literals', async t => {
+  const dataDir = stderrMessages[5][0];
+  for (const data of [
+    stderrMessages[4][0].replace('disallowed', 'allowed') + '\n',
+    dataDir.replace('non-default', 'default') + '\n',
+    dataDir.replace('DevTools ', '') + '\n',
+    dataDir.split(' Specify ')[0] + '\n',
+    ...stderrMessages.slice(4).map(([literal]) => literal.slice(0, 15) + '\n' + literal.slice(15) + '\n')
+  ]) {
     const f = fixture(t), pending = f.discoverBrowserEndpoint(f.child);
-    f.child.stderr.emit('data', Buffer.from(stderrMessages[0][0] + '\n'));
+    f.child.stderr.emit('data', Buffer.from(data));
+    f.clock.advance(30000);
+    await assert.rejects(pending, error => assertReceipt(f, error, [
+      ...pendingObservations.slice(0, 2), 'OFFLINE_STARTUP_STDERR_SOME', 'OFFLINE_STARTUP_PORT_MISSING']));
+  }
+});
+
+test('a complete restriction literal retained after a truncated private prefix is only a literal observation', async t => {
+  for (const [literal, code] of stderrMessages.slice(4)) {
+    const f = fixture(t), pending = f.discoverBrowserEndpoint(f.child);
+    f.child.stderr.emit('data', Buffer.from('authored-secret'.repeat(2000) + literal + f.profile + '\n'));
+    f.clock.advance(30000);
+    await assert.rejects(pending, error => assertReceipt(f, error, [
+      ...pendingObservations.slice(0, 2), code, 'OFFLINE_STARTUP_PORT_MISSING']));
+  }
+});
+
+test('restriction stderr tokens preserve an observed child exit as the primary failure', async t => {
+  for (const [literal, code] of stderrMessages.slice(4)) {
+    const f = fixture(t), pending = f.discoverBrowserEndpoint(f.child);
+    f.child.emit('spawn');
+    f.child.stderr.emit('data', Buffer.from(literal + ' authored-secret\n'));
+    f.child.exitCode = 1; f.child.emit('exit', 1);
+    await assert.rejects(pending, error => {
+      assert.equal(error.safeCode, 'OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT');
+      return assertReceipt(f, error, ['OFFLINE_STARTUP_SPAWN_OBSERVED', 'OFFLINE_STARTUP_CHILD_EXIT_OBSERVED', code,
+        'OFFLINE_STARTUP_PORT_MISSING']);
+    });
+    assert.equal(f.clock.pending(), 0);
+  }
+});
+
+test('valid stderr or owned-file endpoint still wins after a classified message', async t => {
+  for (const [literal] of stderrMessages) for (const via of ['stderr', 'file']) {
+    const f = fixture(t), pending = f.discoverBrowserEndpoint(f.child);
+    f.child.stderr.emit('data', Buffer.from(literal + '\n'));
     if (via === 'stderr') f.child.stderr.emit('data', Buffer.from('DevTools listening on ' + endpoint + '\n'));
     else { fs.writeFileSync(f.activePort, portFile); f.clock.advance(25); }
     assert.equal(await pending, endpoint);
@@ -468,22 +514,24 @@ test('valid stderr or owned-file endpoint still wins after a classified message'
 });
 
 test('classified stderr never adds deadline I/O and a later literal cannot mutate a failure receipt', async t => {
-  let reads = 0;
-  const f = fixture(t, { lstatSync(filename) { reads++; return fs.lstatSync(filename); } });
-  const pending = f.discoverBrowserEndpoint(f.child);
-  f.child.stderr.emit('data', Buffer.from(stderrMessages[2][0] + '\n'));
-  f.clock.advance(29999);
-  const before = reads;
-  f.clock.advance(1);
-  let captured;
-  await assert.rejects(pending, error => {
-    captured = error;
-    return assertReceipt(f, error, [...pendingObservations.slice(0, 2), stderrMessages[2][1], 'OFFLINE_STARTUP_PORT_MISSING']);
-  });
-  f.child.stderr.emit('data', Buffer.from(stderrMessages[0][0] + '\n'));
-  f.clock.advance(100);
-  assert.equal(reads, before);
-  assertReceipt(f, captured, [...pendingObservations.slice(0, 2), stderrMessages[2][1], 'OFFLINE_STARTUP_PORT_MISSING']);
+  for (const [literal, code] of stderrMessages) {
+    let reads = 0;
+    const f = fixture(t, { lstatSync(filename) { reads++; return fs.lstatSync(filename); } });
+    const pending = f.discoverBrowserEndpoint(f.child);
+    f.child.stderr.emit('data', Buffer.from(literal + '\n'));
+    f.clock.advance(29999);
+    const before = reads;
+    f.clock.advance(1);
+    let captured;
+    await assert.rejects(pending, error => {
+      captured = error;
+      return assertReceipt(f, error, [...pendingObservations.slice(0, 2), code, 'OFFLINE_STARTUP_PORT_MISSING']);
+    });
+    f.child.stderr.emit('data', Buffer.from(stderrMessages[0][0] + '\n'));
+    f.clock.advance(100);
+    assert.equal(reads, before);
+    assertReceipt(f, captured, [...pendingObservations.slice(0, 2), code, 'OFFLINE_STARTUP_PORT_MISSING']);
+  }
 });
 
 test('file integrity rejection is distinct from incomplete or unrecognized bounded content', async t => {

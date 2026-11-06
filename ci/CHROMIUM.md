@@ -34,7 +34,7 @@ one optional `startup` receipt containing 4–8 distinct, fixed symbolic tokens:
   do **not** establish a live child. These are event/field observations, not an
   OS process audit, browser readiness, or successful sandbox initialization.
 - Stderr had no bytes, some bytes, a complete but invalid announcement, or one
-  of the four fixed source messages described below. No byte counts, contents,
+  of the six fixed source messages described below. No byte counts, contents,
   raw error messages, endpoint, UUID or profile path is sent.
 - Owned port-file checks cumulatively observed missing (`ENOENT`), access
   denied (`EACCES`/`EPERM`), busy (`EBUSY`), incomplete/unrecognized bounded
@@ -85,6 +85,12 @@ receipts to it. A reported runner-image Chrome version is not the selected PE
 file's version. The diagnostic below is not a claimed repair or a reason to
 rerun an unchanged full matrix.
 
+The later single-test [probe 42219037209](https://github.com/Apdelrahman1911/kmpYT/actions/runs/42219037209)
+at **f2a87cc35910684bdacee9c86e4bf017b2ddc5f4** passed its repaired tooling and
+read-only Chrome156 admission, then failed its one actual Chromium test with the
+same four observation categories. The two restriction-message classifiers below
+were added **after** that run; its discarded stderr cannot be reclassified.
+
 The existing bounded stderr parser can replace its one stderr token with:
 
 | Exact source literal observed | Fixed stderr token suffix |
@@ -93,19 +99,38 @@ The existing bounded stderr parser can replace its one stderr token with:
 | `Error writing DevTools active port to file ` (trailing space required) | `PORT_WRITE_MESSAGE` |
 | `Lock file can not be created` | `PROFILE_LOCK_MESSAGE` |
 | `Failed to create a ProcessSingleton for your profile directory.` | `PROCESS_SINGLETON_MESSAGE` |
+| `DevTools remote debugging is disallowed by the system admin.` | `DEVTOOLS_POLICY_MESSAGE` |
+| `DevTools remote debugging requires a non-default data directory. Specify this using --user-data-dir.` | `DEVTOOLS_DATA_DIR_MESSAGE` |
 
 The prefix is always `OFFLINE_STARTUP_STDERR_`. These are literal observations,
 not authenticated log records, OS error codes or proof of a universal root cause.
 Sources at Chromium **156.0.8078.80**:
 [DevTools bind/port writing](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/content/browser/devtools/devtools_http_handler.cc#316),
 [Windows profile lock](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/chrome/browser/process_singleton_win.cc#286),
-[singleton refusal](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/chrome/app/chrome_main_delegate.cc#624).
+[singleton refusal](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/chrome/app/chrome_main_delegate.cc#624),
+[policy/data-directory messages](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/chrome/browser/browser_process_impl.cc#1074).
+
+Chrome's [136+ restriction](https://developer.chrome.com/blog/remote-debugging-port)
+requires a non-default profile; this helper already supplies a fresh
+`--user-data-dir`. In the exact156 source, the
+[data-directory comparison](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/chrome/common/chrome_paths.cc#524)
+can also return unknown if either current/default directory lookup fails, and
+the branded-Chrome [guard rejects unknown as well as default](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/chrome/browser/devtools/remote_debugging_server.cc#160).
+`DEVTOOLS_DATA_DIR_MESSAGE` cannot distinguish those cases or prove a command-line
+or path-conversion defect. `DEVTOOLS_POLICY_MESSAGE` does not identify the policy
+provider, registry key or effective value. Neither token is a new primary failure
+or authorization to change the browser, environment, registry, sandbox or profile.
 
 Only complete newline-terminated lines remaining in the **existing 16,000-character
 tail** qualify. The first classified line wins; the table order breaks ties within
 one line. A later invalid announcement cannot overwrite it, but a valid endpoint
-still succeeds through either original channel. Unfinished, discarded, changed or
-unknown text stays unclassified; absence of a token does not disprove an error.
+still succeeds through either original channel. A truncated private prefix does
+not prevent classification if the entire exact literal and terminating newline
+remain in the tail; no prefix/suffix authenticates the message. Unfinished or
+discarded literals, changed or unknown text stay unclassified; absence of a token
+does not disprove an error. Browser-free fixtures cover both truncation directions,
+split/CRLF messages, near misses, first-message/tie ordering, both success channels,
+unchanged timeout/exit failures, post-deadline immutability and private sentinels.
 The receipt remains 4–8 distinct tokens with exactly one stderr token, the same
 primary failure and the same deadline/poll/cleanup behavior. No raw suffix or
 post-deadline operation is added.

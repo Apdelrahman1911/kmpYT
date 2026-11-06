@@ -123,7 +123,8 @@ class DesktopRuntimeDiagnosticsTest {
         "OFFLINE_STARTUP_STDERR_NONE", "OFFLINE_STARTUP_PORT_MISSING")
 
     private val stderrMessageCodes = listOf("OFFLINE_STARTUP_STDERR_DEVTOOLS_BIND_MESSAGE", "OFFLINE_STARTUP_STDERR_PORT_WRITE_MESSAGE",
-        "OFFLINE_STARTUP_STDERR_PROFILE_LOCK_MESSAGE", "OFFLINE_STARTUP_STDERR_PROCESS_SINGLETON_MESSAGE")
+        "OFFLINE_STARTUP_STDERR_PROFILE_LOCK_MESSAGE", "OFFLINE_STARTUP_STDERR_PROCESS_SINGLETON_MESSAGE",
+        "OFFLINE_STARTUP_STDERR_DEVTOOLS_POLICY_MESSAGE", "OFFLINE_STARTUP_STDERR_DEVTOOLS_DATA_DIR_MESSAGE")
 
     private fun replyOnlyHelper(code: String, startup: JsonElement): String {
         val reply = buildJsonObject {
@@ -204,8 +205,30 @@ class DesktopRuntimeDiagnosticsTest {
         }
     }
 
+    @Test fun packagedHelperClassifiesChrome156RestrictionMessagesWithoutClaimingAnOsCause() {
+        for ((message, token) in listOf(
+            "DevTools remote debugging is disallowed by the system admin." to "OFFLINE_STARTUP_STDERR_DEVTOOLS_POLICY_MESSAGE",
+            "DevTools remote debugging requires a non-default data directory. Specify this using --user-data-dir." to
+                "OFFLINE_STARTUP_STDERR_DEVTOOLS_DATA_DIR_MESSAGE"
+        )) {
+            val text = "[authored-secret] $message /private/fixture https://private.invalid/?signature=fixture\n"
+            DesktopYouTubeJavaScriptRuntime(scaledSlowBrowser(null, text), 1).use { runtime ->
+                val error = assertFailsWith<YouTubeJavaScriptFailure> { runtime.prepare("owned fixture") }
+                assertEquals("OFFLINE_BROWSER_STARTUP_TIMEOUT", error.code)
+                assertEquals(listOf("OFFLINE_STARTUP_SPAWN_OBSERVED", "OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED",
+                    token, "OFFLINE_STARTUP_PORT_MISSING"), observations(error))
+                assertPrivateDetailsAbsent(error)
+                assertEquals(0, runtime.trackedSessionCount)
+            }
+        }
+    }
+
     @Test fun malformedUnknownDuplicateOversizedAndContradictoryReceiptsAreDroppedWhole() {
-        val malformed = stderrMessageCodes.map { observationArray(pendingObservations + it) } + listOf(
+        val malformed = stderrMessageCodes.flatMap { code -> listOf(
+            observationArray(pendingObservations + code),
+            observationArray(pendingObservations.take(2) + code.dropLast(1) + pendingObservations.last()),
+            observationArray(pendingObservations.take(2) + (code + "_PRIVATE") + pendingObservations.last())
+        ) } + listOf(
             JsonNull, JsonPrimitive("authored-secret"), buildJsonObject { put("private", "authored-secret") },
             JsonArray(emptyList()), JsonArray(listOf(JsonPrimitive(true)) + pendingObservations.drop(1).map(::JsonPrimitive)),
             observationArray(pendingObservations + "OFFLINE_STARTUP_PRIVATE_VALUE"),
