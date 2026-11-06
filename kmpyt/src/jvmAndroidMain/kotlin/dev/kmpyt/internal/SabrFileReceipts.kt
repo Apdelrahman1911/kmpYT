@@ -16,7 +16,9 @@ internal class JvmResumeSha256 : ResumeSha256 {
 
 internal class SabrFileReceipts(private val directory: File, plan: PlannedDownload) {
     private val receipts = SabrResumeReceipts(plan, ::resumeDigest, ::JvmResumeSha256)
-    private fun file(index: Int) = File(directory, "$index-0")
+    private fun file(index: Int) = File(directory, "$index-0").also {
+        requirePrivateCheckpointPath(it, allowMissing = true)
+    }
 
     suspend fun restore(saved: SabrSavedReceipt?): SabrTransferCheckpoint? {
         val checkpoint = receipts.restore(saved, { file(it).takeIf(File::isFile)?.length() }, ::read) ?: return null

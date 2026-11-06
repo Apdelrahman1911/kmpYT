@@ -34,25 +34,34 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
         require(input.credentialRef == null) { "This adapter supports anonymous inspected resources; account credentials are not accepted." }
         require(input.sabrCheckpoint == null) { "An external SABR checkpoint has no owned track files. Retry the original destination instead." }
         YouTubeFormatCapabilities.downloadProblem(input.primary, input.audio, platformName)?.let { error(it) }
-        val destination = File(destinationPath).canonicalFile
+        val requested = File(destinationPath).absoluteFile
+        require(requested.name.isNotBlank() && requested.name !in setOf(".", "..")) { "Choose a destination file." }
+        // Resolve intentional caller-parent aliases (for example Android app directories or
+        // macOS /var), but never erase a link at the destination leaf before checking it.
+        val parent = requireNotNull(requested.parentFile).canonicalFile
+        val destination = File(parent, requested.name)
         val key = destination.path.let { if (System.getProperty("os.name").orEmpty().startsWith("Windows", true)) it.lowercase(Locale.ROOT) else it }
         check(activeDestinations.putIfAbsent(key, true) == null) { "Another download is using this destination." }
         try {
+            requirePrivateCheckpointPath(destination, allowMissing = true)
             require(!destination.exists()) { "The destination already exists; choose another file." }
-            val parent = requireNotNull(destination.parentFile)
+            requirePrivateCheckpointPath(parent, allowMissing = true)
             check(parent.isDirectory || parent.mkdirs()) { "Could not create the destination directory." }
             val directory = File(parent, ".${destination.name}.kmpyt")
-            check(directory.canonicalFile == directory.absoluteFile) { "Download checkpoint storage cannot be a symbolic link." }
+            requirePrivateCheckpointPath(directory, allowMissing = true)
             check(directory.isDirectory || directory.mkdir()) { "Could not create download checkpoint storage." }
             // Inspect the entire existing tree before even opening the lock for
             // writing. Future/corrupt-schema resets must not follow child links.
             checkpointTree(directory)
-            check(File(directory, "lock").canonicalFile == File(directory, "lock").absoluteFile) { "The checkpoint lock cannot be a symbolic link." }
-            val lockFile = RandomAccessFile(File(directory, "lock"), "rw")
+            val lockPath = File(directory, "lock")
+            requirePrivateCheckpointPath(lockPath, allowMissing = true)
+            val lockFile = RandomAccessFile(lockPath, "rw")
             val fileLock = try { lockFile.channel.tryLock() } catch (_: Exception) { null }
             if (fileLock == null) { lockFile.close(); error("Another download is using this destination.") }
             var complete = false
             try {
+                requirePrivateCheckpointPath(lockPath)
+                checkpointTree(directory)
                 val digest = MessageDigest.getInstance("SHA-256").digest(json.encodeToString(PlannedDownload.serializer(),
                     input.copy(sabrCheckpoint = null, sabrDiagnostics = emptyList())).encodeToByteArray())
                     .joinToString("") { "%02x".format(it.toInt() and 255) }
@@ -61,8 +70,9 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                 val resourceScopes = if (selectionDigest == null) emptyMap() else TransferPlanning.parts(input).associate {
                     it.key to progressiveResourceScope(it.resource.url, input.mediaId, allowLocalHttp)
                 }
+                requirePrivateCheckpointPath(checkpointFile, allowMissing = true)
                 val decoded = runCatching {
-                    require(checkpointFile.canonicalFile == checkpointFile.absoluteFile && checkpointFile.length() <= MAX_CHECKPOINT_BYTES)
+                    require(checkpointFile.length() <= MAX_CHECKPOINT_BYTES)
                     json.decodeFromString(FileCheckpoint.serializer(), checkpointFile.readText())
                 }.getOrNull()
                 val restored = decoded?.takeIf {
@@ -91,7 +101,8 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                     val file = File(directory, state.key)
                     // Only keys authored by TransferPlanning are allowed to name local files.
                     require(Regex("\\d+-\\d+").matches(state.key)) { "Invalid local checkpoint resource key." }
-                    if (!file.isFile || file.canonicalFile != file.absoluteFile) null else {
+                    requirePrivateCheckpointPath(file, allowMissing = true)
+                    if (!file.isFile) null else {
                         val expected = requireNotNull(expectedParts[state.key]) { "The checkpoint does not belong to the selected media parts." }.expectedBytes
                         val length = file.length()
                         if (expected != null && (length > expected || state.total != null && state.total != expected ||
@@ -124,9 +135,8 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                     current()
                     plan = updated; states = parts
                     val temporary = File(directory, "checkpoint.tmp")
-                    check(temporary.canonicalFile == temporary.absoluteFile && checkpointFile.canonicalFile == checkpointFile.absoluteFile) {
-                        "Checkpoint files cannot be symbolic links."
-                    }
+                    requirePrivateCheckpointPath(temporary, allowMissing = true)
+                    requirePrivateCheckpointPath(checkpointFile, allowMissing = true)
                     val bytes = json.encodeToString(FileCheckpoint.serializer(),
                         FileCheckpoint(digest, parts, sabrReceipt = updated.sabrCheckpoint?.let { requireNotNull(sabrReceipts).snapshot(it) }, schema = 3,
                             selectionDigest = selectionDigest, resourceScopes = resourceScopes,
@@ -139,7 +149,8 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                     onProgress(YouTubeDownloadProgress(MediaStorageSpace.checkedSum(parts.map { it.bytes }), total, speed))
                 }
                 val published = File(directory, "published.mp4")
-                published.delete()
+                requirePrivateCheckpointPath(published, allowMissing = true)
+                check(!published.exists() || published.delete()) { "Could not reset private output storage." }
                 coroutineScope {
                     // Cancelling the caller closes a blocking native read immediately.
                     val disconnect = launch(Dispatchers.IO) {
@@ -159,6 +170,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                                 var attempt = 0
                                 while (true) {
                                     try {
+                                        requirePrivateCheckpointPath(file, allowMissing = true)
                                         val result = if (part.resource.rangeStart != null)
                                             RangedFileTransfer(allowLocalHttp, { active.set(it) }).fetch(part, state, file, plan, ::current) { update, speed ->
                                                 state = update; progress(update, speed)
@@ -196,6 +208,8 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                                 current()
                                 val part = parts.singleOrNull { it.resource == resource } ?: error("Unplanned local media resource")
                                 val source = File(directory, part.key)
+                                requirePrivateCheckpointPath(source)
+                                requirePrivateCheckpointPath(target, allowMissing = true)
                                 MediaStorageSpace.requireAvailable(target, source.length())
                                 source.inputStream().use { inputStream -> target.outputStream().use { output ->
                                     MediaStorageSpace.copy(inputStream, output, target) { current() }
@@ -203,7 +217,9 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                             }, published)
                         }
                         current()
+                        requirePrivateCheckpointPath(destination, allowMissing = true)
                         require(!destination.exists()) { "The destination was created by another writer." }
+                        requirePrivateCheckpointPath(published)
                         check(published.isFile && published.length() > 0 && published.renameTo(destination)) { "Could not publish the complete media file." }
                         complete = true
                         YouTubeDownloadResult(destination.absolutePath, destination.length(),

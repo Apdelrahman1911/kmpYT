@@ -112,8 +112,9 @@ ownership of the HTTP client passed to those adapter factories. Mobile hosts mus
 permit only the required local native transport according to their platform security policy.
 
 The 2026-11-06 focused JVM run passed 103 tests with explicit FFmpeg, including real loopback
-POST-to-range byte integrity and authored AAC decode/seek to a null sink. Android/iOS adapters
-and the Android resume mirror are authored, not yet platform-compiled/executed for this change.
+POST-to-range byte integrity and authored AAC decode/seek to a null sink. The later scoped run
+below also compiled Android production and instrumented-test sources; no Android instrumentation
+or iOS adapter execution is established by these Linux runs.
 These tests do not establish authorized live YouTube playback, audible output or app completion.
 
 Retry a cancelled or interrupted download with the same selection and destination to resume
@@ -128,11 +129,15 @@ Multi-resource plans retain their exact-plan bindings rather than borrowing this
 identity rule. iOS has a separate checkpoint implementation; its retained-byte hashing,
 redirect/scope and storage parity repair is under review, not compiled or executed for this change.
 
-JVM/Android checkpoint roots must remain caller-private. Linux JVM regressions reject symlinks,
-special files and oversized trees before reset/cleanup. **A Windows audit found that canonical
-path equality alone does not reject junctions/reparse points; a platform no-follow repair is
-separate and Windows safety is not yet verified.** After success, media/checkpoint data is purged **while holding
-the OS lock**; the empty reusable `.<destination-name>.kmpyt/lock` inode and its parent remain.
+JVM/Android checkpoint roots must remain caller-private. Platform no-follow guards now inspect
+the full ancestry before destination/private-file access: JVM NIO rejects links, special files
+and reparse attributes; Android uses API-21+ `Os.lstat`, not API-26 NIO. Only the caller-supplied
+parent is canonicalized; a linked destination leaf is never resolved into a writable caller file.
+Oversized or linked private trees fail before reset/cleanup, receipt hashing or media publication.
+**Linux regression and Android compilation results do not establish actual Windows junction
+safety or hostile same-user concurrent-rename protection.** After success, media/checkpoint data
+is purged **while holding the OS lock**; the empty reusable `.<destination-name>.kmpyt/lock` inode
+and its parent remain.
 Do not unlink/recreate that lock while any process may reuse the destination: doing so can let
 two processes lock different inodes for one path. A host may remove a retired private generation
 only under a stronger external lifetime fence proving that no current or future writer can
@@ -150,11 +155,13 @@ purged under the stable lock before callbacks or network requests, never replaye
 Raw `SabrTransferCheckpoint` remains a sensitive in-memory protocol object, not a safe persistence
 format. No implicit authorization or integrity grant is added.
 
-The 2026-11-06 scoped Linux JVM privacy/transfer run passed **143 tests, 0 failures/errors/skips**
-with explicit FFmpeg. It includes 8 actual-file SABR receipt cases, 7 receipt/hash cases and 4 raw
-resource-identity cases. It overlaps the earlier 103-test selection; do not add those totals.
-This does not establish Android/Apple compilation, Windows safety, live-source media access or
-physical audio playback.
+The 2026-11-06 scoped Linux JVM privacy/transfer/path run completed **147 tests: 146 passed,
+0 failures/errors, 1 Windows-only junction test skipped**, with explicit FFmpeg. It includes
+9 actual-file SABR receipt cases, 7 receipt/hash cases and 4 raw resource-identity cases. Android
+production and instrumented-test source compilation also passed, including 3 new no-follow
+tests; **0 Android instrumentation tests executed**. The selection overlaps the earlier 103- and
+143-test runs; do not add those totals. Apple compilation, actual Windows execution, live-source
+media access and physical audio playback remain separate unverified gates.
 
 ## Current limitations
 

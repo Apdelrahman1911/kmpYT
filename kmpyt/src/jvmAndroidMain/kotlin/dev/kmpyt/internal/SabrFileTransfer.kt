@@ -43,8 +43,10 @@ internal class SabrFileTransfer(
         val total = expected.values.fold(0L) { sum, length ->
             require(length > 0 && length <= Long.MAX_VALUE - sum) { "SABR transfer sizes overflow supported file offsets" }; sum + length
         }
+        requirePrivateCheckpointPath(directory, allowMissing = true)
         check(directory.isDirectory || directory.mkdirs()) { "Could not create private SABR track storage" }
         val trackFiles = representations.mapIndexed { index, representation -> representation.role to File(directory, "$index-0") }.toMap()
+        trackFiles.values.forEach { requirePrivateCheckpointPath(it, allowMissing = true) }
         if (plan.sabrCheckpoint == null) trackFiles.values.forEach { file ->
             check(!file.exists() || file.delete()) { "Could not reset an uncheckpointed SABR track" }
         }
@@ -111,7 +113,8 @@ internal class SabrFileTransfer(
                 check(result.outputBytesByRole.all { (role, bytes) -> trackFiles.getValue(role).length() == bytes }) {
                     "Completed SABR track file differs from verified coverage"
                 }
-                output.delete()
+                requirePrivateCheckpointPath(output, allowMissing = true)
+                check(!output.exists() || output.delete()) { "Could not reset private SABR output storage" }
                 // Both protocol tracks normally share one endpoint. Actual app-private file
                 // URIs distinguish them for the existing processor's callback; no GET or
                 // fabricated public media URL is used in this local processing stage.
@@ -122,6 +125,8 @@ internal class SabrFileTransfer(
                 processor.materialize(local(plan.primary), plan.audio?.let(::local), { resource, target ->
                     requireCurrent()
                     val file = localFiles[resource.url] ?: error("Unplanned private SABR processing resource")
+                    requirePrivateCheckpointPath(file)
+                    requirePrivateCheckpointPath(target, allowMissing = true)
                     MediaStorageSpace.requireAvailable(target, file.length())
                     file.inputStream().use { input -> target.outputStream().use { destination ->
                         MediaStorageSpace.copy(input, destination, target, ::requireCurrent)
@@ -171,17 +176,20 @@ internal class SabrFileTransfer(
         }
         override suspend fun size(): Long = withContext(Dispatchers.IO) {
             checkCurrent()
+            requirePrivateCheckpointPath(file, allowMissing = true)
             val size = file.takeIf { it.isFile }?.length() ?: 0L
             require(size <= expected) { "Private SABR track exceeds its source-declared size" }
             size
         }
         override suspend fun read(offset: Long, count: Int): ByteArray = withContext(Dispatchers.IO) {
             checkCurrent()
+            requirePrivateCheckpointPath(file)
             require(offset >= 0 && count >= 0 && offset <= expected - count && file.isFile && file.length() >= offset + count)
             ByteArray(count).also { bytes -> RandomAccessFile(file, "r").use { input -> input.seek(offset); input.readFully(bytes) } }
         }
         override suspend fun write(offset: Long, bytes: ByteArray) = withContext(Dispatchers.IO) {
             checkCurrent()
+            requirePrivateCheckpointPath(file, allowMissing = true)
             require(offset >= 0 && bytes.isNotEmpty() && offset <= expected - bytes.size)
             try {
                 storageCheck(file, bytes.size.toLong())

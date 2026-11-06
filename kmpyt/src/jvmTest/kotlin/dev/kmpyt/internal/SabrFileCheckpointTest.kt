@@ -13,7 +13,6 @@ import kotlinx.serialization.json.*
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.file.Files
-import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import kotlin.test.*
 
@@ -67,7 +66,7 @@ class SabrFileCheckpointTest {
     @Test fun legacySensitiveCheckpointsArePurgedUnderTheStableLockBeforeCallbacksOrRequests(): Unit = runBlocking {
         for (schema in listOf(1, 2)) Fixture().use { fixture ->
             fixture.interrupt()
-            val lockKey = fixture.lockKey()
+            val lockWitness = fixture.lockWitness()
             val root = fixture.checkpoint()
             val legacy = SabrTransferCheckpoint(fixture.plan.mediaId, fixture.format, null, fixture.client,
                 listOf(SabrTransferTrackCheckpoint(TrackRole.AUDIO, fixture.format, fixture.payload.size.toLong(),
@@ -85,14 +84,14 @@ class SabrFileCheckpointTest {
             var observedCallback = false
             fixture.resume(expectBuffered = false, beforeRequest = {
                 assertTrue(observedCallback)
-                assertEquals(lockKey, fixture.lockKey())
+                fixture.assertSameLock(lockWitness)
                 fixture.assertPrivateCheckpoint()
             }, progress = {
                 observedCallback = true
                 fixture.assertPrivateCheckpoint()
             })
             assertTrue(observedCallback)
-            assertEquals(lockKey, fixture.lockKey())
+            fixture.assertSameLock(lockWitness)
             assertEquals(listOf("lock"), fixture.working.list()!!.sorted())
             assertContentEquals(fixture.payload, fixture.output.readBytes())
         }
@@ -157,6 +156,32 @@ class SabrFileCheckpointTest {
             assertFalse(fixture.output.exists())
             assertContentEquals(before, fixture.part.readBytes())
             fixture.assertPrivateCheckpoint()
+            fixture.resume(expectBuffered = true)
+            assertContentEquals(fixture.payload, fixture.output.readBytes())
+        }
+    }
+
+    @Test fun linkedSabrTrackIsRejectedBeforeReceiptHashingCallbacksOrRequests(): Unit = runBlocking {
+        Fixture().use { fixture ->
+            fixture.interrupt()
+            val prefix = fixture.part.readBytes()
+            val saved = fixture.checkpointFile.readText()
+            val callerFile = File(fixture.directory, "caller-owned-prefix").apply { writeBytes(prefix) }
+            check(fixture.part.delete())
+            Files.createSymbolicLink(fixture.part.toPath(), callerFile.toPath())
+            var callback = false
+            var request = false
+            try {
+                assertFailsWith<IllegalStateException> {
+                    fixture.resume(expectBuffered = true, beforeRequest = { request = true }, progress = { callback = true })
+                }
+                assertFalse(callback)
+                assertFalse(request)
+                assertTrue(Files.isSymbolicLink(fixture.part.toPath()))
+                assertContentEquals(prefix, callerFile.readBytes())
+                assertEquals(saved, fixture.checkpointFile.readText())
+                assertFalse(fixture.output.exists())
+            } finally { Files.delete(fixture.part.toPath()); fixture.part.writeBytes(prefix) }
             fixture.resume(expectBuffered = true)
             assertContentEquals(fixture.payload, fixture.output.readBytes())
         }
@@ -228,7 +253,15 @@ class SabrFileCheckpointTest {
 
         fun checkpoint() = Json.parseToJsonElement(checkpointFile.readText()).jsonObject
         fun receipt() = Json.decodeFromJsonElement(SabrSavedReceipt.serializer(), checkpoint().getValue("sabrReceipt"))
-        fun lockKey(): Any = assertNotNull(Files.readAttributes(File(working, "lock").toPath(), BasicFileAttributes::class.java).fileKey())
+        // Windows BasicFileAttributes.fileKey() is allowed to be null. A distinct,
+        // test-owned hard link gives isSameFile a portable retained-file witness.
+        fun lockWitness(): File = File(directory, "retained-lock-witness").also {
+            Files.createLink(it.toPath(), File(working, "lock").toPath())
+        }
+        fun assertSameLock(witness: File) {
+            assertTrue(Files.isSameFile(witness.toPath(), File(working, "lock").toPath()),
+                "Reset or publication replaced the reusable checkpoint lock.")
+        }
         fun assertPrivateCheckpoint() {
             val root = checkpoint()
             assertFalse("sabrCheckpoint" in root)
