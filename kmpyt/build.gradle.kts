@@ -87,6 +87,13 @@ publishing.publications.withType<MavenPublication>().configureEach {
         name.set("kmpYT")
         description.set("YouTube inspection, browsing, captions and downloads for Kotlin Multiplatform.")
         url.set("https://github.com/Apdelrahman1911/kmpYT")
+        licenses {
+            license {
+                name.set("MIT License")
+                url.set("https://opensource.org/license/mit")
+                distribution.set("repo")
+            }
+        }
         scm {
             url.set("https://github.com/Apdelrahman1911/kmpYT")
             connection.set("scm:git:https://github.com/Apdelrahman1911/kmpYT.git")
