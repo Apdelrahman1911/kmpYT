@@ -197,6 +197,13 @@ jobs:
           submodules: false
       - name: Verify license and browser-free diagnostic regressions
         run: |
+          # Native Windows Python must not resolve bare bash to the WSL launcher.
+          # Bind the Git Bash already running this step; no PATH/system changes.
+          case "$(uname -s)" in MINGW*|MSYS*) ;; *) printf '%s\n' 'Git Bash is required for this Windows probe.' >&2; exit 78 ;; esac
+          tooling_bash="$(cygpath -am "$BASH")"
+          case "$tooling_bash" in *.[Ee][Xx][Ee]) ;; *) tooling_bash="$tooling_bash.exe" ;; esac
+          test -f "$tooling_bash"
+          export KMPYT_TEST_BASH="$tooling_bash"
           ci/scoped.sh python3 -B ci/verify-license.py
           ci/scoped.sh python3 -B ci/test-tooling.py
       - name: Read-only admission then exactly one production-path authored Chromium test

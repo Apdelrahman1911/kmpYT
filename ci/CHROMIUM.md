@@ -157,9 +157,11 @@ native spawn/close path. It does not enumerate or attach to other browsers.
 The ordinary push/PR and default manual `full` mode retain every existing job,
 status name and native exit-78 gate. Only `workflow_dispatch` with the explicit
 `mode=windows-startup-probe` selects the additional **windows-2022** job instead
-of the full matrix. Every skipped ordinary job in this mode has a distinct
-`Probe scope - ... gates not executed` name: its skipped conclusion must not
-masquerade as an ordinary required check. The probe uses the disjoint concurrency
+of the full matrix. Every ordinary job's probe-name branch assigns a distinct
+`Probe scope - ... gates not executed` name. GitHub can retain the unevaluated
+name expression for a skipped job; neither form is an ordinary required context.
+Its skipped conclusion must not masquerade as an ordinary required check.
+The probe uses the disjoint concurrency
 prefix `ci-windows-startup-probe-${{ github.ref }}`, not a suffix that could
 collide with an ordinary run on a branch named `topic-windows-startup-probe`.
 Outside explicit probe mode the original effective names and
@@ -192,3 +194,35 @@ Win32/registry calls, denies process/network creation, and checks finite output,
 read-only access masks, buffer limits, races, refusal and exact test selection.
 These tests do not execute the Windows APIs or browser and cannot establish an
 actual Windows startup result.
+
+### Windows tooling uses the selected Git Bash, not a bare executable name
+
+[Probe run 42213767443](https://github.com/Apdelrahman1911/kmpYT/actions/runs/42213767443)
+checked out `5ade5425492fbb4541412c4fe1f15fb6aa5b2590` but failed **before**
+browser admission. License, 18 mocked Windows-API tests and 35 browser-free Node
+tests passed; 21 tooling tests had 3 failures and 2 errors at bare-`bash` Python
+subprocess sites. The actual log reports that WSL has no installed distributions,
+while the Actions step itself ran Git Bash. It does not record the exact child
+executable path. The native admission/single JVM step was skipped, with zero
+JUnit tests/startup receipts: this is not a Chromium startup diagnosis.
+
+Only the probe's tooling step now sets `KMPYT_TEST_BASH` from its running `$BASH`,
+using `cygpath -am` for a native absolute Windows path and adding `.exe` if Bash
+omitted that suffix. Native Windows tooling requires that explicit local-drive
+`bin/bash.exe` or `usr/bin/bash.exe` plus the same installation's `bin/git.exe`
+and `usr/bin/msys-2.0.dll`. Missing/wrong/WSL/relative/UNC paths refuse without
+launching another shell or searching PATH. These are read-only layout checks,
+not binary signature authentication. Other installation layouts need review,
+not a silent fallback. Non-Windows tooling resolves its existing Bash to an
+absolute path. No system/PATH configuration, WSL install, test skip or ordinary
+workflow command changes.
+
+This follows Python's recommendation to use a
+[fully qualified executable path](https://docs.python.org/3.12/library/subprocess.html#subprocess.Popen)
+because native Windows search rules differ from POSIX, and MSYS2's documented
+[manual Unix/Windows path conversion](https://www.msys2.org/docs/filesystem-paths/).
+Finite mocks bind all five subprocess sites to the exact selected executable
+and verify malformed/missing/incomplete selection refuses before process launch.
+Linux light tests cannot establish the repaired native Windows shell handoff;
+that still needs a separately authorized exact-revision probe, not an automatic
+redispatch or a claimed Chromium repair.

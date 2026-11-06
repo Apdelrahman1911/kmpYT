@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cheap scoped-tooling checks. No Gradle, browser, emulator or simulator."""
-import hashlib,importlib.util,io,json,os,re
-from pathlib import Path
+import ast,hashlib,importlib.util,io,json,os,re
+from pathlib import Path,PureWindowsPath
 import shutil,subprocess,tarfile,tempfile,unittest,zipfile
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
@@ -13,6 +13,38 @@ SPEC.loader.exec_module(FFMPEG)
 PROVENANCE_SPEC=importlib.util.spec_from_file_location('js_tool_provenance',ROOT/'ci/js-tool-provenance.py')
 PROVENANCE=importlib.util.module_from_spec(PROVENANCE_SPEC)
 PROVENANCE_SPEC.loader.exec_module(PROVENANCE)
+
+def tooling_bash(environment=None,platform=None):
+    """Resolve the reviewed shell explicitly; native Windows must not find WSL."""
+    environment=os.environ if environment is None else environment
+    platform=os.name if platform is None else platform
+    if platform=='nt':
+        value=environment.get('KMPYT_TEST_BASH')
+        if (not isinstance(value,str) or not 1<=len(value)<=4096
+                or any(ord(char)<32 for char in value)):
+            raise ValueError('Windows tooling requires the workflow-local Git Bash path')
+        candidate=PureWindowsPath(value)
+        if (not candidate.is_absolute() or not re.fullmatch(r'[A-Za-z]:',candidate.drive)
+                or candidate.name.lower()!='bash.exe'
+                or '..' in re.split(r'[\\/]',value)
+                or candidate.parent.name.lower()!='bin'):
+            raise ValueError('Windows tooling requires an absolute installed Git Bash executable')
+        installation=candidate.parent.parent
+        if installation.name.lower()=='usr': installation=installation.parent
+        # The override comes from the running Actions Git Bash ($BASH), converted
+        # by cygpath. These read-only peer checks reject WSL/wrong installations;
+        # they are not an executable signature or hostile-same-user attestation.
+        required=(candidate,installation/'bin/git.exe',installation/'usr/bin/msys-2.0.dll')
+        if not all(Path(str(path)).is_file() for path in required):
+            raise ValueError('The selected Git Bash installation is unavailable or incomplete')
+        return str(candidate)
+    value=shutil.which('bash')
+    if not value or not Path(value).is_absolute() or not Path(value).is_file():
+        raise ValueError('An existing absolute Bash executable is required for tooling checks')
+    return str(Path(value).resolve(strict=True))
+
+def run_tooling_bash(arguments,**options):
+    return subprocess.run([tooling_bash(options.get('env')),*arguments],**options)
 
 class ToolingTests(unittest.TestCase):
     def test_ci_runs_once_per_pr_update_and_keeps_all_checks(self):
@@ -72,7 +104,91 @@ class ToolingTests(unittest.TestCase):
 
     def test_shell_syntax(self):
         for path in (ROOT/'ci').glob('*.sh'):
-            subprocess.run(['bash','-n',str(path)],check=True)
+            run_tooling_bash(['-n',str(path)],check=True)
+
+    def test_windows_tooling_bash_accepts_only_the_explicit_native_git_shell(self):
+        for selected in ('C:/Program Files/Git/bin/bash.exe','C:/Program Files/Git/usr/bin/bash.exe'):
+            with self.subTest(selected=selected):
+                expected=str(PureWindowsPath(selected))
+                present={expected,str(PureWindowsPath('C:/Program Files/Git/bin/git.exe')),
+                    str(PureWindowsPath('C:/Program Files/Git/usr/bin/msys-2.0.dll'))}
+                environment={'KMPYT_TEST_BASH':selected,'PATH':'authored-untrusted-search-path'}
+                before=dict(environment)
+                with patch.object(Path,'is_file',lambda path: str(path) in present), \
+                        patch.object(shutil,'which',side_effect=AssertionError('No Windows PATH search')), \
+                        patch.object(subprocess,'run',side_effect=AssertionError('No shell identity launch')):
+                    self.assertEqual(tooling_bash(environment,platform='nt'),expected)
+                self.assertEqual(environment,before)
+
+    def test_windows_tooling_bash_missing_wrong_or_unavailable_never_falls_back_or_launches(self):
+        values=(None,'','bash','/usr/bin/bash','C:bin/bash.exe',
+            'C:/Windows/System32/bash.exe','C:/Windows/System32/wsl.exe',
+            'C:/Program Files/Git/bin/cmd.exe','C:/Program Files/Git/bin/../bin/bash.exe',
+            r'\\server\share\Git\bin\bash.exe',r'\\?\C:\Git\bin\bash.exe',
+            'C:/Program Files/Git/bin/bash.exe\n')
+        with patch.object(shutil,'which',side_effect=AssertionError('No Windows PATH fallback')), \
+                patch.object(subprocess,'run',side_effect=AssertionError('No wrong-shell launch')):
+            for value in values:
+                with self.subTest(value=value),patch.object(Path,'is_file',return_value=True):
+                    with self.assertRaises(ValueError):
+                        tooling_bash({} if value is None else {'KMPYT_TEST_BASH':value},platform='nt')
+            selected='C:/Program Files/Git/usr/bin/bash.exe'
+            required=(selected,'C:/Program Files/Git/bin/git.exe','C:/Program Files/Git/usr/bin/msys-2.0.dll')
+            for missing in required:
+                absent=str(PureWindowsPath(missing))
+                with self.subTest(missing=missing), \
+                        patch.object(Path,'is_file',lambda path: str(path)!=absent):
+                    with self.assertRaises(ValueError):
+                        tooling_bash({'KMPYT_TEST_BASH':selected},platform='nt')
+
+    def test_tooling_shell_subprocess_uses_exact_resolved_argv_and_propagates_refusal(self):
+        selected=r'C:\Program Files\Git\usr\bin\bash.exe'
+        arguments=['--noprofile','--norc','-c','printf "%s" "authored space"']
+        environment={'KMPYT_TEST_BASH':selected}
+        with patch(__name__+'.tooling_bash',return_value=selected) as resolve, \
+                patch.object(subprocess,'run') as launch:
+            self.assertIs(run_tooling_bash(arguments,env=environment,check=True),launch.return_value)
+            resolve.assert_called_once_with(environment)
+            launch.assert_called_once_with([selected,*arguments],env=environment,check=True)
+        with patch(__name__+'.tooling_bash',side_effect=ValueError('authored missing shell')), \
+                patch.object(subprocess,'run') as launch:
+            with self.assertRaises(ValueError): run_tooling_bash(arguments)
+            launch.assert_not_called()
+        # Bind each of the five formerly bare-bash sites to this checked helper.
+        source=ast.parse(Path(__file__).read_text())
+        methods={node.name:node for node in ast.walk(source) if isinstance(node,ast.FunctionDef)}
+        names=('test_shell_syntax','test_probe_tool_selection_does_not_prepare_or_execute_ffmpeg_with_mocked_tools',
+            'test_homes_and_parent_are_preserved','test_both_native_gates_fail_without_starting_services',
+            'test_escaping_work_symlink_rejected_before_writes')
+        for name in names:
+            calls=[node for node in ast.walk(methods[name]) if isinstance(node,ast.Call)]
+            self.assertEqual(sum(isinstance(call.func,ast.Name) and call.func.id=='run_tooling_bash' for call in calls),1)
+            for call in calls:
+                if isinstance(call.func,ast.Attribute) and isinstance(call.func.value,ast.Name):
+                    self.assertNotEqual(call.func.value.id,'subprocess')
+
+    def test_posix_tooling_shell_resolves_existing_bash_without_mutating_environment(self):
+        selected=str(ROOT/'authored-bash-path')
+        environment={'KMPYT_TEST_BASH':'ignored Windows-only override'}
+        with patch.object(shutil,'which',return_value=selected) as search, \
+                patch.object(Path,'is_file',return_value=True), \
+                patch.object(Path,'resolve',return_value=Path(selected)):
+            self.assertEqual(tooling_bash(environment,platform='posix'),selected)
+            search.assert_called_once_with('bash')
+        self.assertEqual(environment,{'KMPYT_TEST_BASH':'ignored Windows-only override'})
+        for value in (None,'bash'):
+            with self.subTest(value=value),patch.object(shutil,'which',return_value=value):
+                with self.assertRaises(ValueError): tooling_bash({},platform='posix')
+
+    def test_windows_probe_binds_the_running_git_shell_only_inside_probe_scope(self):
+        workflow=(ROOT/'.github/workflows/ci.yml').read_text()
+        ordinary,probe=workflow.split('\n  windows_startup_probe:\n',1)
+        self.assertNotIn('KMPYT_TEST_BASH',ordinary)
+        self.assertIn('tooling_bash="$(cygpath -am "$BASH")"',probe)
+        self.assertIn('tooling_bash="$tooling_bash.exe"',probe)
+        self.assertIn('export KMPYT_TEST_BASH="$tooling_bash"',probe)
+        self.assertLess(probe.index('export KMPYT_TEST_BASH='),probe.index('ci/test-tooling.py'))
+        self.assertNotIn('export PATH=',probe)
 
     def test_native_test_sources_compile_before_unchanged_runtime_gates(self):
         workflow=(ROOT/'.github/workflows/ci.yml').read_text()
@@ -133,7 +249,7 @@ python3() {
 source "$KMPYT_CI_PROJECT_ROOT/ci/select-tools.sh" windows-startup-probe
 printf 'SELECTED_NODE=%s\nSELECTED_BROWSER=%s\n' "$KMPYT_NODE" "$KMPYT_CHROMIUM"
 '''
-            result=subprocess.run(['bash','--noprofile','--norc','-c',script],capture_output=True,text=True,env=environment)
+            result=run_tooling_bash(['--noprofile','--norc','-c',script],capture_output=True,text=True,env=environment)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertIn('MOCK_PROVENANCE_ONLY',result.stdout)
             self.assertIn('SELECTED_BROWSER='+str(base)+'/chrome.exe',result.stdout)
@@ -143,7 +259,7 @@ printf 'SELECTED_NODE=%s\nSELECTED_BROWSER=%s\n' "$KMPYT_NODE" "$KMPYT_CHROMIUM"
         before=dict(os.environ)
         names=['HOME','GRADLE_USER_HOME','KONAN_DATA_DIR','TMPDIR','TMP','TEMP','ANDROID_USER_HOME','GIT_CONFIG_GLOBAL']
         code='import json,os; print(json.dumps({k:os.environ[k] for k in '+repr(names)+'}))'
-        result=subprocess.check_output(['bash',str(ROOT/'ci/scoped.sh'),'python3','-B','-c',code],text=True)
+        result=run_tooling_bash([str(ROOT/'ci/scoped.sh'),'python3','-B','-c',code],stdout=subprocess.PIPE,check=True,text=True).stdout
         values=json.loads(result)
         for value in values.values(): self.assertTrue(Path(value).resolve().is_relative_to(ROOT))
         self.assertEqual(values['TMPDIR'],values['TMP']); self.assertEqual(values['TMP'],values['TEMP'])
@@ -151,7 +267,7 @@ printf 'SELECTED_NODE=%s\nSELECTED_BROWSER=%s\n' "$KMPYT_NODE" "$KMPYT_CHROMIUM"
 
     def test_both_native_gates_fail_without_starting_services(self):
         for kind in ('android','ios'):
-            result=subprocess.run(['bash',str(ROOT/'ci/native-boundary.sh'),kind],capture_output=True,text=True)
+            result=run_tooling_bash([str(ROOT/'ci/native-boundary.sh'),kind],capture_output=True,text=True)
             self.assertEqual(result.returncode,78)
             self.assertIn('BLOCKED:',result.stderr)
 
@@ -162,7 +278,7 @@ printf 'SELECTED_NODE=%s\nSELECTED_BROWSER=%s\n' "$KMPYT_NODE" "$KMPYT_CHROMIUM"
             outside=base/'outside'; outside.mkdir()
             try: (repo/'.work').symlink_to(outside,target_is_directory=True)
             except OSError as error: self.skipTest(str(error))
-            result=subprocess.run(['bash',str(repo/'ci/scoped.sh'),'true'],capture_output=True,text=True)
+            result=run_tooling_bash([str(repo/'ci/scoped.sh'),'true'],capture_output=True,text=True)
             self.assertNotEqual(result.returncode,0); self.assertIn('out-of-repository',result.stderr)
             self.assertEqual(list(outside.iterdir()),[])
 
