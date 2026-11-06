@@ -7,17 +7,17 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Full required matrix or one manually authorized Windows startup discriminator
+        description: Full required matrix or one manually authorized Windows diagnostic
         type: choice
         required: true
         default: full
-        options: [full, windows-startup-probe]
+        options: [full, windows-startup-probe, windows-known-folder-diagnostic]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'ci-windows-startup-probe-' || 'ci-' }}${{ github.ref }}
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'ci-windows-startup-probe-' || github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-known-folder-diagnostic' && 'ci-windows-known-folder-diagnostic-' || 'ci-' }}${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -26,8 +26,8 @@ defaults:
 
 jobs:
   license:
-    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}
-    name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'Probe scope - license gate not executed' || 'License and provenance policy' }}
+    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || (inputs.mode != 'windows-startup-probe' && inputs.mode != 'windows-known-folder-diagnostic')) }}
+    name: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'windows-startup-probe' || inputs.mode == 'windows-known-folder-diagnostic') && 'Probe scope - license gate not executed' || 'License and provenance policy' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -42,8 +42,8 @@ jobs:
         run: ci/scoped.sh python3 -B ci/test-tooling.py
 
   jvm:
-    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}
-    name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'Probe scope - JVM gates not executed' || 'JVM' }} (${{ matrix.check_name }})
+    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || (inputs.mode != 'windows-startup-probe' && inputs.mode != 'windows-known-folder-diagnostic')) }}
+    name: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'windows-startup-probe' || inputs.mode == 'windows-known-folder-diagnostic') && 'Probe scope - JVM gates not executed' || 'JVM' }} (${{ matrix.check_name }})
     strategy:
       fail-fast: false
       matrix:
@@ -75,8 +75,8 @@ jobs:
         run: ci/scoped.sh python3 -B ci/summary.py
 
   android:
-    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}
-    name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'Probe scope - Android gates not executed' || 'Android API' }} ${{ matrix.api }}
+    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || (inputs.mode != 'windows-startup-probe' && inputs.mode != 'windows-known-folder-diagnostic')) }}
+    name: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'windows-startup-probe' || inputs.mode == 'windows-known-folder-diagnostic') && 'Probe scope - Android gates not executed' || 'Android API' }} ${{ matrix.api }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -124,8 +124,8 @@ jobs:
         run: ci/scoped.sh python3 -B ci/summary.py
 
   apple:
-    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}
-    name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'Probe scope - iOS gates not executed' || 'iOS simulator and XCFramework' }}
+    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || (inputs.mode != 'windows-startup-probe' && inputs.mode != 'windows-known-folder-diagnostic')) }}
+    name: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'windows-startup-probe' || inputs.mode == 'windows-known-folder-diagnostic') && 'Probe scope - iOS gates not executed' || 'iOS simulator and XCFramework' }}
     runs-on: macos-15-intel
     timeout-minutes: 120
     env:
@@ -219,3 +219,23 @@ jobs:
         env:
           KMPYT_CI_JOB_STATUS: ${{ job.status }}
         run: ci/scoped.sh python3 -B ci/summary.py
+
+  windows_known_folder_diagnostic:
+    if: ${{ github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-known-folder-diagnostic' }}
+    name: Windows known-folder diagnostic (no browser)
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+          submodules: false
+      - name: Verify license and Python-only mocked diagnostic regressions
+        timeout-minutes: 1
+        run: |
+          ci/scoped.sh python3 -I -B ci/verify-license.py
+          ci/scoped.sh python3 -I -B ci/test-windows-known-folder-diagnostic.py
+      - name: Read-only current and DONT_VERIFY LocalAppData observations (never admission)
+        timeout-minutes: 1
+        run: ci/scoped.sh python3 -I -B ci/windows-known-folder-diagnostic.py

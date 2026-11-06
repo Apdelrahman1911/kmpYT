@@ -52,7 +52,7 @@ class ToolingTests(unittest.TestCase):
         self.assertIn('on:\n  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:\n',workflow)
         for job in ('license','jvm','android','apple'):
             self.assertIn('\n  '+job+':\n',workflow)
-        condition="github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe'"
+        condition="github.event_name == 'workflow_dispatch' && (inputs.mode == 'windows-startup-probe' || inputs.mode == 'windows-known-folder-diagnostic')"
         ordinary=re.sub(r'name: \$\{\{ '+re.escape(condition)+r" && '[^']+' \|\| '([^']+)' \}\}",r'name: \1',workflow)
         for check in ('License and provenance policy','JVM (${{ matrix.check_name }})','Android API ${{ matrix.api }}','iOS simulator and XCFramework'):
             self.assertIn('name: '+check,ordinary)
@@ -60,7 +60,7 @@ class ToolingTests(unittest.TestCase):
 
     def test_probe_skipped_contexts_and_concurrency_cannot_collide_with_full_mode(self):
         workflow=(ROOT/'.github/workflows/ci.yml').read_text()
-        condition="github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe'"
+        condition="github.event_name == 'workflow_dispatch' && (inputs.mode == 'windows-startup-probe' || inputs.mode == 'windows-known-folder-diagnostic')"
         names=(('license','Probe scope - license gate not executed','License and provenance policy',''),
             ('jvm','Probe scope - JVM gates not executed','JVM',' (${{ matrix.check_name }})'),
             ('android','Probe scope - Android gates not executed','Android API',' ${{ matrix.api }}'),
@@ -69,28 +69,33 @@ class ToolingTests(unittest.TestCase):
             block=workflow.split('\n  '+job+':\n',1)[1].split('\n\n  ',1)[0]
             self.assertIn("name: ${{ "+condition+" && '"+probe+"' || '"+ordinary+"' }}"+suffix,block)
             self.assertNotEqual(probe+suffix,ordinary+suffix)
-        probe_prefix,ordinary_prefix='ci-windows-startup-probe-','ci-'
-        self.assertIn("group: ${{ "+condition+" && '"+probe_prefix+"' || '"+ordinary_prefix+"' }}${{ github.ref }}",workflow)
+        probe_prefix,diagnostic_prefix,ordinary_prefix='ci-windows-startup-probe-','ci-windows-known-folder-diagnostic-','ci-'
+        probe_condition="github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe'"
+        diagnostic_condition="github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-known-folder-diagnostic'"
+        self.assertIn("group: ${{ "+probe_condition+" && '"+probe_prefix+"' || "+diagnostic_condition+" && '"+diagnostic_prefix+"' || '"+ordinary_prefix+"' }}${{ github.ref }}",workflow)
         # A suffix collided across topic and topic-windows-startup-probe refs.
         # GitHub groups are case-insensitive; disjoint prefixes also cover this.
         refs=('refs/heads/topic','refs/heads/topic-windows-startup-probe',
-            'refs/heads/windows-startup-probe-topic','refs/heads/TOPIC',
+            'refs/heads/windows-startup-probe-topic','refs/heads/topic-windows-known-folder-diagnostic','refs/heads/TOPIC',
             'refs/tags/topic','refs/pull/42/merge')
         probe_groups={(probe_prefix+ref).lower() for ref in refs}
+        diagnostic_groups={(diagnostic_prefix+ref).lower() for ref in refs}
         ordinary_groups={(ordinary_prefix+ref).lower() for ref in refs}
         self.assertTrue(probe_groups.isdisjoint(ordinary_groups))
+        self.assertTrue(diagnostic_groups.isdisjoint(ordinary_groups))
+        self.assertTrue(diagnostic_groups.isdisjoint(probe_groups))
         self.assertNotEqual(probe_prefix+'refs/heads/topic',
             ordinary_prefix+'refs/heads/topic-windows-startup-probe')
         self.assertIn('cancel-in-progress: true',workflow)
 
     def test_startup_probe_is_explicit_manual_windows_only_and_does_not_weaken_default_jobs(self):
         workflow=(ROOT/'.github/workflows/ci.yml').read_text()
-        self.assertIn('default: full\n        options: [full, windows-startup-probe]',workflow)
-        ordinary="if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}"
+        self.assertIn('default: full\n        options: [full, windows-startup-probe, windows-known-folder-diagnostic]',workflow)
+        ordinary="if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || (inputs.mode != 'windows-startup-probe' && inputs.mode != 'windows-known-folder-diagnostic')) }}"
         for name in ('license','jvm','android','apple'):
             block=workflow.split('\n  '+name+':\n',1)[1].split('\n  ',1)[0]
             self.assertIn(ordinary,block)
-        probe=workflow.split('\n  windows_startup_probe:\n',1)[1]
+        probe=workflow.split('\n  windows_startup_probe:\n',1)[1].split('\n\n  ',1)[0]
         self.assertIn("if: ${{ github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' }}",probe)
         self.assertIn('runs-on: windows-2022',probe)
         self.assertEqual(probe.count('ci/gradle.sh'),1)
@@ -101,6 +106,25 @@ class ToolingTests(unittest.TestCase):
         self.assertLess(probe.index('ci/windows-browser-preflight.py'),probe.index('ci/gradle.sh'))
         for other in (':kmpyt:jvmJar',':kmpyt:connected',':kmpyt:ios','ffmpeg-tool','upload-artifact','actions/cache','continue-on-error:'):
             self.assertNotIn(other,probe)
+
+    def test_known_folder_diagnostic_is_explicit_manual_python_only_and_bounded(self):
+        workflow=(ROOT/'.github/workflows/ci.yml').read_text()
+        diagnostic=workflow.split('\n  windows_known_folder_diagnostic:\n',1)[1].split('\n\n  ',1)[0]
+        self.assertIn("if: ${{ github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-known-folder-diagnostic' }}",diagnostic)
+        self.assertIn('name: Windows known-folder diagnostic (no browser)',diagnostic)
+        self.assertIn('runs-on: windows-2022',diagnostic)
+        self.assertIn('    timeout-minutes: 5\n',diagnostic)
+        self.assertEqual(diagnostic.count('        timeout-minutes: 1\n'),2)
+        for script in ('verify-license.py','test-windows-known-folder-diagnostic.py','windows-known-folder-diagnostic.py'):
+            self.assertEqual(diagnostic.count('ci/scoped.sh python3 -I -B ci/'+script),1)
+        self.assertEqual(diagnostic.count('ci/scoped.sh '),3)
+        self.assertEqual(diagnostic.count('uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'),1)
+        for disabled in ('persist-credentials','set-safe-directory','submodules'):
+            self.assertIn(disabled+': false',diagnostic)
+        for forbidden in ('ci/test-tooling.py','select-tools.sh','gradle','node','chromium.sh',
+            'windows-browser-preflight.py','summary.py','upload-artifact','actions/cache',
+            'continue-on-error:','always()','needs:','mkdir','powershell','gh workflow','sleep','timeout '):
+            self.assertNotIn(forbidden,diagnostic)
 
     def test_shell_syntax(self):
         for path in (ROOT/'ci').glob('*.sh'):
@@ -222,6 +246,9 @@ class ToolingTests(unittest.TestCase):
 
     def test_windows_preflight_with_authored_pe_and_mocked_apis_only(self):
         subprocess.run(['python3','-B',str(ROOT/'ci/test-windows-browser-preflight.py')],check=True)
+
+    def test_windows_known_folder_diagnostic_with_mocked_apis_only(self):
+        subprocess.run(['python3','-I','-B',str(ROOT/'ci/test-windows-known-folder-diagnostic.py')],check=True)
 
     def test_probe_tool_selection_does_not_prepare_or_execute_ffmpeg_with_mocked_tools(self):
         with tempfile.TemporaryDirectory(dir=ROOT/'.work/tmp') as temp:

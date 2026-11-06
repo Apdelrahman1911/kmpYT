@@ -180,7 +180,7 @@ native spawn/close path. It does not enumerate or attach to other browsers.
 ### One explicitly authorized manual job
 
 The ordinary push/PR and default manual `full` mode retain every existing job,
-status name and native exit-78 gate. Only `workflow_dispatch` with the explicit
+status name and native exit-78 gate. `workflow_dispatch` with the explicit
 `mode=windows-startup-probe` selects the additional **windows-2022** job instead
 of the full matrix. Every ordinary job's probe-name branch assigns a distinct
 `Probe scope - ... gates not executed` name. GitHub can retain the unevaluated
@@ -189,7 +189,7 @@ Its skipped conclusion must not masquerade as an ordinary required check.
 The probe uses the disjoint concurrency
 prefix `ci-windows-startup-probe-${{ github.ref }}`, not a suffix that could
 collide with an ordinary run on a branch named `topic-windows-startup-probe`.
-Outside explicit probe mode the original effective names and
+Outside the two explicit diagnostic modes the original effective names and
 `ci-${{ github.ref }}` concurrency key are unchanged. These are source guards,
 not evidence of GitHub server execution.
 Its scope is:
@@ -251,3 +251,154 @@ and verify malformed/missing/incomplete selection refuses before process launch.
 Linux light tests cannot establish the repaired native Windows shell handoff;
 that still needs a separately authorized exact-revision probe, not an automatic
 redispatch or a claimed Chromium repair.
+
+### Separate known-folder diagnostic: no application runtime or repair
+
+The branded Chrome156
+[default-directory guard](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/chrome/browser/devtools/remote_debugging_server.cc#160)
+rejects an **unknown** comparison as well as a default directory. The
+[Windows default-directory provider](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/chrome/common/chrome_paths_win.cc#42)
+gets `base::DIR_LOCAL_APP_DATA`; the exact
+[base provider](https://chromium.googlesource.com/chromium/src/+/refs/tags/156.0.8078.80/base/base_paths_win.cc#151)
+uses `SHGetFolderPath(NULL, CSIDL_LOCAL_APPDATA, NULL, SHGFP_TYPE_CURRENT, buffer)`.
+It does not simply read `LOCALAPPDATA`, nor require the final Chrome `User Data`
+directory to exist. The existing scoped environment makes HOME/USERPROFILE and
+LOCALAPPDATA repository-owned but does not create `home/AppData/Local`.
+An unavailable native known-folder location is therefore a **hypothesis**, not
+the established cause of any retained failed browser run. No old-run HRESULT
+has been recovered or reconstructed.
+
+The separate explicit manual mode `windows-known-folder-diagnostic` asks only
+that question. It selects one standard public **windows-2022** job. The four
+ordinary groups keep their distinct nonrequired `Probe scope - ... not executed`
+skip names; the startup-test job is also skipped under its own nonrequired name.
+Full-mode names, matrix labels, native exit-78 gates, policy preflight, production
+browser flags, startup deadlines and process ownership are unchanged. A disjoint
+`ci-windows-known-folder-diagnostic-${{ github.ref }}` concurrency prefix cannot
+replace a full or startup-test run. GitHub may display an unevaluated name for
+a skipped job; neither form is an ordinary required context.
+
+The job uses the existing pinned checkout action, the unchanged scoped
+environment wrapper, license verification, the **standalone Python-only mocked
+suite**, and `ci/windows-known-folder-diagnostic.py`. It does not run
+`ci/test-tooling.py`, tool selection, application Node, browser, Java/Gradle,
+FFmpeg, media/source access or a subsequent startup test. The pinned checkout
+action itself uses GitHub's standard **action-runtime Node**; that infrastructure
+is not an application/runtime/fixture Node invocation. No alternative bootstrap,
+cache/upload action, paid runner or automatic retry is introduced.
+
+Both the Python-only check step and the diagnostic step have a **one-minute**
+Actions timeout; the whole job has five minutes including checkout. The existing
+Actions job owns cancellation. There is no second killer, background owner or
+deadline extension. A finite count of synchronous Win32 calls is **not** a native
+API wall-clock guarantee. Timeout/missing output means failed/unknown evidence,
+not a missing directory, and never triggers a repair or another launch.
+
+#### Exact read-only observations
+
+On native64 Windows only (64-bit pointers, two-byte `wchar_t`), two separately
+recorded calls use explicit 32-bit HRESULT/int and DWORD declarations and a
+zeroed 260-wide-character buffer:
+
+1. `SHGetFolderPathW(NULL, 0x001c, NULL, 0, buffer)` — normal current lookup.
+2. `SHGetFolderPathW(NULL, 0x401c, NULL, 0, buffer)` — the same current lookup with
+   `CSIDL_FLAG_DONT_VERIFY`, **diagnosis only**, never browser admission.
+
+The fixed flags never include `CSIDL_FLAG_CREATE`. There is no SHSet/registry
+write, environment mutation, token change, folder redirection or directory
+repair. Both system DLLs (`shell32.dll`, `kernel32.dll`) and their dependencies
+use only
+[`LOAD_LIBRARY_SEARCH_SYSTEM32`](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw),
+not PATH, the checkout, a browser directory, or an environment-derived DLL path.
+
+The exact HRESULT is eight uppercase hexadecimal digits and has a separate
+FAILED bit. Failed-call output is never read. Positive nonzero HRESULT is not
+S_OK; its buffer is deliberately not consumed either. S_OK with empty output,
+unterminated output, invalid UTF-16 or a nonzero suffix after NUL is distinct from
+a usable path. No output buffer, path, path hash, username, error message or
+arbitrary environment value is printed.
+
+The executing source's lexical checkout root, with matching CWD, is the existing
+trust anchor, not an ambient project-root override. Ten boolean assertions check
+that root/CWD, the scoped marker, HOME, USERPROFILE, LOCALAPPDATA, APPDATA and
+TEMP/TMP/TMPDIR match the unchanged contract. They do not assert directory
+existence or Java's actual runtime settings. Existing `ci/scoped.sh` initialization
+still creates its ordinary base directories; `environmentChanged=false` and
+`directoriesCreated=0` describe the **diagnostic**, not checkout or that wrapper.
+In particular, no AppData, Local, Roaming or Chrome User Data directory is added
+to the wrapper. LOCALAPPDATA existence is not claimed if it was not observed.
+
+Paths are bounded ASCII local-drive forms with component-wise case-insensitive
+comparison, not raw string prefixes or Unicode casefold aliasing. UNC/device,
+relative, dot components, ADS, DOS-device names, trailing-dot/space aliases,
+non-ASCII and overlong forms are unsupported. Outside paths remain uninspected;
+`OUTSIDE_REPOSITORY_LOCAL` means **local-drive syntax**, not proof that an unknown
+outside drive is fixed media. No drive-type call is made for an outside return.
+
+One explicit
+[`GetDriveTypeW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdrivetypew)
+requires the checkout drive to be fixed media. A read-only root attribute check
+must show a non-reparse directory. Only then may
+[`GetFileAttributesW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesw)
+inspect either returned path **inside** the root or the two fixed candidates
+`.work/home/AppData` and `.work/home/AppData/Local`. The API reports a final
+symbolic link's own attributes. Every in-repo ancestor is checked before descent;
+an observed reparse point is rejected without reading descendants. No listing,
+contents, lock, `resolve()` or outside-path metadata read occurs. The root is one
+of at most **16 ancestor checks**, with at most **4 leaf checks** globally;
+case-equivalent paths and ancestors are deduplicated. An ancestor failure carries
+`at=ANCESTOR`, not a fabricated leaf lookup. A bound reached gives NOT_PROBED and
+INCOMPLETE, never MISSING.
+
+These are finite **point-in-time pathname checks**, not handle-relative atomic
+containment against hostile same-user renames or a check of ancestors above the
+trusted checkout root. Known-folder configuration and metadata can change after
+observation. No whole-Windows write containment or inferred browser diagnosis is
+claimed.
+
+#### Fixed receipt and interpretation
+
+Exactly one compact JSON line, including newline at most **4096 bytes**, has this
+complete field allowlist (all strings are fixed categories, never native values):
+
+- Top level: `schemaVersion`, `diagnostic`, `outcome`, `reason`, `browserLaunched`,
+  `environmentChanged`, `directoriesCreated`, `noBrowserAdmission`,
+  `environmentChecks`, `boundary`, `current`, `dontVerify`, `candidates`, `counts`.
+- `environmentChecks`: `scopedMarker`, `repositoryRoot`, `workingDirectory`,
+  `home`, `userProfile`, `localAppData`, `appData`, `temp`, `tmp`, `tmpdir` (booleans).
+- `boundary`: `driveType` (numeric/null) and `root` (metadata record).
+- `current` / `dontVerify`: `flags`, `attempted`, `hresult`, `failed`, `buffer`,
+  `nulTerminated`, `nonempty`, `pathClass`, `metadata`, `winError`.
+- `candidates`: `homeAppData`, `homeAppDataLocal` (metadata records).
+- Every metadata record: `state`, `winError`, `at` (`SELF`, `ANCESTOR`, `NONE`).
+- `counts`: `knownFolderAttempts`, `driveTypeChecks`, `leafChecks`, `ancestorChecks`.
+
+The six path classes are `EXACT_SCOPED_HOME_APPDATA_LOCAL`,
+`EXACT_SCOPED_LOCALAPPDATA_ENV`, `OTHER_INSIDE_REPOSITORY`,
+`OUTSIDE_REPOSITORY_LOCAL`, `NONLOCAL_OR_UNSUPPORTED`, `NO_USABLE_PATH`.
+Metadata states are `DIRECTORY`, `MISSING`, `NON_DIRECTORY`, `REPARSE_REJECTED`,
+`ACCESS_DENIED`, `OTHER_ERROR`, `NOT_PROBED`. Missing Win32 errors 2/3 are distinct
+from denied 5; other error codes are bounded unsigned integers or null. Unknown
+fields, added values, duplicate JSON keys, contradictory HRESULT/classification,
+invented admission and oversized receipts are rejected by the pure strict parser.
+If the report itself is lost/invalid, the fixed INVALID_REPORT fallback uses
+UNKNOWN buffers and **null** attempts/counts, not a false assertion of zero calls.
+
+`outcome=OBSERVED` / exit 0 means this diagnostic collected its finite observations,
+**including possibly failing HRESULTs**. It does not mean any test, browser,
+source, media or release gate passed. Refused/incomplete returns 78. Safety markers
+are always `browserLaunched=false`, `environmentChanged=false`,
+`directoriesCreated=0`, `noBrowserAdmission=true`. The Python tests exercise mocked
+System32 loading, exact flags/widths/buffers, metadata bounds/refusals, environment
+checks and privacy; no native DLL or known-folder call is used by those tests.
+
+Normal-fails/DONT_VERIFY-S_OK/exact-owned-missing-path evidence may motivate a
+**separate** minimal directory-initialization proposal. Denied/reparse/unknown,
+outside/unsupported paths, an already successful normal lookup, or a missing
+receipt do not authorize that repair. Even supported evidence requires review of
+the owned ancestors and scoped base directories, a separately authorized native
+before/after comparison, and only then a separately authorized unchanged original
+one-method Chromium test. Never create Chrome's default profile, restore a host
+home, bypass policy, weaken sandbox/offline flags, substitute DONT_VERIFY for the
+normal lookup, or automatically dispatch the next step. A later experiment cannot
+manufacture the unavailable HRESULT from the older failed run.
