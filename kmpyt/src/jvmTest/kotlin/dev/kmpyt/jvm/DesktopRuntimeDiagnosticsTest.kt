@@ -15,16 +15,17 @@ class DesktopRuntimeDiagnosticsTest {
 
     private fun scaledSlowBrowser(endpointAfterMs: Int?): String = helper("""
         const TestEmitter = require('node:events').EventEmitter;
+        const TestPipe = require('node:stream').PassThrough;
         // Scale authored/helper timers equally: 20s startup stays later than 15s and earlier than 30s.
         const actualTimer = globalThis.setTimeout;
         globalThis.setTimeout = (callback, ms, ...args) => actualTimer(callback, Math.max(1, Math.ceil(ms / 100)), ...args);
         require('node:child_process').spawn = () => {
           const child = new TestEmitter();
-          child.stderr = new TestEmitter(); child.exitCode = null;
+          child.stderr = new TestPipe(); child.exitCode = null; child.signalCode = null;
           child.kill = () => { child.exitCode = 1; child.emit('exit', 1); };
           ${if (endpointAfterMs == null) "" else """
           setTimeout(() => child.stderr.emit('data', Buffer.from(
-            'DevTools listening on ws://127.0.0.1:32123/devtools/browser/authored-slow-fixture\n')), $endpointAfterMs);
+            'DevTools listening on ws://127.0.0.1:32123/devtools/browser/00000000-0000-4000-8000-000000000001\n')), $endpointAfterMs);
           """.trimIndent()}
           return child;
         };
@@ -61,9 +62,10 @@ class DesktopRuntimeDiagnosticsTest {
     @Test fun browserStartupFailureReportsAStaticCodeWithoutChildErrorText() {
         val source = helper("""
             const TestEmitter = require('node:events').EventEmitter;
+            const TestPipe = require('node:stream').PassThrough;
             require('node:child_process').spawn = () => {
               const child = new TestEmitter();
-              child.stderr = new TestEmitter(); child.exitCode = null;
+              child.stderr = new TestPipe(); child.exitCode = null; child.signalCode = null;
               child.kill = () => { child.exitCode = 1; child.emit('exit', 1); };
               setImmediate(() => child.emit('error', new Error('authored-secret https://private.invalid/source')));
               return child;
@@ -80,12 +82,13 @@ class DesktopRuntimeDiagnosticsTest {
     @Test fun cdpFailureNamesTheAuthoredStageWithoutProtocolPayload() {
         val source = helper("""
             const TestEmitter = require('node:events').EventEmitter;
+            const TestPipe = require('node:stream').PassThrough;
             require('node:child_process').spawn = () => {
               const child = new TestEmitter();
-              child.stderr = new TestEmitter(); child.exitCode = null;
+              child.stderr = new TestPipe(); child.exitCode = null; child.signalCode = null;
               child.kill = () => { child.exitCode = 1; child.emit('exit', 1); };
               setImmediate(() => child.stderr.emit('data', Buffer.from(
-                'DevTools listening on ws://127.0.0.1:32123/devtools/browser/authored-fixture\n')));
+                'DevTools listening on ws://127.0.0.1:32123/devtools/browser/00000000-0000-4000-8000-000000000002\n')));
               return child;
             };
             globalThis.WebSocket = class {
