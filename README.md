@@ -69,6 +69,49 @@ of its child tracks. Channels/playlists may be browsed, but are not single-media
 download representations. Browse receipts preserve complete titles and stable public identities;
 they do not certify playback authorization or recording/album equivalence.
 
+### Owned native SABR playback resources
+
+SABR source URLs are POST protocol endpoints, not ordinary MP4/M4A URLs. For an actual
+selected static SABR `SourcePlaybackRequest`, native client factories expose
+`supportsSabrPlayback` and `suspend openPlayback(request, authorization)`. The caller must
+provide its real `SourcePlaybackAuthorization`; no implicit authorization/integrity issuer
+is installed. The existing `YouTubeSabrStreamingSession` is the sole media ingestion engine.
+
+```kotlin
+val resource = youtube.openPlayback(selectedSabrRequest, applicationAuthorization)
+try {
+    // Give the native decoder the exact endpoint for the selected AUDIO/VIDEO role.
+    // Never pass it the original SABR endpoint or persist/log the capability URL.
+    nativePlayer.prepare(resource.endpoints)
+    // Keep resource alive throughout playback, seeks and native callbacks.
+} finally {
+    nativePlayer.release() // Stop native access before releasing its private cache.
+    resource.close()
+}
+```
+
+The owned endpoint binds only numeric IPv4 loopback, uses a random 256-bit capability route,
+and supports exact GET/HEAD/single byte ranges with no-store responses. It serves only verified
+cached coverage, not sparse-file length, and rechecks the caller policy on actual media requests.
+It has bounded headers, connections, chunks and timeouts. `YouTubeNativePlaybackLimits` defaults
+to a 1-GiB static cache budget and four connections per resource; the client permits at most
+eight active/opening resources. Seeking waits for whole-track ingestion to reach the requested
+bytes; there is no invented live window or server-time-seek protocol. Loopback remains **remote
+source playback**, not an offline download.
+
+`resource.close()` cancels/joins owned readers and ingestion, closes listeners and removes its
+private cache. Client close also disposes any remaining resources before its transport. Unknown
+native release stays a failure on repeated close, never a successful deletion authorization.
+Custom hosts can inject `createJvmYouTubeSabrPlaybackAdapter`,
+`createAndroidYouTubeSabrPlaybackAdapter` or `createIosYouTubeSabrPlaybackAdapter`; they retain
+ownership of the HTTP client passed to those adapter factories. Mobile hosts must explicitly
+permit only the required local native transport according to their platform security policy.
+
+The 2026-11-06 focused JVM run passed 103 tests with explicit FFmpeg, including real loopback
+POST-to-range byte integrity and authored AAC decode/seek to a null sink. Android/iOS adapters
+and the Android resume mirror are authored, not yet platform-compiled/executed for this change.
+These tests do not establish authorized live YouTube playback, audible output or app completion.
+
 Retry a cancelled or interrupted download with the same selection and destination to resume
 validated private progress. JVM/Android schema-2 checkpoints additionally permit **standalone
 progressive** signing-URL refresh only when the selected media/format, exact origin/path/content

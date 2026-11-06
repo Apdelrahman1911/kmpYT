@@ -22,5 +22,6 @@ fun createIosYouTubeClient(): YouTubeClient {
         downloader = IosYouTubeDownloader(http),
         onClose = { http.close() },
         platformName = "iOS",
+        playbackAdapter = createIosYouTubeSabrPlaybackAdapter(http),
     )
 }

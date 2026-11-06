@@ -31,6 +31,7 @@ internal class IosMediaFile(val path: String, private val expected: Long? = null
     private val durableWrites: Boolean = false, existing: Boolean = false) : YouTubeSabrTrackSink {
     private var descriptor = open(path, O_RDWR or O_NOFOLLOW or (if (existing) 0 else (O_CREAT or O_EXCL)), 384)
     private var storageAllowance = 0L
+    private var closeFailure: IosMediaStorageException? = null
     var storageFailure: IosMediaStorageException? = null
         private set
     init { if (descriptor < 0) throw IosMediaStorageException("Could not create private media storage.") }
@@ -110,6 +111,17 @@ internal class IosMediaFile(val path: String, private val expected: Long? = null
     }
 
     fun close() {
-        if (descriptor >= 0) { close(descriptor); descriptor = -1 }
+        closeFailure?.let { throw it }
+        if (descriptor >= 0) {
+            val owned = descriptor
+            descriptor = -1
+            // A failed close leaves descriptor ownership uncertain. Do not
+            // retry a numeric descriptor that the OS may already have reused.
+            if (platform.posix.close(owned) != 0) {
+                val failure = IosMediaStorageException("Could not confirm release of private media storage.")
+                closeFailure = failure
+                throw failure
+            }
+        }
     }
 }

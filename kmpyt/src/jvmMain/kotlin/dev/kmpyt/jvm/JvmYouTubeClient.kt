@@ -40,5 +40,7 @@ fun createJvmYouTubeClient(ffmpegPath: String? = System.getenv("KMPYT_FFMPEG"),
         install(ContentEncoding) { gzip(); deflate() }
     }
     return YouTubeClient(KtorResearchTransport(http, maximumBytes = 8_000_000), runtime, JvmYouTubeDownloader(http, ffmpegPath),
-        onClose = { try { runtime.close() } finally { http.close() } }, platformName = "JVM")
+        onClose = { try { runtime.close() } finally { http.close() } }, platformName = "JVM",
+        playbackAdapter = createJvmYouTubeSabrPlaybackAdapter(http,
+            java.io.File(runtimeOptions.temporaryDirectory ?: System.getProperty("java.io.tmpdir")).canonicalPath))
 }
