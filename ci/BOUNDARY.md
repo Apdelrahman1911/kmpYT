@@ -12,6 +12,21 @@ This hygiene change removes known unauthorized system setup and artifact/cache u
 - SHA-pinned checkout5.0.1 disables persisted credentials, global safe-directory configuration and submodule helper use. Its transient checkout credential stays repository-local. Upgrades require another credential-path audit.
 - GitHub necessarily provisions the runner, retrieves action code, creates step/control files and records logs before disposing of the machine. These are service-controlled orchestration, **not permission for our commands** to write system/global files. The explicitly requested job-summary file is reporting only. No blanket exception applies to host services started by our tools.
 
+## Private-by-default JavaScript startup diagnostics
+
+The selected Node executable comes from `process.execPath`, not a Windows PATH
+shim. CI records only the actual Node/browser basenames, byte lengths, SHA256s
+and validated Node version. It does **not** launch a GUI browser with `--version`
+(which is not a reliable read-only operation on Windows), dump the environment,
+or print absolute tool paths. These identities describe existing tools, not a
+new browser version pin or native containment proof.
+
+JUnit summaries count a fixed allowlist of authored `OFFLINE_*` stage codes from
+failed testcases. Raw exception bodies, Chromium stderr, URLs, source variables
+and unknown codes remain private. A 30-second test failure interval alone does
+not establish its cause; the actual safe code and subsequent executed tests
+are needed. No timeout, browser sandbox or offline-network policy is relaxed.
+
 ## Honest failed native preflights
 
 Original JVM test/JAR, API29/35 instrumentation+AAR/lint, native iOS tests, UIKit-hosted WebKit tests and release XCFramework intent remains visible in the workflow. No continue-on-error, skip-ci, synthetic native success or protected-check override is added. Independent compile/package steps provide only that narrower evidence.

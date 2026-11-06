@@ -9,6 +9,9 @@ ROOT=Path(__file__).resolve().parents[1]
 SPEC=importlib.util.spec_from_file_location('ffmpeg_tool',ROOT/'ci/ffmpeg-tool.py')
 FFMPEG=importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FFMPEG)
+PROVENANCE_SPEC=importlib.util.spec_from_file_location('js_tool_provenance',ROOT/'ci/js-tool-provenance.py')
+PROVENANCE=importlib.util.module_from_spec(PROVENANCE_SPEC)
+PROVENANCE_SPEC.loader.exec_module(PROVENANCE)
 
 class ToolingTests(unittest.TestCase):
     def test_ci_runs_once_per_pr_update_and_keeps_all_checks(self):
@@ -101,5 +104,32 @@ class ToolingTests(unittest.TestCase):
             output.unlink()
             result=subprocess.run(['python3','-B',str(base/'ci/summary.py'),'--require-media'],capture_output=True,env=environment)
             self.assertNotEqual(result.returncode,0)
+
+    def test_tool_identity_is_read_only_and_omits_full_paths(self):
+        with tempfile.TemporaryDirectory(dir=ROOT/'.work/tmp') as temp:
+            base=Path(temp); tool=base/'authored-browser-fixture'
+            content=b'#!/bin/sh\nprintf launched > should-not-exist\n'
+            tool.write_bytes(content); tool.chmod(0o700)
+            result=PROVENANCE.identity(tool)
+            self.assertEqual(result,{'file':tool.name,'bytes':len(content),'sha256':hashlib.sha256(content).hexdigest()})
+            self.assertNotIn(str(base),json.dumps(result))
+            self.assertEqual(sorted(path.name for path in base.iterdir()),[tool.name])
+            with self.assertRaises(ValueError): PROVENANCE.identity(base)
+
+    def test_failure_summary_only_reports_allowlisted_stage_codes(self):
+        with tempfile.TemporaryDirectory(dir=ROOT/'.work/tmp') as temp:
+            base=Path(temp); (base/'ci').mkdir(); shutil.copy2(ROOT/'ci/summary.py',base/'ci/summary.py')
+            output=base/'kmpyt/build/test-results/jvmTest/TEST-fixture.xml'; output.parent.mkdir(parents=True)
+            output.write_text('''<testsuite tests="2" failures="2"><testcase name="one">
+                <failure message="OFFLINE_BROWSER_STARTUP_TIMEOUT">OFFLINE_BROWSER_STARTUP_TIMEOUT
+                SECRET_FIXTURE_TOKEN https://example.invalid/private?signature=secret OFFLINE_PRIVATE_VALUE
+                </failure></testcase><testcase name="two"><error>OFFLINE_CDP_TIMEOUT_EVALUATE_PROGRAM
+                /private/fixture/path</error></testcase></testsuite>''')
+            environment={k:v for k,v in os.environ.items() if k!='GITHUB_STEP_SUMMARY'}
+            result=subprocess.check_output(['python3','-B',str(base/'ci/summary.py')],env=environment,text=True)
+            self.assertIn('"OFFLINE_BROWSER_STARTUP_TIMEOUT": 1',result)
+            self.assertIn('"OFFLINE_CDP_TIMEOUT_EVALUATE_PROGRAM": 1',result)
+            for private in ('SECRET_FIXTURE_TOKEN','example.invalid','signature=secret','OFFLINE_PRIVATE_VALUE','/private/fixture/path'):
+                self.assertNotIn(private,result)
 
 if __name__=='__main__': unittest.main(verbosity=2)
