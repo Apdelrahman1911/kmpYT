@@ -14,6 +14,7 @@ import java.io.IOException
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 
 internal class StaleDownloadException : IOException("Download operation was superseded.")
 internal class PermanentDownloadException(message: String) : IOException(message)
@@ -28,6 +29,8 @@ internal data class FileTransferRequest(
     val lastModified: String? = null,
     /** Exact inspected length, kept separate from a previous response/checkpoint's total. */
     val expectedBytes: Long? = null,
+    val requireStrongResume: Boolean = false,
+    val resumeResponseScope: String? = null,
 )
 
 internal data class TransferProgress(
@@ -36,9 +39,12 @@ internal data class TransferProgress(
     val speedBytesPerSecond: Long,
     val etag: String?,
     val lastModified: String?,
+    val prefixDigest: String? = null,
+    val responseScope: String? = null,
 )
 
-internal data class TransferOutcome(val bytes: Long, val total: Long?, val etag: String?, val lastModified: String?)
+internal data class TransferOutcome(val bytes: Long, val total: Long?, val etag: String?, val lastModified: String?,
+    val prefixDigest: String? = null, val responseScope: String? = null)
 
 /** Both complete files and explicit byte ranges must contain the requested unencoded media. */
 internal fun requireMediaResponse(connection: HttpURLConnection) {
@@ -92,6 +98,7 @@ internal class HttpDownloadTransfer(
         var storedEtag = task.etag
         var storedModified = task.lastModified
         if (offset > 0 && DownloadProtocol.strongValidator(storedEtag, storedModified) == null) offset = 0
+        if (offset > 0 && task.requireStrongResume && strongResumeEtag(storedEtag) == null) offset = 0
         var restarted = false
         suspend fun restart(reason: String) {
             if (restarted) throw PermanentDownloadException(reason)
@@ -114,6 +121,14 @@ internal class HttpDownloadTransfer(
                 }
                 val etag = connection.getHeaderField("ETag")
                 val modified = connection.getHeaderField("Last-Modified")
+                val responseScope = if (task.requireStrongResume)
+                    progressiveResourceScope(connection.url.toExternalForm(), task.transferPlan.mediaId, allowLocalHttp) else null
+                if (task.requireStrongResume && offset > 0 && status in setOf(206, 416) &&
+                    (strongResumeEtag(etag) == null || strongResumeEtag(etag) != strongResumeEtag(storedEtag) ||
+                        responseScope != task.resumeResponseScope)) {
+                    restart("The refreshed resource has no matching strong, source-scoped validator.")
+                    continue
+                }
                 val length = mediaContentLength(connection)
                 val plan = DownloadProtocol.plan(offset, status, connection.getHeaderField("Content-Range"), length, storedEtag, storedModified, etag, modified)
                 when (plan) {
@@ -131,7 +146,8 @@ internal class HttpDownloadTransfer(
                             continue
                         }
                         checkCurrent()
-                        return@withContext TransferOutcome(offset, offset, etag ?: storedEtag, modified ?: storedModified)
+                        return@withContext TransferOutcome(offset, offset, etag ?: storedEtag, modified ?: storedModified,
+                            prefixDigest = if (task.requireStrongResume) prefixDigest(partial, offset) else null, responseScope = responseScope)
                     }
                     is DownloadProtocol.ResponsePlan.Transfer -> {
                         val oldStrongEtag = DownloadProtocol.strongValidator(task.etag, null)
@@ -151,6 +167,10 @@ internal class HttpDownloadTransfer(
                         // Chunked full responses and ranges can omit the object size. Preserve
                         // the inspected/checkpoint total so EOF cannot certify a short prefix.
                         val total = plan.total ?: knownTotal
+                        if (status == 206 && task.requireStrongResume && total != null &&
+                            DownloadProtocol.parseContentRange(connection.getHeaderField("Content-Range"))?.last != total - 1) {
+                            throw PermanentDownloadException("The resumed response does not cover the exact remaining media range.")
+                        }
                         if (status == 206 && total == null) {
                             // EOF cannot prove that an unknown-size partial is the whole file.
                             // Retry once without Range and require an unambiguous response.
@@ -162,7 +182,10 @@ internal class HttpDownloadTransfer(
                         var bytes = plan.offset
                         val effectiveEtag = etag ?: storedEtag.takeIf { plan.append }
                         val effectiveModified = modified ?: storedModified.takeIf { plan.append }
-                        onProgress(TransferProgress(bytes, total, 0, effectiveEtag, effectiveModified))
+                        val prefix = if (task.requireStrongResume) MessageDigest.getInstance("SHA-256").also {
+                            if (plan.append) updateResumeDigest(it, partial, bytes)
+                        } else null
+                        onProgress(TransferProgress(bytes, total, 0, effectiveEtag, effectiveModified, prefix?.resumeSnapshot(), responseScope))
                         val started = System.nanoTime()
                         var lastReport = started
                         var lastBytes = bytes
@@ -194,11 +217,13 @@ internal class HttpDownloadTransfer(
                                         throw PermanentDownloadException("Could not write the media file. Check free storage and try again.")
                                     }
                                     bytes += count
+                                    prefix?.update(buffer, 0, count)
                                     val now = System.nanoTime()
                                     if (lastBytes == plan.offset || now - lastReport >= 400_000_000L) {
                                         val elapsed = (now - lastReport).coerceAtLeast(1)
                                         speed = ((bytes - lastBytes).toDouble() * 1_000_000_000.0 / elapsed).toLong()
-                                        onProgress(TransferProgress(bytes, total, speed, effectiveEtag, effectiveModified))
+                                        if (prefix != null) destination.fd.sync()
+                                        onProgress(TransferProgress(bytes, total, speed, effectiveEtag, effectiveModified, prefix?.resumeSnapshot(), responseScope))
                                         lastBytes = bytes
                                         lastReport = now
                                     }
@@ -208,11 +233,12 @@ internal class HttpDownloadTransfer(
                         }
                         checkCurrent()
                         if (bytes == 0L) throw PermanentDownloadException("The server returned an empty media file.")
-                        onProgress(TransferProgress(bytes, total ?: bytes, speed, effectiveEtag, effectiveModified))
+                        val committedDigest = prefix?.digest()?.resumeHex()
+                        onProgress(TransferProgress(bytes, total ?: bytes, speed, effectiveEtag, effectiveModified, committedDigest, responseScope))
                         if (total != null && bytes != total) {
                             throw RetryableDownloadException("Connection ended before the complete media file arrived.")
                         }
-                        return@withContext TransferOutcome(bytes, total ?: bytes, effectiveEtag, effectiveModified)
+                        return@withContext TransferOutcome(bytes, total ?: bytes, effectiveEtag, effectiveModified, committedDigest, responseScope)
                     }
                 }
             } finally {

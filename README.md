@@ -69,7 +69,26 @@ of its child tracks. Channels/playlists may be browsed, but are not single-media
 download representations. Browse receipts preserve complete titles and stable public identities;
 they do not certify playback authorization or recording/album equivalence.
 
-Retry a cancelled or interrupted download with the same selection and destination to resume validated private progress. On iOS, HTTP resume requires a strong response validator; changed or unverifiable resources restart safely. Refreshed signing parameters can retain progress when the selected media, resource scope and validator still match. SABR checkpoints retain byte receipts and start a fresh protocol session; a changed source generation restarts. iOS checkpoints contain hashes and byte counts rather than signed URLs, headers or session tokens. The host app owns background scheduling and must keep the destination directory available.
+Retry a cancelled or interrupted download with the same selection and destination to resume
+validated private progress. JVM/Android schema-2 checkpoints additionally permit **standalone
+progressive** signing-URL refresh only when the selected media/format, exact origin/path/content
+query, strong quoted ETag, actual redirected response scope and committed-prefix SHA-256 still
+match. Uncommitted tails are truncated; retained complete parts are revalidated too. Query
+order, duplicate/empty pairs and raw encoding remain identity-bearing. Only documented exact
+lowercase signing keys on Googlevideo (or explicit authored loopback tests) are excluded.
+Changed/unverifiable identity restarts; legacy schema-1 checkpoints require the exact old plan.
+SABR and multi-resource plans retain their existing exact-plan/generation bindings rather than
+borrowing this progressive identity rule. iOS has a separate checkpoint implementation; these
+new JVM/Android prefix/scope guarantees are not a claim of iOS parity.
+
+JVM/Android checkpoint roots must remain caller-private. Symlinks, special files and oversized
+trees fail before reset/cleanup. After success, media/checkpoint data is purged **while holding
+the OS lock**; the empty reusable `.<destination-name>.kmpyt/lock` inode and its parent remain.
+Do not unlink/recreate that lock while any process may reuse the destination: doing so can let
+two processes lock different inodes for one path. A host may remove a retired private generation
+only under a stronger external lifetime fence proving that no current or future writer can
+reuse it. The host owns background scheduling and persistent job state. Checkpoints contain
+hashes/receipts, not signed URLs or an application library database.
 
 ## Current limitations
 
