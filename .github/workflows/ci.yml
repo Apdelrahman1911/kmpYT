@@ -53,12 +53,12 @@ jobs:
           persist-credentials: false
           set-safe-directory: false
           submodules: false
-      - name: Verify shared and desktop code using existing read-only tools
+      - name: Verify shared and desktop code with read-only or pinned repository-owned tools
         run: |
           ci/scoped.sh bash -euo pipefail -c '
             source ci/select-tools.sh jvm
             ci/gradle.sh :kmpyt:jvmTest :kmpyt:jvmJar --stacktrace
-            python3 -B ci/summary.py --require-executed
+            python3 -B ci/summary.py --require-executed --require-media
           '
       - name: Summarize without artifact/cache uploads
         if: ${{ always() && steps.checkout.outcome == 'success' }}
