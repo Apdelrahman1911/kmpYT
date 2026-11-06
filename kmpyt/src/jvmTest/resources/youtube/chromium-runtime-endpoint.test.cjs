@@ -167,6 +167,41 @@ test('stderr discovery is preserved and later process errors are harmless', asyn
   assert.equal(f.clock.pending(), 0);
 });
 
+test('stderr uses the same strict port UUID and whole-line rules as the owned file', async t => {
+  const f = fixture(t);
+  const pending = f.discoverBrowserEndpoint(f.child);
+  for (const value of [endpoint.replace(':43123', ':0'), endpoint.replace(':43123', ':65536'),
+    endpoint.replace(':43123', ':043123'), endpoint + '?secret=fixture', endpoint + '/suffix',
+    endpoint.slice(0, -1), 'prefix ' + endpoint, endpoint.replace('127.0.0.1', 'user:secret@127.0.0.1')]) {
+    f.child.stderr.emit('data', Buffer.from('DevTools listening on ' + value + '\n'));
+    assert.equal(f.clock.pending(), 2, value);
+  }
+  f.clock.advance(30000);
+  await assert.rejects(pending, /OFFLINE_BROWSER_STARTUP_TIMEOUT/);
+});
+
+test('stderr chunks require a complete newline-terminated announcement including CRLF', async t => {
+  const f = fixture(t);
+  const pending = f.discoverBrowserEndpoint(f.child);
+  const line = 'DevTools listening on ' + endpoint;
+  f.child.stderr.emit('data', Buffer.from(line.slice(0, -8)));
+  assert.equal(f.clock.pending(), 2);
+  f.child.stderr.emit('data', Buffer.from(line.slice(-8)));
+  assert.equal(f.clock.pending(), 2);
+  f.child.stderr.emit('data', Buffer.from('\r\n'));
+  assert.equal(await pending, endpoint);
+  assert.equal(f.clock.pending(), 0);
+});
+
+test('stderr from an already exited child cannot select an endpoint', async t => {
+  const f = fixture(t);
+  const pending = f.discoverBrowserEndpoint(f.child);
+  f.child.exitCode = 0;
+  f.child.stderr.emit('data', Buffer.from('DevTools listening on ' + endpoint + '\n'));
+  await assert.rejects(pending, /OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT/);
+  assert.equal(f.clock.pending(), 0);
+});
+
 test('partially written port file is retried, never treated as a complete target', async t => {
   const f = fixture(t);
   const pending = f.discoverBrowserEndpoint(f.child);

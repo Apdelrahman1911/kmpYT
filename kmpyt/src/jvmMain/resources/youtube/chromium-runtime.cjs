@@ -78,9 +78,17 @@ function discoverBrowserEndpoint(child) {
     const timer = setTimeout(() => finish(failure('OFFLINE_BROWSER_STARTUP_TIMEOUT')), 30000);
     const onExit = () => finish(failure('OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT'));
     const onData = data => {
+      if (child.exitCode !== null || child.signalCode !== null) return onExit();
       text = (text + data.toString()).slice(-16000);
-      const match = /DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[a-zA-Z0-9-]+)/.exec(text);
-      if (match) finish(undefined, match[1]);
+      const lines = text.split('\n');
+      // Chromium's stderr announcement is newline-terminated. Never accept an
+      // unfinished line or a prefix of an invalid UUID/path across pipe chunks.
+      text = lines.pop();
+      for (const line of lines) {
+        const match = /^DevTools listening on ws:\/\/127\.0\.0\.1:([0-9]+)(\/\S+)\r?$/.exec(line);
+        const endpoint = match && activePortEndpoint(match[1] + '\n' + match[2]);
+        if (endpoint) return finish(undefined, endpoint);
+      }
     };
     // Leave the once-error handler attached after success so a later process
     // error cannot become an unhandled EventEmitter error containing paths.

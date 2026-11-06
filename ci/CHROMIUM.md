@@ -5,8 +5,10 @@ proxy/Fetch/CSP policy, 30-second startup allowance and individual CDP/JavaScrip
 limits. It still accepts the launched browser's loopback stderr announcement.
 In parallel it polls `DevToolsActivePort` in that session's freshly created,
 previously empty profile. No caller-supplied host or WebSocket URL is accepted
-from the file: only port 1–65535 plus the complete browser UUID path can produce
+from either channel: only port 1–65535 plus the complete browser UUID path can produce
 an endpoint, and its host is always literal `127.0.0.1`.
+Stderr announcements must be complete newline-terminated lines from a still-live
+child, not a prefix of a malformed or partially delivered URL.
 
 Chromium writes this file for ChromeDriver and Telemetry alongside its stderr
 announcement; see the upstream [`DevToolsHttpHandler` implementation](https://chromium.googlesource.com/chromium/src/+/main/content/browser/devtools/devtools_http_handler.cc).
