@@ -119,7 +119,9 @@ class DesktopYouTubeJavaScriptRuntime internal constructor(private val helperSou
                 val result = Json.parseToJsonElement(line).jsonObject
                 if (result["ok"]?.jsonPrimitive?.booleanOrNull != true) {
                     val code = result["error"]?.jsonPrimitive?.content?.takeIf { it.length <= 128 && Regex("[A-Za-z0-9_$:-]+").matches(it) }
-                    throw YouTubeJavaScriptFailure(code ?: "OFFLINE_RUNTIME_FAILURE")
+                    val failure = YouTubeJavaScriptFailure(code ?: "OFFLINE_RUNTIME_FAILURE")
+                    startupObservationReceipt(failure.code, result["startup"])?.let(failure::addSuppressed)
+                    throw failure
                 }
                 return result
             } catch (failure: YouTubeJavaScriptFailure) { throw failure }
@@ -182,6 +184,45 @@ class DesktopYouTubeJavaScriptRuntime internal constructor(private val helperSou
         private fun waitFor(handles: List<ProcessHandle>, milliseconds: Long) {
             val deadline = System.nanoTime() + milliseconds * 1_000_000
             while (handles.any { it.isAlive } && System.nanoTime() < deadline) Thread.sleep(20)
+        }
+    }
+
+    /** Supplemental observations, not another failure or a raw helper exception/cause. */
+    private class StartupObservationReceipt(code: String, observations: List<String>) : RuntimeException(
+        "KMPYT_BROWSER_STARTUP_V1[$code;${observations.joinToString(",")}]", null, false, false)
+
+    private companion object {
+        val startupFailureCodes = setOf(
+            "OFFLINE_BROWSER_STARTUP_TIMEOUT", "OFFLINE_BROWSER_SPAWN_FAILED",
+            "OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT", "OFFLINE_BROWSER_ENDPOINT_FILE_INVALID", "OFFLINE_PROFILE_INVALID")
+        val startupSpawnCodes = setOf("OFFLINE_STARTUP_SPAWN_OBSERVED", "OFFLINE_STARTUP_SPAWN_UNOBSERVED")
+        val startupChildCodes = setOf("OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED", "OFFLINE_STARTUP_CHILD_EXIT_OBSERVED",
+            "OFFLINE_STARTUP_CHILD_UNCONFIRMED")
+        val startupStderrCodes = setOf("OFFLINE_STARTUP_STDERR_NONE", "OFFLINE_STARTUP_STDERR_SOME",
+            "OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT", "OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT")
+        val startupPortCodes = setOf("OFFLINE_STARTUP_PORT_UNCHECKED", "OFFLINE_STARTUP_PORT_MISSING",
+            "OFFLINE_STARTUP_PORT_ACCESS_DENIED", "OFFLINE_STARTUP_PORT_BUSY",
+            "OFFLINE_STARTUP_PORT_INCOMPLETE_OR_UNRECOGNIZED", "OFFLINE_STARTUP_PORT_VALID", "OFFLINE_STARTUP_PORT_FILE_REJECTED")
+        val startupCodes = startupSpawnCodes + startupChildCodes + startupStderrCodes + startupPortCodes
+
+        fun startupObservationReceipt(code: String, value: JsonElement?): StartupObservationReceipt? {
+            if (code !in startupFailureCodes) return null
+            val array = value as? JsonArray ?: return null
+            if (array.size !in 4..8) return null
+            val observations = array.map { (it as? JsonPrimitive)?.takeIf { primitive -> primitive.isString }?.content ?: return null }
+            if (observations.any { it !in startupCodes } || observations.distinct().size != observations.size) return null
+            fun count(group: Set<String>) = observations.count { it in group }
+            if (count(startupSpawnCodes) != 1 || count(startupChildCodes) != 1 || count(startupStderrCodes) != 1 ||
+                count(startupPortCodes) < 1 ||
+                ("OFFLINE_STARTUP_PORT_UNCHECKED" in observations && count(startupPortCodes) != 1) ||
+                ("OFFLINE_STARTUP_SPAWN_UNOBSERVED" in observations && "OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED" in observations) ||
+                ("OFFLINE_STARTUP_SPAWN_OBSERVED" in observations && "OFFLINE_STARTUP_CHILD_UNCONFIRMED" in observations) ||
+                (code == "OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT" && "OFFLINE_STARTUP_CHILD_EXIT_OBSERVED" !in observations) ||
+                ((code == "OFFLINE_BROWSER_ENDPOINT_FILE_INVALID") != ("OFFLINE_STARTUP_PORT_FILE_REJECTED" in observations)) ||
+                "OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT" in observations || "OFFLINE_STARTUP_PORT_VALID" in observations) return null
+            // Keep the original public failure code unchanged. Only this finite,
+            // whole validated receipt reaches the suppressed JUnit diagnostic.
+            return StartupObservationReceipt(code, observations)
         }
     }
 }

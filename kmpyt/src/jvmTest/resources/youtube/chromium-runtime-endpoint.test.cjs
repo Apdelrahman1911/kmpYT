@@ -56,7 +56,7 @@ function fixture(t, fsOverrides = {}) {
       return require(name);
     }
   };
-  vm.runInNewContext(source + '\nmodule.exports={activePortEndpoint,readActivePortEndpoint,discoverBrowserEndpoint,start,setProfile(value){profile=value;}};', context);
+  vm.runInNewContext(source + '\nmodule.exports={activePortEndpoint,readActivePortEndpoint,discoverBrowserEndpoint,failureResponse,start,setProfile(value){profile=value;}};', context);
   const api = context.module.exports;
   api.setProfile(profile);
   return { ...api, directory, profile, activePort, child, clock, spawns };
@@ -154,6 +154,7 @@ test('fresh file discovers an endpoint without browser stderr and clears timers'
   f.clock.advance(25);
   assert.equal(await pending, endpoint);
   assert.equal(f.clock.pending(), 0);
+  assert.equal(f.child.listenerCount('spawn'), 0);
   assert.equal(f.child.listenerCount('exit'), 0);
   assert.equal(f.child.stderr.listenerCount('data'), 0);
 });
@@ -287,4 +288,161 @@ test('startup does not alter the browser sandbox or original offline arguments',
   assert.equal(options.windowsHide, true);
   f.clock.advance(30000);
   await assert.rejects(pending, /OFFLINE_BROWSER_STARTUP_TIMEOUT/);
+});
+
+const pendingObservations = [
+  'OFFLINE_STARTUP_SPAWN_UNOBSERVED', 'OFFLINE_STARTUP_CHILD_UNCONFIRMED',
+  'OFFLINE_STARTUP_STDERR_NONE', 'OFFLINE_STARTUP_PORT_MISSING'
+];
+
+function assertReceipt(f, error, expected) {
+  assert.deepEqual(Array.from(error.startup), expected);
+  assert.equal(Object.isFrozen(error.startup), true);
+  const serialized = JSON.stringify(f.failureResponse(error));
+  assert.ok(serialized.length <= 1024, 'The symbolic response must stay bounded');
+  assert.deepEqual(JSON.parse(serialized), { ok: false, error: error.safeCode, startup: expected });
+  for (const privateValue of [f.profile, endpoint, uuid, 'authored-secret', 'private.invalid', 'signature=fixture']) {
+    assert.equal(serialized.includes(privateValue), false);
+  }
+  return true;
+}
+
+test('owned reader observations distinguish missing access busy unrecognized and valid without raw content', t => {
+  for (const [code, token] of [['ENOENT', 'OFFLINE_STARTUP_PORT_MISSING'], ['EACCES', 'OFFLINE_STARTUP_PORT_ACCESS_DENIED'],
+    ['EPERM', 'OFFLINE_STARTUP_PORT_ACCESS_DENIED'], ['EBUSY', 'OFFLINE_STARTUP_PORT_BUSY']]) {
+    const observed = [];
+    const f = fixture(t, { lstatSync(filename) {
+      if (path.basename(filename) === 'DevToolsActivePort') throw Object.assign(new Error('authored-secret'), { code });
+      return fs.lstatSync(filename);
+    } });
+    assert.equal(f.readActivePortEndpoint(value => observed.push(value)), undefined);
+    assert.deepEqual(observed, [token]);
+  }
+  const f = fixture(t), observed = [];
+  fs.writeFileSync(f.activePort, 'authored-secret https://private.invalid/source?signature=fixture');
+  assert.equal(f.readActivePortEndpoint(value => observed.push(value)), undefined);
+  fs.writeFileSync(f.activePort, portFile);
+  assert.equal(f.readActivePortEndpoint(value => observed.push(value)), endpoint);
+  assert.deepEqual(observed, ['OFFLINE_STARTUP_PORT_INCOMPLETE_OR_UNRECOGNIZED', 'OFFLINE_STARTUP_PORT_VALID']);
+});
+
+test('timeout captures cumulative port observations without post-deadline I/O or later mutation', async t => {
+  let condition, reads = 0;
+  const f = fixture(t, { lstatSync(filename) {
+    if (path.basename(filename) === 'DevToolsActivePort') {
+      reads++;
+      if (condition) throw Object.assign(new Error('authored-secret'), { code: condition });
+    }
+    return fs.lstatSync(filename);
+  } });
+  const pending = f.discoverBrowserEndpoint(f.child);
+  f.child.emit('spawn');
+  condition = 'EACCES'; f.clock.advance(25);
+  condition = 'EBUSY'; f.clock.advance(25);
+  condition = undefined; fs.writeFileSync(f.activePort, '43123\n/devtools/browser/partial'); f.clock.advance(25);
+  f.clock.advance(29999 - 75);
+  const before = reads;
+  assert.equal(f.clock.pending(), 2);
+  f.clock.advance(1);
+  let captured;
+  await assert.rejects(pending, error => {
+    captured = error;
+    assert.equal(error.safeCode, 'OFFLINE_BROWSER_STARTUP_TIMEOUT');
+    return assertReceipt(f, error, ['OFFLINE_STARTUP_SPAWN_OBSERVED', 'OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED',
+      'OFFLINE_STARTUP_STDERR_NONE', 'OFFLINE_STARTUP_PORT_MISSING', 'OFFLINE_STARTUP_PORT_ACCESS_DENIED',
+      'OFFLINE_STARTUP_PORT_BUSY', 'OFFLINE_STARTUP_PORT_INCOMPLETE_OR_UNRECOGNIZED']);
+  });
+  assert.equal(reads, before);
+  const snapshot = JSON.stringify(captured.startup);
+  f.child.exitCode = 0; f.child.emit('exit', 0);
+  f.child.stderr.emit('data', Buffer.from('authored-secret\n'));
+  fs.writeFileSync(f.activePort, portFile); f.clock.advance(100);
+  assert.equal(reads, before);
+  assert.equal(JSON.stringify(captured.startup), snapshot);
+  assert.equal(f.clock.pending(), 0);
+  assert.equal(f.child.listenerCount('spawn'), 0);
+});
+
+test('null child exit fields without a spawn event remain unconfirmed rather than claiming liveness', async t => {
+  const f = fixture(t);
+  const pending = f.discoverBrowserEndpoint(f.child);
+  f.clock.advance(30000);
+  await assert.rejects(pending, error => assertReceipt(f, error, pendingObservations));
+});
+
+test('spawn failure and exit snapshots contain only event and field observations', async t => {
+  const failed = fixture(t), failure = failed.discoverBrowserEndpoint(failed.child);
+  failed.child.emit('error', new Error('authored-secret https://private.invalid/source'));
+  await assert.rejects(failure, error => {
+    assert.equal(error.safeCode, 'OFFLINE_BROWSER_SPAWN_FAILED');
+    return assertReceipt(failed, error, pendingObservations);
+  });
+  const exited = fixture(t), pending = exited.discoverBrowserEndpoint(exited.child);
+  exited.child.emit('spawn'); exited.child.exitCode = 0; exited.child.emit('exit', 0);
+  await assert.rejects(pending, error => {
+    assert.equal(error.safeCode, 'OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT');
+    return assertReceipt(exited, error, ['OFFLINE_STARTUP_SPAWN_OBSERVED', 'OFFLINE_STARTUP_CHILD_EXIT_OBSERVED',
+      'OFFLINE_STARTUP_STDERR_NONE', 'OFFLINE_STARTUP_PORT_MISSING']);
+  });
+});
+
+test('stderr observations distinguish none some and invalid complete announcements without retaining bytes', async t => {
+  for (const [data, stderr] of [
+    ['', 'OFFLINE_STARTUP_STDERR_NONE'],
+    ['authored-secret '.repeat(20000), 'OFFLINE_STARTUP_STDERR_SOME'],
+    ['DevTools listening on ws://private.invalid:43123' + browserPath + '?signature=fixture\n', 'OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT']
+  ]) {
+    const f = fixture(t), pending = f.discoverBrowserEndpoint(f.child);
+    f.child.emit('spawn'); f.child.stderr.emit('data', Buffer.from(data));
+    f.clock.advance(30000);
+    await assert.rejects(pending, error => assertReceipt(f, error, [
+      'OFFLINE_STARTUP_SPAWN_OBSERVED', 'OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED', stderr, 'OFFLINE_STARTUP_PORT_MISSING'
+    ]));
+  }
+});
+
+test('file integrity rejection is distinct from incomplete or unrecognized bounded content', async t => {
+  const f = fixture(t), pending = f.discoverBrowserEndpoint(f.child);
+  f.child.emit('spawn');
+  fs.writeFileSync(f.activePort, 'authored-secret'); f.clock.advance(25);
+  fs.writeFileSync(f.activePort, Buffer.alloc(1025)); f.clock.advance(25);
+  await assert.rejects(pending, error => {
+    assert.equal(error.safeCode, 'OFFLINE_BROWSER_ENDPOINT_FILE_INVALID');
+    return assertReceipt(f, error, ['OFFLINE_STARTUP_SPAWN_OBSERVED', 'OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED',
+      'OFFLINE_STARTUP_STDERR_NONE', 'OFFLINE_STARTUP_PORT_MISSING',
+      'OFFLINE_STARTUP_PORT_INCOMPLETE_OR_UNRECOGNIZED', 'OFFLINE_STARTUP_PORT_FILE_REJECTED']);
+  });
+});
+
+test('sender drops whole malformed oversized unknown duplicate and contradictory receipts', t => {
+  const f = fixture(t), code = 'OFFLINE_BROWSER_STARTUP_TIMEOUT';
+  const malformed = [null, {}, 'authored-secret', [], [true, ...pendingObservations.slice(1)],
+    [...pendingObservations, 'OFFLINE_STARTUP_PRIVATE_VALUE'],
+    [...pendingObservations, 'authored-secret https://private.invalid/source'],
+    [...pendingObservations, pendingObservations[3]], Array(9).fill('OFFLINE_STARTUP_PORT_MISSING'),
+    [...pendingObservations, 'OFFLINE_STARTUP_SPAWN_OBSERVED'], [...pendingObservations, 'OFFLINE_STARTUP_CHILD_EXIT_OBSERVED'],
+    [...pendingObservations, 'OFFLINE_STARTUP_STDERR_SOME'], [...pendingObservations, 'OFFLINE_STARTUP_PORT_UNCHECKED'],
+    pendingObservations.map(value => value === 'OFFLINE_STARTUP_CHILD_UNCONFIRMED' ? 'OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED' : value),
+    pendingObservations.map(value => value === 'OFFLINE_STARTUP_SPAWN_UNOBSERVED' ? 'OFFLINE_STARTUP_SPAWN_OBSERVED' : value),
+    pendingObservations.map(value => value === 'OFFLINE_STARTUP_STDERR_NONE' ? 'OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT' : value),
+    pendingObservations.map(value => value === 'OFFLINE_STARTUP_PORT_MISSING' ? 'OFFLINE_STARTUP_PORT_VALID' : value),
+    [...pendingObservations, 'OFFLINE_STARTUP_PORT_FILE_REJECTED']
+  ];
+  for (const startup of malformed) {
+    const response = f.failureResponse({ safeCode: code, startup, message: 'authored-secret' });
+    assert.deepEqual(JSON.parse(JSON.stringify(response)), { ok: false, error: code });
+  }
+});
+
+test('sender requires matching discovery stage and never copies additional error or array properties', t => {
+  const f = fixture(t);
+  for (const code of ['OFFLINE_CDP_CONNECTION_FAILED', 'OFFLINE_INPUT_INVALID', 'OFFLINE_RUNTIME_FAILURE',
+    'OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT', 'OFFLINE_BROWSER_ENDPOINT_FILE_INVALID']) {
+    assert.deepEqual(JSON.parse(JSON.stringify(f.failureResponse({ safeCode: code, startup: pendingObservations }))),
+      { ok: false, error: code });
+  }
+  const startup = [...pendingObservations]; startup.private = 'authored-secret';
+  const response = f.failureResponse({ safeCode: 'OFFLINE_BROWSER_STARTUP_TIMEOUT', startup,
+    stack: 'authored-secret https://private.invalid/source', cause: new Error('authored-secret') });
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { ok: false, error: 'OFFLINE_BROWSER_STARTUP_TIMEOUT', startup: pendingObservations });
 });

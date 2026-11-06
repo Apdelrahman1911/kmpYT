@@ -26,12 +26,26 @@ failed testcases. Raw exception bodies, Chromium stderr, URLs, source variables
 and unknown codes remain private. A 30-second test failure interval alone does
 not establish its cause; the actual safe code and subsequent executed tests
 are needed. No timeout, browser sandbox or offline-network policy is relaxed.
+Discovery-stage failures can also carry a bounded, fixed-token startup receipt
+as one stackless JVM suppressed diagnostic. Summaries validate its complete
+envelope and matching primary code before counting observations, never known
+words found arbitrarily in raw text. Null child exit fields without an observed
+spawn remain unconfirmed; event observations are not an OS liveness proof. See
+`ci/CHROMIUM.md` for the receipt/privacy contract and browser-free regressions.
 
 ## Honest failed native preflights
 
 Original JVM test/JAR, API29/35 instrumentation+AAR/lint, native iOS tests, UIKit-hosted WebKit tests and release XCFramework intent remains visible in the workflow. No continue-on-error, skip-ci, synthetic native success or protected-check override is added. Independent compile/package steps provide only that narrower evidence.
 
 `ci/native-boundary.sh` returns nonzero **before native runtime launch** until an independently reviewed harness replaces the unsafe defaults. This is a failed required gate, not a passing replacement check or an opt-in boolean bypass.
+
+Independent pre-gate steps compile Android instrumented Kotlin sources with
+`:kmpyt:compileDebugAndroidTestKotlinAndroid` and iOS simulator Kotlin test sources
+with `:kmpyt:compileTestKotlinIosX64`. Framework/AAR assembly alone does not compile
+those source sets. These compile steps remain visible even after another build
+step fails, do not run a device/simulator, and do not replace the unchanged
+required native execution gates or UIKit-hosted WebKit tests. A successful test
+source compilation still means **zero native tests executed**.
 
 Android still needs an audited owned AVD/image launcher, private adb server/port, owned process cleanup and proven backing for hard-coded scratch paths. Existing KVM permissions may be inspected but no udev/sysctl change is allowed. API29/35 tests remain unexecuted until verified.
 
