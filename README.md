@@ -46,6 +46,16 @@ try {
 
 Call these suspending methods from a coroutine. Reuse a client to benefit from its player cache, then close it when its owner ends. Desktop execution requires Node.js 22 and Chrome/Chromium or Edge; set `KMPYT_NODE` and `KMPYT_CHROMIUM` for nonstandard locations. Pass an FFmpeg executable path when combining separate tracks.
 
+For application-owned runtime provisioning, pass `runtimeOptions = DesktopYouTubeRuntimeOptions(
+nodeExecutable = absoluteNodePath, chromiumExecutable = absoluteChromiumPath,
+temporaryDirectory = absolutePrivateTempPath)` to `createJvmYouTubeClient`. Explicit executable
+paths must already exist and be executable; the private temporary directory must exist and be
+writable. Invalid explicit paths fail rather than silently using another installation. The
+default factory/constructor and environment lookups remain available. Only child-process
+`TMPDIR`/`TMP`/`TEMP` change, matching the Java helper/profile directory; no application-wide
+environment or JVM property is modified. Chromium's sandbox and offline network restrictions
+remain required; these options do not add a no-sandbox mode or install runtime dependencies.
+
 Inspect `report.media` to present formats. When a response supplies HLS/DASH catalogues, call `expandFormats(report)` before selecting their tracks; this fetches manifest metadata only. `playbackPlan(report, selection)` provides portable progressive/SABR source contracts. `search`, `channel`, `playlist`, `more` and `captions` expose browsing and subtitle data. Swift callers use `try await` for suspending operations and handle exported errors with `do`/`catch`.
 
 Search submits its **complete query verbatim**, including surrounding whitespace, up to 16,384

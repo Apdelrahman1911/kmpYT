@@ -26,13 +26,19 @@ class JvmYouTubeDownloader(private val httpClient: HttpClient,
 
 /** Node/Chromium and optional FFmpeg are supplied by the host; no executables are bundled. */
 fun createJvmYouTubeClient(ffmpegPath: String? = System.getenv("KMPYT_FFMPEG")): YouTubeClient {
+    return createJvmYouTubeClient(ffmpegPath, DesktopYouTubeRuntimeOptions())
+}
+
+/** Explicit runtime paths avoid application-wide environment/property changes. */
+fun createJvmYouTubeClient(ffmpegPath: String? = System.getenv("KMPYT_FFMPEG"),
+    runtimeOptions: DesktopYouTubeRuntimeOptions): YouTubeClient {
+    val runtime = DesktopYouTubeJavaScriptRuntime(runtimeOptions)
     val http = HttpClient(CIO) {
         expectSuccess = false
         followRedirects = false
         install(HttpTimeout) { requestTimeoutMillis = 60_000; connectTimeoutMillis = 15_000; socketTimeoutMillis = 20_000 }
         install(ContentEncoding) { gzip(); deflate() }
     }
-    val runtime = DesktopYouTubeJavaScriptRuntime()
     return YouTubeClient(KtorResearchTransport(http, maximumBytes = 8_000_000), runtime, JvmYouTubeDownloader(http, ffmpegPath),
         onClose = { try { runtime.close() } finally { http.close() } }, platformName = "JVM")
 }
