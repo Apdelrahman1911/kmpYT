@@ -3,6 +3,12 @@
 # is prepared reproducibly inside this repository, never installed globally.
 set -euo pipefail
 : "${KMPYT_CI_SCOPED_ENV:?Use ci/scoped.sh first}"
+if [ "${1:-}" = windows-startup-probe ]; then
+    case "$(uname -s)" in
+        MINGW*|MSYS*) ;;
+        *) printf '%s\n' 'The single startup discriminator requires Windows; no alternate host/browser attempted.' >&2; return 1 ;;
+    esac
+fi
 case "$(uname -m)" in
     arm64|aarch64) candidates=("${JAVA_HOME_17_ARM64:-}" "${JAVA_HOME_17_arm64:-}" "${JAVA_HOME:-}") ;;
     *) candidates=("${JAVA_HOME_17_X64:-}" "${JAVA_HOME:-}") ;;
@@ -24,18 +30,20 @@ if [ "$(uname -s)" = Darwin ]; then
     export DEVELOPER_DIR=/Applications/Xcode_26.0.1.app/Contents/Developer
     [ -d "$DEVELOPER_DIR" ] || { printf '%s\n' 'Pinned existing Xcode missing; no xcode-select/install attempted.' >&2; return 1; }
 fi
-if [ "${1:-}" = jvm ]; then
+if [ "${1:-}" = jvm ] || [ "${1:-}" = windows-startup-probe ]; then
     # The executable itself, not a possible PATH shim/cmd launcher on Windows.
     export KMPYT_NODE="$(node -p 'process.execPath')"
     node -e 'if (+process.versions.node.split(".")[0] < 22) process.exit(1)'
-    KMPYT_FFMPEG="$(command -v ffmpeg || true)"
-    if [ -z "$KMPYT_FFMPEG" ]; then
-        KMPYT_FFMPEG="$(python3 -B "$KMPYT_CI_PROJECT_ROOT/ci/ffmpeg-tool.py")"
+    if [ "${1:-}" = jvm ]; then
+        KMPYT_FFMPEG="$(command -v ffmpeg || true)"
+        if [ -z "$KMPYT_FFMPEG" ]; then
+            KMPYT_FFMPEG="$(python3 -B "$KMPYT_CI_PROJECT_ROOT/ci/ffmpeg-tool.py")"
+        fi
+        export KMPYT_FFMPEG
+        [ -f "$KMPYT_FFMPEG" ] || { printf '%s\n' 'FFmpeg preparation failed; skipped media tests are not success.' >&2; return 1; }
+        if command -v cygpath >/dev/null 2>&1; then KMPYT_FFMPEG="$(cygpath -m "$KMPYT_FFMPEG")"; fi
+        python3 -B "$KMPYT_CI_PROJECT_ROOT/ci/ffmpeg-tool.py" --verify "$KMPYT_FFMPEG"
     fi
-    export KMPYT_FFMPEG
-    [ -f "$KMPYT_FFMPEG" ] || { printf '%s\n' 'FFmpeg preparation failed; skipped media tests are not success.' >&2; return 1; }
-    if command -v cygpath >/dev/null 2>&1; then KMPYT_FFMPEG="$(cygpath -m "$KMPYT_FFMPEG")"; fi
-    python3 -B "$KMPYT_CI_PROJECT_ROOT/ci/ffmpeg-tool.py" --verify "$KMPYT_FFMPEG"
     KMPYT_CHROMIUM="$(python3 -B - <<'PY'
 import os,shutil
 from pathlib import Path
@@ -51,7 +59,7 @@ PY
     export KMPYT_CHROMIUM
     if command -v cygpath >/dev/null 2>&1; then
         export KMPYT_NODE="$(cygpath -m "$KMPYT_NODE")"
-        export KMPYT_FFMPEG="$(cygpath -m "$KMPYT_FFMPEG")"
+        if [ "${1:-}" = jvm ]; then export KMPYT_FFMPEG="$(cygpath -m "$KMPYT_FFMPEG")"; fi
         export KMPYT_CHROMIUM="$(cygpath -m "$KMPYT_CHROMIUM")"
     fi
     python3 -B "$KMPYT_CI_PROJECT_ROOT/ci/js-tool-provenance.py" \

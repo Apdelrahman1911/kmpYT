@@ -35,7 +35,9 @@ startup_groups={
     'spawn': {'OFFLINE_STARTUP_SPAWN_OBSERVED', 'OFFLINE_STARTUP_SPAWN_UNOBSERVED'},
     'child': {'OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED', 'OFFLINE_STARTUP_CHILD_EXIT_OBSERVED', 'OFFLINE_STARTUP_CHILD_UNCONFIRMED'},
     'stderr': {'OFFLINE_STARTUP_STDERR_NONE', 'OFFLINE_STARTUP_STDERR_SOME',
-        'OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT', 'OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT'},
+        'OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT', 'OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT',
+        'OFFLINE_STARTUP_STDERR_DEVTOOLS_BIND_MESSAGE', 'OFFLINE_STARTUP_STDERR_PORT_WRITE_MESSAGE',
+        'OFFLINE_STARTUP_STDERR_PROFILE_LOCK_MESSAGE', 'OFFLINE_STARTUP_STDERR_PROCESS_SINGLETON_MESSAGE'},
     'port': {'OFFLINE_STARTUP_PORT_UNCHECKED', 'OFFLINE_STARTUP_PORT_MISSING', 'OFFLINE_STARTUP_PORT_ACCESS_DENIED',
         'OFFLINE_STARTUP_PORT_BUSY', 'OFFLINE_STARTUP_PORT_INCOMPLETE_OR_UNRECOGNIZED',
         'OFFLINE_STARTUP_PORT_VALID', 'OFFLINE_STARTUP_PORT_FILE_REJECTED'},
@@ -69,6 +71,9 @@ def startup_receipt(text):
     return values
 
 media_tests=0
+startup_probe_tests=0
+testcase_count=0
+startup_probe_method='executesNativeDomAndUrlOperationsInOfflineChromium'
 paths=list((root/'kmpyt/build/test-results').glob('**/TEST-*.xml'))
 paths+=list((root/'kmpyt/build/outputs/androidTest-results').glob('**/TEST-*.xml'))
 for path in paths:
@@ -78,6 +83,7 @@ for path in paths:
     suites=[value] if value.tag=='testsuite' else value.findall('testsuite')
     for suite in suites:
         for test in suite.findall('testcase'):
+            testcase_count+=1
             seen_codes=set()
             seen_startup=set()
             for failure in test.findall('failure')+test.findall('error'):
@@ -92,6 +98,11 @@ for path in paths:
             if path.parent.name=='jvmTest' and test.attrib.get('classname','').endswith('.JvmYouTubeDownloaderTest') and test.attrib.get('name','').startswith('actualSeparateVideoAndAudioAreDownloadedAndCombinedByCallerFfmpeg'):
                 if test.find('skipped') is None and test.find('failure') is None and test.find('error') is None:
                     media_tests+=1
+            if (path.parent==root/'kmpyt/build/test-results/jvmTest' and
+                test.attrib.get('classname')=='dev.kmpyt.jvm.DesktopYouTubeJavaScriptRuntimeTest' and
+                test.attrib.get('name') in (startup_probe_method,startup_probe_method+'[jvm]') and
+                not any(test.find(kind) is not None for kind in ('skipped','failure','error'))):
+                startup_probe_tests+=1
         counts['suites']+=1
         for key in ('tests','failures','errors','skipped'):
             count=int(suite.attrib.get(key,'0'))
@@ -110,3 +121,6 @@ if '--require-executed' in sys.argv and (counts['tests']<=counts['skipped'] or c
     raise SystemExit('Required executed passing tests missing')
 if '--require-media' in sys.argv and media_tests!=1:
     raise SystemExit('Required actual FFmpeg remux/decode JVM regression did not execute and pass exactly once')
+if '--require-startup-probe' in sys.argv and (len(paths)!=1 or testcase_count!=1 or startup_probe_tests!=1 or
+    counts!=dict(suites=1,tests=1,failures=0,errors=0,skipped=0)):
+    raise SystemExit('The Windows startup probe requires exactly one executed passing named JVM testcase and no others')

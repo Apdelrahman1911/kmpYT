@@ -19,11 +19,22 @@ const startupGroups = Object.freeze({
   spawn: ['OFFLINE_STARTUP_SPAWN_OBSERVED', 'OFFLINE_STARTUP_SPAWN_UNOBSERVED'],
   child: ['OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED', 'OFFLINE_STARTUP_CHILD_EXIT_OBSERVED', 'OFFLINE_STARTUP_CHILD_UNCONFIRMED'],
   stderr: ['OFFLINE_STARTUP_STDERR_NONE', 'OFFLINE_STARTUP_STDERR_SOME',
-    'OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT', 'OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT'],
+    'OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT', 'OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT',
+    'OFFLINE_STARTUP_STDERR_DEVTOOLS_BIND_MESSAGE', 'OFFLINE_STARTUP_STDERR_PORT_WRITE_MESSAGE',
+    'OFFLINE_STARTUP_STDERR_PROFILE_LOCK_MESSAGE', 'OFFLINE_STARTUP_STDERR_PROCESS_SINGLETON_MESSAGE'],
   port: ['OFFLINE_STARTUP_PORT_UNCHECKED', 'OFFLINE_STARTUP_PORT_MISSING', 'OFFLINE_STARTUP_PORT_ACCESS_DENIED',
     'OFFLINE_STARTUP_PORT_BUSY', 'OFFLINE_STARTUP_PORT_INCOMPLETE_OR_UNRECOGNIZED',
     'OFFLINE_STARTUP_PORT_VALID', 'OFFLINE_STARTUP_PORT_FILE_REJECTED']
 });
+// Exact upstream source literals, not error-text extraction or a cause verdict.
+// First matching complete bounded line wins; this order breaks same-line ties.
+// Never retain/emit a suffix (which can contain a profile path or other secrets).
+const startupStderrLiterals = Object.freeze([
+  ['Cannot start http server for devtools.', 'OFFLINE_STARTUP_STDERR_DEVTOOLS_BIND_MESSAGE'],
+  ['Error writing DevTools active port to file ', 'OFFLINE_STARTUP_STDERR_PORT_WRITE_MESSAGE'],
+  ['Lock file can not be created', 'OFFLINE_STARTUP_STDERR_PROFILE_LOCK_MESSAGE'],
+  ['Failed to create a ProcessSingleton for your profile directory.', 'OFFLINE_STARTUP_STDERR_PROCESS_SINGLETON_MESSAGE']
+]);
 const startupCodes = new Set(Object.values(startupGroups).flat());
 function safeStartupObservations(code, values) {
   // A receipt is all-or-nothing. Never turn arbitrary helper/child text into a
@@ -107,7 +118,7 @@ function readActivePortEndpoint(observe = () => {}) {
 function discoverBrowserEndpoint(child) {
   return new Promise((resolve, reject) => {
     let text = '', settled = false, pollTimer;
-    let spawned = false, exited = false, stderr = 'OFFLINE_STARTUP_STDERR_NONE';
+    let spawned = false, exited = false, stderr = 'OFFLINE_STARTUP_STDERR_NONE', classifiedStderr = false;
     const portObservations = new Set();
     const finish = (error, endpoint) => {
       if (settled) return;
@@ -144,7 +155,11 @@ function discoverBrowserEndpoint(child) {
         const match = /^DevTools listening on ws:\/\/127\.0\.0\.1:([0-9]+)(\/\S+)\r?$/.exec(line);
         const endpoint = match && activePortEndpoint(match[1] + '\n' + match[2]);
         if (endpoint) { stderr = 'OFFLINE_STARTUP_STDERR_VALID_ANNOUNCEMENT'; return finish(undefined, endpoint); }
-        if (line.startsWith('DevTools listening on ')) stderr = 'OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT';
+        if (!classifiedStderr) {
+          const literal = startupStderrLiterals.find(([value]) => line.includes(value));
+          if (literal) { stderr = literal[1]; classifiedStderr = true; }
+          else if (line.startsWith('DevTools listening on ')) stderr = 'OFFLINE_STARTUP_STDERR_INVALID_ANNOUNCEMENT';
+        }
       }
     };
     // Leave the once-error handler attached after success so a later process

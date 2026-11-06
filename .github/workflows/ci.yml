@@ -5,12 +5,19 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Full required matrix or one manually authorized Windows startup discriminator
+        type: choice
+        required: true
+        default: full
+        options: [full, windows-startup-probe]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'ci-windows-startup-probe-' || 'ci-' }}${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -19,8 +26,8 @@ defaults:
 
 jobs:
   license:
-    if: ${{ github.event.repository.private == false }}
-    name: License and provenance policy
+    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'Probe scope - license gate not executed' || 'License and provenance policy' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -35,8 +42,8 @@ jobs:
         run: ci/scoped.sh python3 -B ci/test-tooling.py
 
   jvm:
-    if: ${{ github.event.repository.private == false }}
-    name: JVM (${{ matrix.check_name }})
+    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'Probe scope - JVM gates not executed' || 'JVM' }} (${{ matrix.check_name }})
     strategy:
       fail-fast: false
       matrix:
@@ -68,8 +75,8 @@ jobs:
         run: ci/scoped.sh python3 -B ci/summary.py
 
   android:
-    if: ${{ github.event.repository.private == false }}
-    name: Android API ${{ matrix.api }}
+    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'Probe scope - Android gates not executed' || 'Android API' }} ${{ matrix.api }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -117,8 +124,8 @@ jobs:
         run: ci/scoped.sh python3 -B ci/summary.py
 
   apple:
-    if: ${{ github.event.repository.private == false }}
-    name: iOS simulator and XCFramework
+    if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' && 'Probe scope - iOS gates not executed' || 'iOS simulator and XCFramework' }}
     runs-on: macos-15-intel
     timeout-minutes: 120
     env:
@@ -169,6 +176,36 @@ jobs:
           ci/scoped.sh bash -euo pipefail -c '
             source ci/select-tools.sh
             ci/gradle.sh :kmpyt:assembleKmpYTReleaseXCFramework --stacktrace
+          '
+      - name: Summarize without artifact/cache uploads
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        env:
+          KMPYT_CI_JOB_STATUS: ${{ job.status }}
+        run: ci/scoped.sh python3 -B ci/summary.py
+
+  windows_startup_probe:
+    if: ${{ github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' }}
+    name: Windows startup discriminator (one authored test)
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        id: checkout
+        with:
+          persist-credentials: false
+          set-safe-directory: false
+          submodules: false
+      - name: Verify license and browser-free diagnostic regressions
+        run: |
+          ci/scoped.sh python3 -B ci/verify-license.py
+          ci/scoped.sh python3 -B ci/test-tooling.py
+      - name: Read-only admission then exactly one production-path authored Chromium test
+        run: |
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh windows-startup-probe
+            python3 -B ci/windows-browser-preflight.py
+            ci/gradle.sh :kmpyt:jvmTest --tests "dev.kmpyt.jvm.DesktopYouTubeJavaScriptRuntimeTest.executesNativeDomAndUrlOperationsInOfflineChromium" --stacktrace
+            python3 -B ci/summary.py --require-startup-probe
           '
       - name: Summarize without artifact/cache uploads
         if: ${{ always() && steps.checkout.outcome == 'success' }}

@@ -20,9 +20,55 @@ class ToolingTests(unittest.TestCase):
         self.assertIn('on:\n  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:\n',workflow)
         for job in ('license','jvm','android','apple'):
             self.assertIn('\n  '+job+':\n',workflow)
+        condition="github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe'"
+        ordinary=re.sub(r'name: \$\{\{ '+re.escape(condition)+r" && '[^']+' \|\| '([^']+)' \}\}",r'name: \1',workflow)
         for check in ('License and provenance policy','JVM (${{ matrix.check_name }})','Android API ${{ matrix.api }}','iOS simulator and XCFramework'):
-            self.assertIn('name: '+check,workflow)
+            self.assertIn('name: '+check,ordinary)
         self.assertNotIn('continue-on-error:',workflow)
+
+    def test_probe_skipped_contexts_and_concurrency_cannot_collide_with_full_mode(self):
+        workflow=(ROOT/'.github/workflows/ci.yml').read_text()
+        condition="github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe'"
+        names=(('license','Probe scope - license gate not executed','License and provenance policy',''),
+            ('jvm','Probe scope - JVM gates not executed','JVM',' (${{ matrix.check_name }})'),
+            ('android','Probe scope - Android gates not executed','Android API',' ${{ matrix.api }}'),
+            ('apple','Probe scope - iOS gates not executed','iOS simulator and XCFramework',''))
+        for job,probe,ordinary,suffix in names:
+            block=workflow.split('\n  '+job+':\n',1)[1].split('\n\n  ',1)[0]
+            self.assertIn("name: ${{ "+condition+" && '"+probe+"' || '"+ordinary+"' }}"+suffix,block)
+            self.assertNotEqual(probe+suffix,ordinary+suffix)
+        probe_prefix,ordinary_prefix='ci-windows-startup-probe-','ci-'
+        self.assertIn("group: ${{ "+condition+" && '"+probe_prefix+"' || '"+ordinary_prefix+"' }}${{ github.ref }}",workflow)
+        # A suffix collided across topic and topic-windows-startup-probe refs.
+        # GitHub groups are case-insensitive; disjoint prefixes also cover this.
+        refs=('refs/heads/topic','refs/heads/topic-windows-startup-probe',
+            'refs/heads/windows-startup-probe-topic','refs/heads/TOPIC',
+            'refs/tags/topic','refs/pull/42/merge')
+        probe_groups={(probe_prefix+ref).lower() for ref in refs}
+        ordinary_groups={(ordinary_prefix+ref).lower() for ref in refs}
+        self.assertTrue(probe_groups.isdisjoint(ordinary_groups))
+        self.assertNotEqual(probe_prefix+'refs/heads/topic',
+            ordinary_prefix+'refs/heads/topic-windows-startup-probe')
+        self.assertIn('cancel-in-progress: true',workflow)
+
+    def test_startup_probe_is_explicit_manual_windows_only_and_does_not_weaken_default_jobs(self):
+        workflow=(ROOT/'.github/workflows/ci.yml').read_text()
+        self.assertIn('default: full\n        options: [full, windows-startup-probe]',workflow)
+        ordinary="if: ${{ github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || inputs.mode != 'windows-startup-probe') }}"
+        for name in ('license','jvm','android','apple'):
+            block=workflow.split('\n  '+name+':\n',1)[1].split('\n  ',1)[0]
+            self.assertIn(ordinary,block)
+        probe=workflow.split('\n  windows_startup_probe:\n',1)[1]
+        self.assertIn("if: ${{ github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.mode == 'windows-startup-probe' }}",probe)
+        self.assertIn('runs-on: windows-2022',probe)
+        self.assertEqual(probe.count('ci/gradle.sh'),1)
+        self.assertEqual(probe.count('--tests '),1)
+        self.assertIn('--tests "dev.kmpyt.jvm.DesktopYouTubeJavaScriptRuntimeTest.executesNativeDomAndUrlOperationsInOfflineChromium"',probe)
+        self.assertIn('source ci/select-tools.sh windows-startup-probe',probe)
+        self.assertIn('ci/summary.py --require-startup-probe',probe)
+        self.assertLess(probe.index('ci/windows-browser-preflight.py'),probe.index('ci/gradle.sh'))
+        for other in (':kmpyt:jvmJar',':kmpyt:connected',':kmpyt:ios','ffmpeg-tool','upload-artifact','actions/cache','continue-on-error:'):
+            self.assertNotIn(other,probe)
 
     def test_shell_syntax(self):
         for path in (ROOT/'ci').glob('*.sh'):
@@ -52,11 +98,46 @@ class ToolingTests(unittest.TestCase):
         paths=('kmpyt/src/jvmMain/resources/youtube/chromium-runtime.cjs',
             'kmpyt/src/jvmMain/kotlin/dev/kmpyt/jvm/DesktopYouTubeJavaScriptRuntime.kt','ci/summary.py')
         codes=[set(re.findall(r'''['"](OFFLINE_STARTUP_[A-Z0-9_]+)['"]''',(ROOT/path).read_text())) for path in paths]
-        self.assertEqual(len(codes[0]),16)
+        self.assertEqual(len(codes[0]),20)
         self.assertEqual(codes[0],codes[1]); self.assertEqual(codes[0],codes[2])
 
     def test_browser_endpoint_fixture_regressions_without_a_browser(self):
         subprocess.run(['node','--test',str(ROOT/'kmpyt/src/jvmTest/resources/youtube/chromium-runtime-endpoint.test.cjs')],check=True)
+
+    def test_windows_preflight_with_authored_pe_and_mocked_apis_only(self):
+        subprocess.run(['python3','-B',str(ROOT/'ci/test-windows-browser-preflight.py')],check=True)
+
+    def test_probe_tool_selection_does_not_prepare_or_execute_ffmpeg_with_mocked_tools(self):
+        with tempfile.TemporaryDirectory(dir=ROOT/'.work/tmp') as temp:
+            base=Path(temp); (base/'jdk/bin').mkdir(parents=True)
+            (base/'jdk/bin/java.exe').write_text('authored fixture, not executed')
+            environment={**os.environ,'JAVA_HOME':str(base/'jdk'),'JAVA_HOME_17_X64':str(base/'jdk'),
+                'PROBE_TEST_ROOT':str(base),'KMPYT_CI_SCOPED_ENV':'1','KMPYT_CI_PROJECT_ROOT':str(ROOT)}
+            script=r'''
+set -euo pipefail
+uname() { if [ "${1:-}" = -s ]; then printf 'MINGW64_NT-10.0\n'; else printf 'x86_64\n'; fi; }
+java() { printf '    java.specification.version = 17\n'; }
+node() {
+    if [ "${1:-}" = -p ]; then
+        if [ "$2" = process.execPath ]; then printf '%s/node.exe\n' "$PROBE_TEST_ROOT"; else printf 'v22.23.4\n'; fi
+    fi
+}
+cygpath() { printf '%s\n' "$2"; }
+python3() {
+    case "${2:-}" in
+        -) printf '%s/chrome.exe\n' "$PROBE_TEST_ROOT" ;;
+        */js-tool-provenance.py) printf 'MOCK_PROVENANCE_ONLY\n' ;;
+        *) printf 'UNEXPECTED_TOOL\n' >&2; return 97 ;;
+    esac
+}
+source "$KMPYT_CI_PROJECT_ROOT/ci/select-tools.sh" windows-startup-probe
+printf 'SELECTED_NODE=%s\nSELECTED_BROWSER=%s\n' "$KMPYT_NODE" "$KMPYT_CHROMIUM"
+'''
+            result=subprocess.run(['bash','--noprofile','--norc','-c',script],capture_output=True,text=True,env=environment)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn('MOCK_PROVENANCE_ONLY',result.stdout)
+            self.assertIn('SELECTED_BROWSER='+str(base)+'/chrome.exe',result.stdout)
+            self.assertNotIn('UNEXPECTED_TOOL',result.stderr)
 
     def test_homes_and_parent_are_preserved(self):
         before=dict(os.environ)
@@ -136,6 +217,38 @@ class ToolingTests(unittest.TestCase):
             result=subprocess.run(['python3','-B',str(base/'ci/summary.py'),'--require-media'],capture_output=True,env=environment)
             self.assertNotEqual(result.returncode,0)
 
+    def test_startup_probe_gate_requires_exactly_one_actual_named_passing_testcase(self):
+        method='executesNativeDomAndUrlOperationsInOfflineChromium'
+        classname='dev.kmpyt.jvm.DesktopYouTubeJavaScriptRuntimeTest'
+        with tempfile.TemporaryDirectory(dir=ROOT/'.work/tmp') as temp:
+            base=Path(temp); (base/'ci').mkdir(); shutil.copy2(ROOT/'ci/summary.py',base/'ci/summary.py')
+            output=base/'kmpyt/build/test-results/jvmTest/TEST-fixture.xml'; output.parent.mkdir(parents=True)
+            environment={k:v for k,v in os.environ.items() if k!='GITHUB_STEP_SUMMARY'}
+            cases=[(method,classname,'',1,True),(method+'[jvm]',classname,'',1,True),
+                (method+'UnexpectedSuffix',classname,'',1,False),(method,'wrong.Class','',1,False),
+                (method,classname,'<skipped/>',1,False),(method,classname,'<failure/>',1,False),
+                (method,classname,'<error/>',1,False),(method,classname,'',0,False),(method,classname,'',2,False)]
+            for name,owner,child,declared,passed in cases:
+                with self.subTest(name=name,owner=owner,child=child,declared=declared):
+                    output.write_text(f'<testsuite tests="{declared}"><testcase classname="{owner}" name="{name}">{child}</testcase></testsuite>')
+                    result=subprocess.run(['python3','-B',str(base/'ci/summary.py'),'--require-startup-probe'],capture_output=True,env=environment)
+                    self.assertEqual(result.returncode==0,passed)
+            case=f'<testcase classname="{classname}" name="{method}"/>'
+            for body in (f'<testsuite tests="1">{case}{case}</testsuite>',
+                f'<testsuite tests="2">{case}<testcase name="another"/></testsuite>',
+                f'<testsuite tests="1" failures="1">{case}</testsuite>',
+                '<testsuite tests="1"/>'):
+                output.write_text(body)
+                result=subprocess.run(['python3','-B',str(base/'ci/summary.py'),'--require-startup-probe'],capture_output=True,env=environment)
+                self.assertNotEqual(result.returncode,0)
+            output.write_text(f'<testsuite tests="1">{case}</testsuite>')
+            other=output.with_name('TEST-duplicate.xml'); shutil.copy2(output,other)
+            result=subprocess.run(['python3','-B',str(base/'ci/summary.py'),'--require-startup-probe'],capture_output=True,env=environment)
+            self.assertNotEqual(result.returncode,0)
+            output.unlink(); other.unlink()
+            result=subprocess.run(['python3','-B',str(base/'ci/summary.py'),'--require-startup-probe'],capture_output=True,env=environment)
+            self.assertNotEqual(result.returncode,0)
+
     def test_tool_identity_is_read_only_and_omits_full_paths(self):
         with tempfile.TemporaryDirectory(dir=ROOT/'.work/tmp') as temp:
             base=Path(temp); tool=base/'authored-browser-fixture'
@@ -170,6 +283,10 @@ class ToolingTests(unittest.TestCase):
         prefix='\tSuppressed: dev.kmpyt.jvm.DesktopYouTubeJavaScriptRuntime$StartupObservationReceipt: KMPYT_BROWSER_STARTUP_V1['
         def receipt(code,values): return prefix+code+';'+','.join(values)+']'
         cases=[(timeout,receipt(timeout,baseline),baseline)]
+        for token in ('DEVTOOLS_BIND','PORT_WRITE','PROFILE_LOCK','PROCESS_SINGLETON'):
+            values=[*baseline[:2],'OFFLINE_STARTUP_STDERR_'+token+'_MESSAGE',baseline[3]]
+            cases.append((timeout,receipt(timeout,values),values))
+            cases.append((timeout,receipt(timeout,baseline+[values[2]]),[]))
         for changed in ([],baseline+['OFFLINE_STARTUP_PRIVATE_VALUE'],baseline+['authored-secret'],
             baseline+[baseline[-1]],['OFFLINE_STARTUP_PORT_MISSING']*9,
             baseline+['OFFLINE_STARTUP_SPAWN_OBSERVED'],baseline+['OFFLINE_STARTUP_CHILD_EXIT_OBSERVED'],

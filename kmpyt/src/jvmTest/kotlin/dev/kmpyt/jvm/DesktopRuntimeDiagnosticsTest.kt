@@ -15,7 +15,7 @@ class DesktopRuntimeDiagnosticsTest {
         requireNotNull(javaClass.getResourceAsStream("/youtube/chromium-runtime.cjs"))
             .bufferedReader().use { it.readText() }
 
-    private fun scaledSlowBrowser(endpointAfterMs: Int?): String = helper("""
+    private fun scaledSlowBrowser(endpointAfterMs: Int?, stderrMessage: String? = null): String = helper("""
         const TestEmitter = require('node:events').EventEmitter;
         const TestPipe = require('node:stream').PassThrough;
         // Scale authored/helper timers equally: 20s startup stays later than 15s and earlier than 30s.
@@ -26,6 +26,7 @@ class DesktopRuntimeDiagnosticsTest {
           child.stderr = new TestPipe(); child.exitCode = null; child.signalCode = null;
           child.kill = () => { child.exitCode = 1; child.emit('exit', 1); };
           setImmediate(() => child.emit('spawn'));
+          ${if (stderrMessage == null) "" else "setImmediate(() => child.stderr.emit('data', Buffer.from(${JsonPrimitive(stderrMessage)})));"}
           ${if (endpointAfterMs == null) "" else """
           setTimeout(() => child.stderr.emit('data', Buffer.from(
             'DevTools listening on ws://127.0.0.1:32123/devtools/browser/00000000-0000-4000-8000-000000000001\n')), $endpointAfterMs);
@@ -121,6 +122,9 @@ class DesktopRuntimeDiagnosticsTest {
     private val pendingObservations = listOf("OFFLINE_STARTUP_SPAWN_UNOBSERVED", "OFFLINE_STARTUP_CHILD_UNCONFIRMED",
         "OFFLINE_STARTUP_STDERR_NONE", "OFFLINE_STARTUP_PORT_MISSING")
 
+    private val stderrMessageCodes = listOf("OFFLINE_STARTUP_STDERR_DEVTOOLS_BIND_MESSAGE", "OFFLINE_STARTUP_STDERR_PORT_WRITE_MESSAGE",
+        "OFFLINE_STARTUP_STDERR_PROFILE_LOCK_MESSAGE", "OFFLINE_STARTUP_STDERR_PROCESS_SINGLETON_MESSAGE")
+
     private fun replyOnlyHelper(code: String, startup: JsonElement): String {
         val reply = buildJsonObject {
             put("ok", false); put("error", code); put("startup", startup)
@@ -175,8 +179,33 @@ class DesktopRuntimeDiagnosticsTest {
         }
     }
 
+    @Test fun classifiedStderrReceiptsPreserveThePrimaryFailureAndOmitPrivateDetails() {
+        for (code in stderrMessageCodes) {
+            val expected = listOf(pendingObservations[0], pendingObservations[1], code, pendingObservations[3])
+            DesktopYouTubeJavaScriptRuntime(replyOnlyHelper("OFFLINE_BROWSER_STARTUP_TIMEOUT", observationArray(expected)), 1).use { runtime ->
+                val error = assertFailsWith<YouTubeJavaScriptFailure> { runtime.prepare("owned fixture") }
+                assertEquals("OFFLINE_BROWSER_STARTUP_TIMEOUT", error.code)
+                assertEquals(expected, observations(error))
+                assertPrivateDetailsAbsent(error)
+                assertEquals(0, runtime.trackedSessionCount)
+            }
+        }
+    }
+
+    @Test fun packagedHelperClassifiesPortWriteMessageWithoutItsPrivateSuffix() {
+        val message = "[authored-secret ERROR] Error writing DevTools active port to file /private/fixture https://private.invalid/?signature=fixture\n"
+        DesktopYouTubeJavaScriptRuntime(scaledSlowBrowser(null, message), 1).use { runtime ->
+            val error = assertFailsWith<YouTubeJavaScriptFailure> { runtime.prepare("owned fixture") }
+            assertEquals("OFFLINE_BROWSER_STARTUP_TIMEOUT", error.code)
+            assertEquals(listOf("OFFLINE_STARTUP_SPAWN_OBSERVED", "OFFLINE_STARTUP_CHILD_NO_EXIT_OBSERVED",
+                "OFFLINE_STARTUP_STDERR_PORT_WRITE_MESSAGE", "OFFLINE_STARTUP_PORT_MISSING"), observations(error))
+            assertPrivateDetailsAbsent(error)
+            assertEquals(0, runtime.trackedSessionCount)
+        }
+    }
+
     @Test fun malformedUnknownDuplicateOversizedAndContradictoryReceiptsAreDroppedWhole() {
-        val malformed = listOf(
+        val malformed = stderrMessageCodes.map { observationArray(pendingObservations + it) } + listOf(
             JsonNull, JsonPrimitive("authored-secret"), buildJsonObject { put("private", "authored-secret") },
             JsonArray(emptyList()), JsonArray(listOf(JsonPrimitive(true)) + pendingObservations.drop(1).map(::JsonPrimitive)),
             observationArray(pendingObservations + "OFFLINE_STARTUP_PRIVATE_VALUE"),
