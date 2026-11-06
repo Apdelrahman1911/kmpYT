@@ -11,6 +11,15 @@ FFMPEG=importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FFMPEG)
 
 class ToolingTests(unittest.TestCase):
+    def test_ci_runs_once_per_pr_update_and_keeps_all_checks(self):
+        workflow=(ROOT/'.github/workflows/ci.yml').read_text()
+        self.assertIn('on:\n  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:\n',workflow)
+        for job in ('license','jvm','android','apple'):
+            self.assertIn('\n  '+job+':\n',workflow)
+        for check in ('License and provenance policy','JVM (${{ matrix.check_name }})','Android API ${{ matrix.api }}','iOS simulator and XCFramework'):
+            self.assertIn('name: '+check,workflow)
+        self.assertNotIn('continue-on-error:',workflow)
+
     def test_shell_syntax(self):
         for path in (ROOT/'ci').glob('*.sh'):
             subprocess.run(['bash','-n',str(path)],check=True)
