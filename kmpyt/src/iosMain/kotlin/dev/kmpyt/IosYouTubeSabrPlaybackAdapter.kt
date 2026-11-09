@@ -11,11 +11,14 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import platform.CoreFoundation.CFSwapInt16BigToHost
 import platform.Foundation.NSDate
 import platform.Foundation.NSTemporaryDirectory
 import platform.Foundation.NSUUID
+import platform.Foundation.timeIntervalSince1970
 import platform.Security.SecRandomCopyBytes
 import platform.Security.kSecRandomDefault
+import platform.darwin.inet_pton
 import platform.posix.*
 import kotlin.time.TimeSource
 
@@ -187,7 +190,7 @@ private fun createIosPlaybackListener(backlog: Int): Pair<IosPlaybackSocket, Int
         }
         val length = alloc<socklen_tVar>(); length.value = sizeOf<sockaddr_in>().convert()
         check(getsockname(descriptor, address.ptr.reinterpret(), length.ptr) == 0) { "Could not inspect the native playback listener." }
-        IosPlaybackSocket(descriptor) to ntohs(address.sin_port).toInt()
+        IosPlaybackSocket(descriptor) to CFSwapInt16BigToHost(address.sin_port).toInt()
     } catch (failure: Throwable) { platform.posix.close(descriptor); throw failure }
 }
 
