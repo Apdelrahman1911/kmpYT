@@ -17,6 +17,16 @@ fun createIosYouTubeClient(): YouTubeClient {
     val http = HttpClient(Darwin) {
         followRedirects = false
         expectSuccess = false
+        engine {
+            // Anonymous like every other platform: never send or keep YouTube cookies. A stored
+            // preference cookie otherwise overrides the neutral request language (translated titles).
+            configureSession {
+                setHTTPCookieStorage(null)
+                setHTTPShouldSetCookies(false)
+                setHTTPCookieAcceptPolicy(platform.Foundation.NSHTTPCookieAcceptPolicy.NSHTTPCookieAcceptPolicyNever)
+                setURLCache(null)
+            }
+        }
         install(HttpTimeout) {
             connectTimeoutMillis = 20_000
             socketTimeoutMillis = 45_000
@@ -58,7 +68,7 @@ private fun measuredIosTransport(delegate: ResearchTransport): ResearchTransport
             println("VEYRA_SOURCE_TIMING stage=$stage outcome=END elapsedMs=$elapsed status=${response.status} characters=${response.body.length} uptimeMs=${(NSProcessInfo.processInfo.systemUptime * 1_000).toLong()}")
             if (request.stage == "youtube-player-client") debugIosAvailability(request, response.body)
             if (stage == "BROWSE") Regex("\"itemSectionRenderer\":\\{\"contents\":\\[\\{\"([A-Za-z]{1,64})\"").findAll(response.body).take(3)
-                .map { it.groupValues[1] }.toList().takeIf { it.isNotEmpty() }?.let { println("VEYRA_SEARCH_LEADING_CARDS $it") }
+                .map { it.groupValues[1] }.toList().takeIf { it.isNotEmpty() }?.let { println("VEYRA_SEARCH_LEADING_CARDS $it hl=${Regex("\"hl\":\"([a-zA-Z-]{2,12})\"").find(response.body)?.groupValues?.get(1)}") }
             response
         } catch (error: Throwable) {
             val elapsed = ((NSProcessInfo.processInfo.systemUptime - started) * 1_000).toLong()
