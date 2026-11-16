@@ -44,14 +44,14 @@ class YouTubeClient(
     publicClientOrder: List<String> = YouTubePublicPlayerClients.DEFAULT_ORDER,
 ) {
     /** Every request carries a neutral language so all platforms see the same source titles. */
-    private val transport: ResearchTransport = NeutralLanguageTransport(transport)
+    private val requests: ResearchTransport = NeutralLanguageTransport(transport)
     private val compiler: YouTubePlayerProgramCompiler = playerRuntime?.let(::ContextYouTubePlayerProgramCompiler)
         ?: BoundedYouTubePlayerProgramCompiler()
-    private val programs = YouTubePlayerProgramCache(transport, compiler, cacheEntries = 1, store = programStore)
-    private val inspector = YouTubeInspectionResolver(HedgedResearchTransport(transport), compiler = compiler,
+    private val programs = YouTubePlayerProgramCache(requests, compiler, cacheEntries = 1, store = programStore)
+    private val inspector = YouTubeInspectionResolver(HedgedResearchTransport(requests), compiler = compiler,
         usePublicPlayerClients = true, programCache = programs, publicClientOrder = publicClientOrder)
-    private val browse = PublicYouTubeBrowseService(transport)
-    private val captionService = PublicYouTubeCaptionService(transport)
+    private val browse = PublicYouTubeBrowseService(requests)
+    private val captionService = PublicYouTubeCaptionService(requests)
     val captionState get() = captionService.state
 
     private val lifecycle = Mutex()
@@ -413,7 +413,7 @@ class YouTubeClient(
         UrlPolicy.validate(url)?.let { throw IllegalArgumentException(it) }
         YouTubeDownloadPolicy.requireResource(url, source, mediaId)
         SourceAvailability.await(PlannedDownload(representation, inspectionUrl = source, mediaId = mediaId))
-        val response = transport.execute(ResearchRequest("GET", url, stage = "selected-manifest"))
+        val response = requests.execute(ResearchRequest("GET", url, stage = "selected-manifest"))
         require(response.url == url && response.status in 200..299) { "The selected manifest was not available at its declared URL." }
         val result = (if (representation.transport == TransportKind.HLS) HlsParser else DashParser).parse(url, response.body)
         require(result.representations.isNotEmpty()) {
