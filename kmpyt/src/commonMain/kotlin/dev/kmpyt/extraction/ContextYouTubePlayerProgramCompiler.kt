@@ -25,7 +25,12 @@ class ContextYouTubePlayerProgramCompiler(
         if (binding.signatureFunction?.let { it != model.signature } == true || binding.throttlingFunction != null)
             return classic.copy(diagnostics = classic.diagnostics + diagnostic("PLAYER_CONTEXT_EXPLICIT_BINDING_UNSUPPORTED",
                 "The requested explicit function binding does not match the observed full-context URL-helper contract."))
-        val program = source.substring(0, model.closeOffset) + exports(model) + source.substring(model.closeOffset)
+        val exported = exports(model)
+        val program = buildString(source.length + exported.length) {
+            append(source, 0, model.closeOffset)
+            append(exported)
+            append(source, model.closeOffset, source.length)
+        }
         val session = try { runtime.prepare(program) } catch (cancelled: CancellationException) { throw cancelled }
         catch (failure: YouTubeJavaScriptFailure) {
             return classic.copy(diagnostics = classic.diagnostics + diagnostic("PLAYER_CONTEXT_RUNTIME_UNAVAILABLE",
@@ -112,14 +117,15 @@ class ContextYouTubePlayerProgramCompiler(
         }
         while (stack.isNotEmpty()) {
             val token = requireNotNull(lexer.next())
-            if (token.kind == Kind.NUMBER && recent.takeLast(2).let { it.size == 2 && it[0].text == "signatureTimestamp" && it[1].text in setOf(":", "=") }) {
+            if (token.kind == Kind.NUMBER && recent.getOrNull(recent.size - 2)?.text == "signatureTimestamp" &&
+                recent.lastOrNull()?.text.let { it == ":" || it == "=" }) {
                 token.text.toLongOrNull()?.takeIf { it >= 0 }?.let { timestamps += it }
                 require(timestamps.size <= 16)
             }
-            if (token.kind == Kind.SYMBOL && token.text in setOf("=", "+=", "-=", "%=", "++", "--") && stack.size == 1) {
-                val tail = recent.takeLast(3)
-                if (tail.size == 3 && tail[0].text == namespace && tail[1].text == "." && tail[2].kind == Kind.IDENTIFIER)
-                    count(assignments, "$namespace.${tail[2].text}")
+            if (stack.size == 1 && token.kind == Kind.SYMBOL && token.text in ASSIGNMENT_OPERATORS) {
+                if (recent.getOrNull(recent.size - 3)?.text == namespace &&
+                    recent.getOrNull(recent.size - 2)?.text == "." && recent.lastOrNull()?.kind == Kind.IDENTIFIER)
+                    count(assignments, "$namespace.${recent.last().text}")
                 else recent.lastOrNull()?.takeIf { it.kind == Kind.IDENTIFIER && recent.getOrNull(recent.lastIndex - 1)?.text != "." }
                     ?.let { count(assignments, it.text) }
             }
@@ -133,7 +139,7 @@ class ContextYouTubePlayerProgramCompiler(
                             tail[6].kind == Kind.IDENTIFIER && tail[7].syntax(",") && tail[8].kind == Kind.IDENTIFIER && tail[9].syntax(")")) {
                             val preceding = recent.getOrNull(recent.size - 11)?.text
                             val parameters = listOf(tail[4].text, tail[6].text, tail[8].text)
-                            if (preceding in setOf(null, ";", "}", "var", "let", "const", ",") &&
+                            if (preceding in DECLARATION_PREDECESSORS &&
                                 parameters.distinct().size == 3 && namespace !in parameters && IDENTIFIER.matches(tail[0].text))
                                 candidate = Candidate(tail[0].text, parameters, token.end)
                         }
@@ -236,7 +242,7 @@ class ContextYouTubePlayerProgramCompiler(
             val start = position
             val first = source[position++]
             var kind = Kind.SYMBOL
-            var value = first.toString()
+            var value = SINGLE_CHAR_TOKENS.getOrNull(first.code) ?: first.toString()
             if (first in "\"'`") {
                 val text = StringBuilder(); var closed = false; var overflow = false
                 while (position < source.length) {
@@ -283,8 +289,8 @@ class ContextYouTubePlayerProgramCompiler(
                 while (source.getOrNull(position)?.isLetter() == true) position++
                 kind = Kind.OPAQUE; value = "<regex>"
             } else {
-                val pair = source.substring(start, minOf(source.length, start + 2))
-                if (pair in PAIRS) { value = pair; position++ }
+                val pair = PAIRS[first]?.get(source.getOrNull(position))
+                if (pair != null) { value = pair; position++ }
             }
             previous = value
             return Token(value, kind, start, position)
@@ -301,7 +307,11 @@ class ContextYouTubePlayerProgramCompiler(
         private const val MAX_DEPTH = 256
         private const val MAX_TOKENS = 2_000_000
         private val IDENTIFIER = Regex("[A-Za-z_$][A-Za-z0-9_$]*")
+        private val SINGLE_CHAR_TOKENS = Array(128) { it.toChar().toString() }
+        private val ASSIGNMENT_OPERATORS = setOf("=", "+=", "-=", "%=", "++", "--")
+        private val DECLARATION_PREDECESSORS = setOf(null, ";", "}", "var", "let", "const", ",")
         private val REGEX_PREFIX = setOf("", "=", "(", "[", ":", ",", "return", "throw", "case", "!", "&&", "||", "?", ";", "{")
         private val PAIRS = setOf("=>", "++", "--", "+=", "-=", "%=", "==", "!=", "&&", "||", "<=", ">=")
+            .groupBy { it.first() }.mapValues { (_, symbols) -> symbols.associateBy { it.last() } }
     }
 }

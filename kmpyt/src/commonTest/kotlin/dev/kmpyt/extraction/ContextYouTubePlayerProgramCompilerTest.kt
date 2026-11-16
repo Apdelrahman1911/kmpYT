@@ -183,6 +183,43 @@ class ContextYouTubePlayerProgramCompilerTest {
         assertNull(transforms.signatureTimestamp)
     }
 
+    @Test fun densePlayerTablesBeyondTheClassicTokenLimitRetainTheExactClosure() {
+        val runtime = RecordingRuntime()
+        val source = program(extra = "var table=0;".repeat(45_000))
+        val compilation = ContextYouTubePlayerProgramCompiler(runtime).compile(source, YouTubeProgramBinding())
+        val transforms = assertNotNull(compilation.transforms)
+        assertTrue(compilation.diagnostics.any { it.code == "PLAYER_PROGRAM_TOKEN_LIMIT" })
+        assertEquals(21002L, transforms.signatureTimestamp)
+        val emitted = assertNotNull(runtime.program)
+        assertEquals(source.substringBeforeLast("})(_yt_player);"), emitted.substringBefore(";globalThis.__kmpyt_capabilities"))
+        assertTrue(emitted.endsWith("})(_yt_player);"))
+        assertEquals("cba", transforms.signature("abc"))
+        transforms.close()
+        assertEquals(1, runtime.closeCount)
+    }
+
+    @Test fun cachedPunctuationTokensPreserveCompoundOperatorsAndBindingReassignmentChecks() {
+        val runtime = RecordingRuntime()
+        val source = program(extra = """
+            var punctuation=function(value){
+              if(value!=0&&value>=0||value<=1){value++;value--;value+=2;value-=1;value%=3;}
+              return value==0?1:0;
+            };
+            var arrow=(value)=>value;
+        """.trimIndent())
+        val transforms = assertNotNull(ContextYouTubePlayerProgramCompiler(runtime).compile(source, YouTubeProgramBinding()).transforms)
+        transforms.close()
+        listOf("assemble", "realm.Resource").forEach { binding ->
+            listOf("=other", "+=1", "-=1", "%=1", "++", "--").forEach { reassignment ->
+                val rejectedRuntime = RecordingRuntime()
+                val rejected = ContextYouTubePlayerProgramCompiler(rejectedRuntime).compile(
+                    program(extra = "$binding$reassignment;"), YouTubeProgramBinding())
+                assertNull(rejected.transforms, "$binding$reassignment must invalidate the binding")
+                assertNull(rejectedRuntime.program)
+            }
+        }
+    }
+
     @Test fun closingCompilationDisposesSessionOnceAndRejectsFurtherNativeCalls() {
         val runtime = RecordingRuntime()
         val transforms = assertNotNull(ContextYouTubePlayerProgramCompiler(runtime).compile(program(), YouTubeProgramBinding()).transforms)

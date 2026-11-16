@@ -62,6 +62,27 @@ remain required; these options do not add a no-sandbox mode or install runtime d
 
 Inspect `report.media` to present formats. When a response supplies HLS/DASH catalogues, call `expandFormats(report)` before selecting their tracks; this fetches manifest metadata only. `playbackPlan(report, selection)` provides portable progressive/SABR source contracts. `search`, `channel`, `playlist`, `more` and `captions` expose browsing and subtitle data. Swift callers use `try await` for suspending operations and handle exported errors with `do`/`catch`.
 
+For a music/podcast player, `inspectAudio(videoUrl)` resolves standalone audio without
+running unrelated video-format signature transforms. The returned report marks this audio
+scope and retains source-declared manifest pointers for explicit expansion. The default
+`inspect` method still inspects the full catalogue.
+
+Use the suspending `preparePlayback(report, selection)` before handing a progressive URI to
+a native player. It honors `Representation.availableAtEpochMs`, including a source-declared
+pre-playback wait. The synchronous `playbackPlan` remains available for inspection; a host
+using it directly must honor that timestamp before requesting media. `download` and the
+native transfer/SABR adapters honor the same wait with cancellable delays. An early media
+HTTP 403 is not proof that a link expired, and refreshing a link can restart its source wait.
+No advertising resource or account/integrity grant is fetched to implement this timing.
+
+Large progressive downloads are fetched as exact HTTP byte ranges of at most 8 MiB over up to
+four connections (`ProgressiveDownloadTuning`; googlevideo paces a single larger range to about
+the media bitrate). Only a contiguous, synced and SHA-256-receipted prefix is checkpointed; every
+section must be an exact 206 of the same strong-ETag representation, otherwise the transfer
+falls back to one verified request. Unusually slow watch, player and oEmbed reads are duplicated
+once after a bounded delay (`HedgedResearchTransport`); media transfers are never hedged.
+`publicClientOrder` selects the request order of the pinned public player profiles.
+
 Search submits its **complete query verbatim**, including surrounding whitespace, up to 16,384
 well-formed UTF-16 code units. Oversized/invalid queries and titles are rejected, not shortened.
 `YouTubeBrowsePage.query` records that submitted query; `firstEntry` records the leading content

@@ -28,6 +28,10 @@ internal class AndroidMediaProcessor(private val maximumBytes: Long = Long.MAX_V
     private val sampleBufferAllocator: (Int) -> ByteBuffer = ByteBuffer::allocateDirect) : FileMediaProcessor {
     private companion object { const val MAX_SAMPLE_BYTES = 16 * 1024 * 1024 }
 
+    override fun link(source: File, target: File): Boolean = try {
+        android.system.Os.link(source.path, target.path); true
+    } catch (_: Exception) { false }
+
     override suspend fun materialize(primary: Representation, audio: Representation?,
         fetch: suspend (SegmentResource, File) -> Unit, output: File): Unit = withContext(Dispatchers.IO) {
         val destination = output.canonicalFile
@@ -52,6 +56,17 @@ internal class AndroidMediaProcessor(private val maximumBytes: Long = Long.MAX_V
                 }
                 require(representation.initialization == null || representation.segments.isNotEmpty()) { "Initialization has no media segments" }
                 val target = File(temporary, name)
+                if (representation.segments.isEmpty() && representation.initialization == null) {
+                    // One complete progressive resource: fetch it straight into place, no copy.
+                    val resource = SegmentResource(requireNotNull(representation.url))
+                    MediaStorageSpace.requireAvailable(target, representation.sizeBytes ?: 0L)
+                    fetch(resource, target)
+                    currentCoroutineContext().ensureActive()
+                    check(target.isFile && target.length() > 0) { "Research transport returned an empty resource" }
+                    require(target.length() <= maximumBytes - total) { "Research media exceeds the size limit" }
+                    total += target.length()
+                    return target
+                }
                 val resources = buildList {
                     representation.initialization?.let(::add)
                     if (representation.segments.isEmpty()) add(SegmentResource(requireNotNull(representation.url))) else addAll(representation.segments)
@@ -98,8 +113,11 @@ internal class AndroidMediaProcessor(private val maximumBytes: Long = Long.MAX_V
             val audioFile = audio?.let { assemble(it, "audio") }
             if (audioFile == null && primary.segments.isEmpty()) {
                 validate(primaryFile, primary.role)
-                MediaStorageSpace.requireAvailable(published, primaryFile.length())
-                FileOutputStream(published).use { stream -> copy(primaryFile, stream, published); stream.fd.sync() }
+                // Same private directory: publish by rename instead of a third full copy.
+                if (!primaryFile.renameTo(published)) {
+                    MediaStorageSpace.requireAvailable(published, primaryFile.length())
+                    FileOutputStream(published).use { stream -> copy(primaryFile, stream, published); stream.fd.sync() }
+                }
             } else mux(primaryFile, primary.role, audioFile, published)
             currentCoroutineContext().ensureActive()
             check(published.length() > 0 && !destination.exists() && published.renameTo(destination)) { "Could not publish processed media" }

@@ -28,7 +28,8 @@ internal fun checkedIosSum(values: Iterable<Long>): Long = values.fold(0L) { tot
 
 /** Bounded buffers, 64-bit offsets and errno-based failures avoid Objective-C file-write exceptions. */
 internal class IosMediaFile(val path: String, private val expected: Long? = null,
-    private val durableWrites: Boolean = false, existing: Boolean = false) : YouTubeSabrTrackSink {
+    private val durableWrites: Boolean = false, existing: Boolean = false,
+    private val synchronize: (Int) -> Int = { fileDescriptor -> fsync(fileDescriptor) }) : YouTubeSabrTrackSink {
     private var descriptor = open(path, O_RDWR or O_NOFOLLOW or (if (existing) 0 else (O_CREAT or O_EXCL)), 384)
     private var storageAllowance = 0L
     private var closeFailure: IosMediaStorageException? = null
@@ -101,7 +102,7 @@ internal class IosMediaFile(val path: String, private val expected: Long? = null
     }
 
     fun flush() {
-        if (fsync(descriptor) != 0) throw IosMediaStorageException("Could not commit private media storage.")
+        if (synchronize(descriptor) != 0) throw IosMediaStorageException("Could not commit private media storage.")
     }
 
     fun truncate(bytes: Long) {

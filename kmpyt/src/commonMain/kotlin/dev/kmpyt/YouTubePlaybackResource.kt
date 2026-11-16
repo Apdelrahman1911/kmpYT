@@ -28,6 +28,7 @@ class YouTubePlaybackEndpoint(
  */
 interface YouTubePlaybackResource {
     val endpoints: List<YouTubePlaybackEndpoint>
+    val failureCode: String? get() = null
     suspend fun close()
 }
 

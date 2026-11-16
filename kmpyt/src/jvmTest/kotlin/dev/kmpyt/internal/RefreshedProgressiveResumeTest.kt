@@ -392,4 +392,41 @@ class RefreshedProgressiveResumeTest {
         fun request(): RecordedRequest = assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
         override fun close() { http.close(); server.shutdown(); directory.deleteRecursively() }
     }
+    @Test fun changingSourceAvailabilityDoesNotChangeTheResumableRecordingIdentity() {
+        val original = PlannedDownload(Representation("140", "https://owned.test/audio", TrackRole.AUDIO,
+            mimeType = "audio/mp4", codecs = "mp4a.40.2", sizeBytes = 16, availableAtEpochMs = 15_000),
+            inspectionUrl = "https://www.youtube.com/watch?v=ABCDEFGHIJK", mediaId = "ABCDEFGHIJK")
+        assertNotNull(progressiveSelectionDigest(original))
+        assertEquals(progressiveSelectionDigest(original),
+            progressiveSelectionDigest(original.copy(primary = original.primary.copy(availableAtEpochMs = 25_000))))
+    }
+
+    @Test fun nativeDownloadWaitsBeforeOpeningATemporarilyUnavailableMediaResource(): Unit = runBlocking {
+        val body = requireNotNull(javaClass.getResourceAsStream("/research/audio.m4a")).use { it.readBytes() }
+        val directory = Files.createTempDirectory("kmpyt-availability-").toFile()
+        val server = MockWebServer()
+        var firstRequestAt = 0L
+        var deadline = Long.MAX_VALUE
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                firstRequestAt = System.currentTimeMillis()
+                return if (firstRequestAt < deadline) MockResponse().setResponseCode(403)
+                else MockResponse().setHeader("Content-Type", "audio/mp4").setBody(Buffer().write(body))
+            }
+        }
+        server.startLoopback()
+        val http = HttpClient(CIO)
+        try {
+            deadline = System.currentTimeMillis() + 300
+            val output = File(directory, "authored.m4a")
+            val plan = PlannedDownload(Representation("140", server.loopbackUrl("/audio").toString(), TrackRole.AUDIO,
+                mimeType = "audio/mp4", codecs = "mp4a.40.2", sizeBytes = body.size.toLong(), availableAtEpochMs = deadline),
+                inspectionUrl = "https://www.youtube.com/watch?v=ABCDEFGHIJK", mediaId = "ABCDEFGHIJK")
+            JvmYouTubeDownloader(http, allowLocalHttp = true).download(plan, output.path) {}
+            assertTrue(firstRequestAt >= deadline)
+            assertEquals(1, server.requestCount)
+            assertContentEquals(body, output.readBytes())
+        } finally { http.close(); server.shutdown(); directory.deleteRecursively() }
+    }
+
 }

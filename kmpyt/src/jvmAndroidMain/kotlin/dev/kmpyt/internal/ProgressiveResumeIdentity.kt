@@ -28,7 +28,7 @@ internal fun progressiveSelectionDigest(plan: PlannedDownload): String? {
     if (plan.audio != null || track.transport != TransportKind.PROGRESSIVE || track.segments.isNotEmpty() ||
         track.initialization != null || track.manifestUrl != null || track.sabr != null) return null
     val fields = Json.encodeToJsonElement(Representation.serializer(), track).jsonObject.toMutableMap()
-    listOf("url", "expiresAtEpochMs", "manifestBody", "unavailableReason").forEach(fields::remove)
+    listOf("url", "expiresAtEpochMs", "availableAtEpochMs", "manifestBody", "unavailableReason").forEach(fields::remove)
     fields["id"] = JsonPrimitive(track.id.replace(Regex("#progressive(?:-[0-9]+)?$"), ""))
     return resumeDigest(buildJsonObject {
         put("schema", "single-progressive-v1")

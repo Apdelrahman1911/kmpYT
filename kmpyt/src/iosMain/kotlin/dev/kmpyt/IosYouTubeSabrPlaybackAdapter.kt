@@ -35,6 +35,7 @@ private class IosSabrPlaybackAdapter(private val http: HttpClient, private val c
         try {
             return withContext(Dispatchers.Default) {
                 request.requireStaticSabr()
+                SourceAvailability.await(request.plan)
                 val tracks = listOfNotNull(request.plan.primary, request.plan.audio)
                 var total = 0L
                 for (track in tracks) {
@@ -90,9 +91,10 @@ private class IosSabrPlaybackAdapter(private val http: HttpClient, private val c
     }
 }
 
-private class IosPlaybackCache(private val path: String, private val expected: Long) : YouTubeSabrPlaybackCache {
+internal class IosPlaybackCache(private val path: String, private val expected: Long,
+    synchronize: (Int) -> Int = { fileDescriptor -> fsync(fileDescriptor) }) : YouTubeSabrPlaybackCache {
     private val mutex = Mutex()
-    private val file = IosMediaFile(path, expected, durableWrites = true)
+    private val file = IosMediaFile(path, expected, durableWrites = false, synchronize = synchronize)
     private var closed = false
     private var closeFailure: Throwable? = null
     override suspend fun size(): Long = mutex.withLock {
@@ -208,6 +210,7 @@ private class IosSabrPlaybackResource(http: HttpClient, request: SourcePlaybackR
     private val connections = Mutex()
     private val sockets = mutableSetOf<IosPlaybackSocket>()
     private var accepting: Job? = null
+    override val failureCode: String? get() = session.state.value.takeIf { it.status == SabrStreamingStatus.FAILED }?.errorCode
     override val endpoints = listOfNotNull(request.plan.primary, request.plan.audio).map { track ->
         YouTubePlaybackEndpoint(track.role, "http://127.0.0.1:$port/$capability/${track.role.name.lowercase()}",
             track.mimeType.substringBefore(';').trim().lowercase(), requireNotNull(track.sizeBytes))

@@ -34,12 +34,20 @@ class YouTubeClient(
     private val onClose: () -> Unit = {},
     val platformName: String = "JVM",
     private val playbackAdapter: YouTubePlaybackAdapter? = null,
+    /** Optional private store that keeps versioned player programs across process restarts. */
+    programStore: YouTubePlayerProgramStore? = null,
+    /**
+     * Request order of the pinned public player profiles by client name. Chosen for
+     * compatibility and latency only; every declared restriction and wait is honored for
+     * whichever profile answers.
+     */
+    publicClientOrder: List<String> = YouTubePublicPlayerClients.DEFAULT_ORDER,
 ) {
     private val compiler: YouTubePlayerProgramCompiler = playerRuntime?.let(::ContextYouTubePlayerProgramCompiler)
         ?: BoundedYouTubePlayerProgramCompiler()
-    private val programs = YouTubePlayerProgramCache(transport, compiler, cacheEntries = 1)
-    private val inspector = YouTubeInspectionResolver(transport, compiler = compiler,
-        usePublicPlayerClients = true, programCache = programs)
+    private val programs = YouTubePlayerProgramCache(transport, compiler, cacheEntries = 1, store = programStore)
+    private val inspector = YouTubeInspectionResolver(HedgedResearchTransport(transport), compiler = compiler,
+        usePublicPlayerClients = true, programCache = programs, publicClientOrder = publicClientOrder)
     private val browse = PublicYouTubeBrowseService(transport)
     private val captionService = PublicYouTubeCaptionService(transport)
     val captionState get() = captionService.state
@@ -58,6 +66,27 @@ class YouTubeClient(
     suspend fun inspect(url: String): ExtractionReport = operation {
         inspector.inspect(url, Clock.System.now().toEpochMilliseconds())
     }
+
+    /**
+     * Resolves standalone audio without transforming unrelated video-format ciphers.
+     * Source-declared manifest pointers remain available for [expandFormats]. Access,
+     * identity and refresh rules are identical to [inspect]; no media bytes are requested.
+     */
+    @OptIn(ExperimentalTime::class)
+    @Throws(Exception::class)
+    suspend fun inspectAudio(url: String): ExtractionReport = operation {
+        inspector.inspect(url, Clock.System.now().toEpochMilliseconds(), audioOnly = true)
+    }
+
+    /**
+     * Prepares the most recently stored player program and its runtime without any network
+     * request, so the first inspection after a process start that declares the same player
+     * skips downloading and initializing it. Returns false when nothing usable is stored.
+     * Safe to call in the background at application start; a later player change simply
+     * prepares the newly declared program during inspection as usual.
+     */
+    @Throws(Exception::class)
+    suspend fun prewarm(): Boolean = operation { programs.prewarm() }
 
     @Throws(Exception::class)
     suspend fun search(query: String): YouTubeBrowsePage = operation { browse.search(query) }
@@ -120,6 +149,13 @@ class YouTubeClient(
         return request
     }
 
+    /** Prepare the selected source for native playback after its declared availability wait. */
+    @Throws(Exception::class)
+    suspend fun preparePlayback(report: ExtractionReport, selection: YouTubeFormatSelection,
+        mediaId: String = report.media.single().id): SourcePlaybackRequest = operation {
+        playbackPlan(report, selection, mediaId).also { SourceAvailability.await(it.plan) }
+    }
+
     /**
      * Adapt the exact static SABR plan to owned native loopback resources. The
      * explicit caller policy is checked before each media request, not converted
@@ -133,6 +169,7 @@ class YouTubeClient(
             return operation {
                 request.requireStaticSabr()
                 validatePlan(request.plan)
+                SourceAvailability.await(request.plan)
                 val adapter = requireNotNull(playbackAdapter) { "Supply a native YouTubePlaybackAdapter for static SABR playback." }
                 lifecycle.withLock {
                     check(playbackResources.size + openingPlaybackResources < 8) { "Close unused playback resources before opening another." }
@@ -192,8 +229,9 @@ class YouTubeClient(
         onProgress: suspend (YouTubeDownloadProgress) -> Unit = {}): YouTubeDownloadResult = operation {
         validatePlan(plan)
         require(destinationPath.isNotBlank()) { "Choose a destination path." }
-        requireNotNull(downloader) { "Supply a native YouTubeDownloader to save media on this platform." }
-            .download(plan, destinationPath, onProgress)
+        val native = requireNotNull(downloader) { "Supply a native YouTubeDownloader to save media on this platform." }
+        SourceAvailability.await(plan)
+        native.download(plan, destinationPath, onProgress)
     }
 
     /** Reinspect explicitly after expiry; a different quality, language or transport is never substituted. */
@@ -201,7 +239,8 @@ class YouTubeClient(
     @Throws(Exception::class)
     suspend fun refresh(plan: PlannedDownload): PlannedDownload = operation {
         validatePlan(plan)
-        val inspected = inspector.inspect(plan.inspectionUrl, Clock.System.now().toEpochMilliseconds())
+        val inspected = inspector.inspect(plan.inspectionUrl, Clock.System.now().toEpochMilliseconds(),
+            audioOnly = listOfNotNull(plan.primary, plan.audio).all { it.role == TrackRole.AUDIO })
         val catalogues = listOfNotNull(plan.primary, plan.audio).filter { it.manifestUrl != null && MANIFEST_ID in it.id }
             .map { it.id.substringBefore(MANIFEST_ID) }.toSet()
         val report = if (catalogues.isEmpty()) inspected else expandFormatsInternal(inspected, plan.mediaId, catalogues)
@@ -257,6 +296,7 @@ class YouTubeClient(
     private inner class OwnedPlaybackResource(private val delegate: YouTubePlaybackResource) : YouTubePlaybackResource {
         private var endpointSnapshot: List<YouTubePlaybackEndpoint> = emptyList()
         override val endpoints: List<YouTubePlaybackEndpoint> get() = endpointSnapshot
+        override val failureCode: String? get() = delegate.failureCode
         fun publishEndpoints(endpoints: List<YouTubePlaybackEndpoint>) { endpointSnapshot = endpoints }
         private val mutex = Mutex()
         private var disposed = false
@@ -354,10 +394,12 @@ class YouTubeClient(
                 audioLanguage = current.audioLanguage ?: concrete.audioLanguage,
                 audioDisplayName = current.audioDisplayName ?: concrete.audioDisplayName,
                 audioIsDefault = current.audioIsDefault ?: concrete.audioIsDefault,
+                audioIsAutoDubbed = current.audioIsAutoDubbed ?: concrete.audioIsAutoDubbed,
                 frameRate = current.frameRate ?: concrete.frameRate,
                 sizeBytes = concrete.sizeBytes ?: current.sizeBytes,
                 durationMs = concrete.durationMs ?: current.durationMs,
-                expiresAtEpochMs = current.expiresAtEpochMs ?: concrete.expiresAtEpochMs)
+                expiresAtEpochMs = current.expiresAtEpochMs ?: concrete.expiresAtEpochMs,
+                availableAtEpochMs = current.availableAtEpochMs ?: concrete.availableAtEpochMs)
             if (current.segments.isNotEmpty() || current.transport == TransportKind.PROGRESSIVE) return current
         }
         throw IllegalArgumentException("The selected manifest exceeded the resolution depth limit.")
@@ -367,6 +409,7 @@ class YouTubeClient(
         val url = representation.requireResourceUrl()
         UrlPolicy.validate(url)?.let { throw IllegalArgumentException(it) }
         YouTubeDownloadPolicy.requireResource(url, source, mediaId)
+        SourceAvailability.await(PlannedDownload(representation, inspectionUrl = source, mediaId = mediaId))
         val response = transport.execute(ResearchRequest("GET", url, stage = "selected-manifest"))
         require(response.url == url && response.status in 200..299) { "The selected manifest was not available at its declared URL." }
         val result = (if (representation.transport == TransportKind.HLS) HlsParser else DashParser).parse(url, response.body)
@@ -401,6 +444,7 @@ class YouTubeClient(
                 child.copy(id = "${catalogue.id}$MANIFEST_ID${child.role.name.lowercase()}:${child.id}",
                     durationMs = child.durationMs ?: catalogue.durationMs,
                     expiresAtEpochMs = child.expiresAtEpochMs ?: catalogue.expiresAtEpochMs,
+                    availableAtEpochMs = child.availableAtEpochMs ?: catalogue.availableAtEpochMs,
                     manifestUrl = url)
             }
         }

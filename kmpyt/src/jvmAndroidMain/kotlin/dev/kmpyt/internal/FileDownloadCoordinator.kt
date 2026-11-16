@@ -19,7 +19,9 @@ import java.util.Locale
 
 /** Caller-owned files and resumable checkpoints; no app database, UI, or background scheduler. */
 internal class FileDownloadCoordinator(private val processor: FileMediaProcessor, private val client: HttpClient,
-    private val platformName: String, private val allowLocalHttp: Boolean = false) {
+    private val platformName: String, private val allowLocalHttp: Boolean = false,
+    tuning: dev.kmpyt.ProgressiveDownloadTuning = dev.kmpyt.ProgressiveDownloadTuning.Default) {
+    private val sectioning = TransferSectioning(tuning.connections, tuning.sectionBytes)
     private val json = Json { ignoreUnknownKeys = true }
     private companion object {
         val activeDestinations = ConcurrentHashMap<String, Boolean>()
@@ -33,6 +35,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
         YouTubeDownloadPolicy.requirePlan(input)
         require(input.credentialRef == null) { "This adapter supports anonymous inspected resources; account credentials are not accepted." }
         YouTubeFormatCapabilities.downloadProblem(input.primary, input.audio, platformName)?.let { error(it) }
+        SourceAvailability.await(input)
         val destination = File(destinationPath).canonicalFile
         val key = destination.path.let { if (System.getProperty("os.name").orEmpty().startsWith("Windows", true)) it.lowercase(Locale.ROOT) else it }
         check(activeDestinations.putIfAbsent(key, true) == null) { "Another download is using this destination." }
@@ -160,7 +163,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                                             }
                                         else {
                                             val result = HttpDownloadTransfer(allowLocalHttp, plan.requestHeaders,
-                                                refreshOnExpiry = true, onConnection = { active.set(it) }).fetch(
+                                                refreshOnExpiry = true, onConnection = { active.set(it) }, sectioning = sectioning).fetch(
                                                 FileTransferRequest(part.resource.url, plan, state.total, state.etag, state.lastModified,
                                                     expectedBytes = part.expectedBytes, requireStrongResume = strictResume,
                                                     resumeResponseScope = responseScopes[part.key]),
@@ -191,10 +194,15 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                                 current()
                                 val part = parts.singleOrNull { it.resource == resource } ?: error("Unplanned local media resource")
                                 val source = File(directory, part.key)
-                                MediaStorageSpace.requireAvailable(target, source.length())
-                                source.inputStream().use { inputStream -> target.outputStream().use { output ->
-                                    MediaStorageSpace.copy(inputStream, output, target) { current() }
-                                } }
+                                // The part stays intact for resume until publication; a link shares
+                                // its already-synced bytes, and only a failed link falls back to a copy.
+                                val linked = !target.exists() && runCatching { processor.link(source, target) }.getOrDefault(false)
+                                if (!linked) {
+                                    MediaStorageSpace.requireAvailable(target, source.length())
+                                    source.inputStream().use { inputStream -> target.outputStream().use { output ->
+                                        MediaStorageSpace.copy(inputStream, output, target) { current() }
+                                    } }
+                                }
                             }, published)
                         }
                         current()

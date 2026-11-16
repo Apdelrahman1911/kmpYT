@@ -61,6 +61,40 @@ class YouTubeResponseExtractorTest {
         assertTrue(result.diagnostics.any { it.code == "PLAYER_CLIENT_RESOURCES_DISCOVERED" })
     }
 
+
+    @Test fun longEscapedSabrEndpointStillLoadsOnlyTheDeclaredPlayerProgram() = runTest {
+        val endpoint = "https://owned.test/sabr?padding=${"a".repeat(32_768)}&n=abc"
+        val encoded = JsonPrimitive(endpoint).toString().replace("/", "\\/")
+        val body = """<script>var ytInitialPlayerResponse={"videoDetails":{"videoId":"ABCDEFGHIJK","title":"Owned"},
+          "streamingData":{"serverAbrStreamingUrl":$encoded,"adaptiveFormats":[
+          {"itag":140,"mimeType":"audio/mp4","contentLength":"100"}]}};</script><script src="/player.js"></script>"""
+        val transport = RecordingTransport { request ->
+            assertEquals("GET", request.method)
+            assertEquals("https://owned.test/player.js", request.url)
+            ResearchResponse(request.url, 200, program)
+        }
+        val extractor = YouTubeResponseExtractor(transport, options = YouTubeResponseExtractionOptions(programBinding = binding))
+        try {
+            val result = extractor.extract(context, ResearchResponse(context.responseUrl, 200, body))
+            assertEquals(1, transport.requests.size)
+            assertFalse(result.media.single().representations.single().selectable)
+        } finally { extractor.close() }
+    }
+
+    @Test fun longSabrEndpointWithoutThrottleDoesNotRequestAPlayerProgram() = runTest {
+        val endpoint = "https://owned.test/sabr?padding=${"a".repeat(32_768)}"
+        val body = """<script>var ytInitialPlayerResponse={"videoDetails":{"videoId":"ABCDEFGHIJK","title":"Owned"},
+          "streamingData":{"serverAbrStreamingUrl":${JsonPrimitive(endpoint)},"adaptiveFormats":[
+          {"itag":140,"mimeType":"audio/mp4","contentLength":"100"}]}};</script><script src="/player.js"></script>"""
+        val transport = RecordingTransport { error("An unthrottled endpoint needs no player program") }
+        val extractor = YouTubeResponseExtractor(transport, options = YouTubeResponseExtractionOptions(programBinding = binding))
+        try {
+            val result = extractor.extract(context, ResearchResponse(context.responseUrl, 200, body))
+            assertFalse(result.media.single().representations.single().selectable)
+            assertTrue(transport.requests.isEmpty())
+        } finally { extractor.close() }
+    }
+
     @Test fun directSuppliedResourcesAvoidProgramAndClientRequests() = runTest {
         val transport = RecordingTransport { error("A usable response must not trigger extra requests") }
         val body = """{"videoDetails":{"videoId":"ABCDEFGHIJK","title":"Owned"},"streamingData":{"formats":[{"itag":18,"url":"https://owned.test/media.mp4","mimeType":"video/mp4"}]}}"""

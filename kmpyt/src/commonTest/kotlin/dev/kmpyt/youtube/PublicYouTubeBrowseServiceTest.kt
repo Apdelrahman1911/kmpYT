@@ -70,6 +70,21 @@ class PublicYouTubeBrowseServiceTest {
         assertTrue(transport.requests.single().headers.keys.none { it.equals("cookie", true) || it.equals("authorization", true) })
     }
 
+    @Test fun spellingSuggestionIsSearchControlAndDoesNotReplaceTheFirstContentResult() = runTest {
+        val query = "Complete requested title — العنوان الكامل"
+        // Its navigation target and nested media-looking data are controls, not result entries.
+        val suggestion = """{"didYouMeanRenderer":{"correctedQuery":{"runs":[{"text":"Different query"}]},"navigationEndpoint":{"searchEndpoint":{"query":"Different query"}},"contents":[${video(secondId)}]}}"""
+        val transport = Transport { ResearchResponse(it.url, 200, initial("$suggestion,${video()}")) }
+        val page = PublicYouTubeBrowseService(transport).search(query)
+        assertEquals(query, page.query)
+        assertEquals(query, Url(transport.requests.single().url).parameters["search_query"])
+        assertEquals(listOf(id), page.items.map { it.id })
+        assertEquals(YouTubeBrowseKind.VIDEO, page.firstEntry?.kind)
+        assertEquals(id, page.firstEntry?.id)
+        assertEquals(0, page.firstEntry?.ordinal)
+        assertNull(page.firstEntry?.issue)
+    }
+
     @Test fun newLockupsAndShortsUseActualIdentifiersAndMetadata() = runTest {
         val lockup = """{"richItemRenderer":{"content":{"lockupViewModel":{"contentId":"$id","contentType":"LOCKUP_CONTENT_TYPE_VIDEO","metadata":{"lockupMetadataViewModel":{"title":{"content":"Current video shape"},"metadata":{"contentMetadataViewModel":{"metadataRows":[{"metadataParts":[{"text":{"content":"Actual author"}},{"text":{"content":"100 views"}}]}]}}}},"contentImage":{"thumbnailViewModel":{"image":{"sources":[{"url":"https://i.ytimg.com/vi/$id/hqdefault.jpg","width":480}]},"overlays":[{"thumbnailBadgeViewModel":{"text":"12:34"}}]}}}}}}"""
         val shorts = """{"shortsLockupViewModel":{"overlayMetadata":{"primaryText":{"content":"A short"},"secondaryText":{"content":"40 views"}},"onTap":{"innertubeCommand":{"reelWatchEndpoint":{"videoId":"$secondId"}}},"thumbnail":{"sources":[{"url":"https://i.ytimg.com/vi/$secondId/hqdefault.jpg","width":480}]}}}"""

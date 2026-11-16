@@ -196,6 +196,114 @@ class YouTubeFormatCapabilitiesTest {
         assertEquals(selected, YouTubeFormatSelection.recommendedDownload(media(sabrVideo, sabrAudio, video.copy(height = 360)), "Android", selected))
     }
 
+    @Test fun sourceOriginalArabicWinsOverDefaultEnglishAutoDubForAudioAndVideo() {
+        val dubbed = audio.copy(id = "140@en.dub", audioTrackId = "en.dub", audioDisplayName = "English (US)",
+            audioIsAutoDubbed = true, bitrate = 256_000)
+        val original = audio.copy(id = "140@ar.source", audioTrackId = "ar.source", audioDisplayName = "Arabic original",
+            audioIsDefault = false, bitrate = 96_000)
+        for (platform in listOf("Android", "iOS", "JVM")) {
+            for (tracks in listOf(listOf(dubbed, original), listOf(original, dubbed))) {
+                val catalogue = media(video, *tracks.toTypedArray())
+                assertEquals(YouTubeFormatSelection(original.id),
+                    YouTubeFormatSelection.choose(catalogue, platform, audioOnly = true))
+                assertEquals(YouTubeFormatSelection(video.id, original.id), YouTubeFormatSelection.choose(catalogue, platform))
+                assertEquals(original.id, YouTubeFormatSelection.audioChoices(catalogue, video, platform).first().audio.id)
+                assertEquals("ABCDEFGHIJK", catalogue.id)
+            }
+        }
+    }
+
+    @Test fun originalPreferenceIsNotAnArabicOrUiLanguagePreference() {
+        val arabicDub = audio.copy(id = "ar-dub", audioLanguage = "ar", audioDisplayName = "Arabic",
+            audioIsAutoDubbed = true)
+        val frenchOriginal = audio.copy(id = "fr-source", audioLanguage = "fr", audioDisplayName = "French (original)",
+            audioIsDefault = false)
+        assertEquals(YouTubeFormatSelection(frenchOriginal.id),
+            YouTubeFormatSelection.choose(media(arabicDub, frenchOriginal), "iOS", audioOnly = true))
+    }
+
+    @Test fun absentOriginalEvidenceKeepsDefaultsWithoutGuessingFromLanguageTrackIdOrNonAutoFlag() {
+        val unknown = audio.copy(id = "ar.4", audioTrackId = "ar.4", audioLanguage = "ar", audioIsDefault = false,
+            audioIsAutoDubbed = false, audioDisplayName = "Arabic", bitrate = 512_000)
+        val default = audio.copy(id = "en-default", audioLanguage = "en", audioIsAutoDubbed = true)
+        assertTrue(YouTubeFormatSelection.originalAudioTracks(media(default, unknown)).isEmpty())
+        assertEquals(YouTubeFormatSelection(default.id),
+            YouTubeFormatSelection.choose(media(default, unknown), "Android", audioOnly = true))
+        assertEquals(YouTubeFormatSelection(unknown.id), YouTubeFormatSelection.choose(
+            media(default.copy(audioIsDefault = null), unknown), "Android", audioOnly = true))
+    }
+
+    @Test fun multipleDeclaredOriginalsRemainVisibleAndTiesAreDeterministic() {
+        val arabic = audio.copy(id = "original-ar", audioLanguage = "ar", audioDisplayName = "Arabic original",
+            audioIsDefault = false, bitrate = 128_000)
+        val english = arabic.copy(id = "original-en", audioLanguage = "en", audioDisplayName = "English original")
+        val dub = audio.copy(id = "dub-default", audioIsAutoDubbed = true, bitrate = 512_000)
+        for (tracks in listOf(listOf(dub, arabic, english), listOf(english, arabic, dub))) {
+            val catalogue = media(*tracks.toTypedArray())
+            assertEquals(setOf(arabic.id, english.id), YouTubeFormatSelection.originalAudioTracks(catalogue).map { it.id }.toSet())
+            assertEquals(YouTubeFormatSelection(arabic.id), YouTubeFormatSelection.choose(catalogue, "iOS", audioOnly = true))
+        }
+        assertEquals(YouTubeFormatSelection(english.id), YouTubeFormatSelection.choose(
+            media(dub, arabic, english.copy(audioIsDefault = true)), "iOS", audioOnly = true))
+    }
+
+    @Test fun unselectableOrIncompatibleOriginalDoesNotSilentlyBecomeADub() {
+        val original = audio.copy(id = "source", audioDisplayName = "Arabic original", audioIsDefault = false)
+        val dub = audio.copy(id = "dub", audioIsAutoDubbed = true)
+        for (unavailable in listOf(original.copy(url = null), original.copy(unavailableReason = "Source restriction"),
+            original.copy(sizeBytes = -1))) {
+            assertNull(YouTubeFormatSelection.choose(media(dub, unavailable), "iOS", audioOnly = true))
+        }
+        val opus = original.copy(mimeType = "audio/webm", codecs = "opus")
+        assertNull(YouTubeFormatSelection.choose(media(video, dub, opus), "iOS"))
+        assertEquals(YouTubeFormatSelection(opus.id), YouTubeFormatSelection.choose(media(dub, opus), "iOS", audioOnly = true))
+        assertNull(YouTubeFormatSelection.choose(media(video.copy(audioGroupId = "en"), dub,
+            original.copy(audioGroupId = "ar")), "Android"))
+    }
+
+    @Test fun explicitDubPreferenceRetainsItsContractEvenWhenOriginalExists() {
+        val original = audio.copy(id = "source", audioDisplayName = "Arabic original", audioIsDefault = false)
+        val dub = audio.copy(id = "dub", audioIsAutoDubbed = true)
+        assertEquals(YouTubeFormatSelection(dub.id), YouTubeFormatSelection.choose(
+            media(original, dub), "iOS", audioOnly = true, preferredAudioId = dub.id))
+        assertEquals(YouTubeFormatSelection(video.id, dub.id), YouTubeFormatSelection.choose(
+            media(video, original, dub), "Android", preferredAudioId = dub.id))
+    }
+
+    @Test fun unknownMuxedAudioCannotBypassTheDeclaredOriginalDuringAutomaticSelection() {
+        val original = audio.copy(id = "source", audioDisplayName = "Arabic original", audioIsDefault = false)
+        val muxed = video.copy(id = "muxed", role = TrackRole.MUXED, height = 2160)
+        val catalogue = media(muxed, video, original)
+        assertEquals(YouTubeFormatSelection(video.id, original.id),
+            YouTubeFormatSelection.choose(catalogue, "iOS", maxHeight = null))
+        assertEquals(YouTubeFormatSelection(muxed.id), YouTubeFormatSelection.choose(
+            catalogue, "iOS", maxHeight = null, preferredPrimaryId = muxed.id))
+    }
+
+    @Test fun progressiveRecommendationDoesNotDropSabrOriginalEvidenceAndSelectADub() {
+        val original = asSabr(audio.copy(id = "140@ar.source", audioTrackId = "ar.source",
+            audioDisplayName = "Arabic original", audioIsDefault = false), 140)
+        val sabrVideo = asSabr(video, 137)
+        val dubbed = audio.copy(id = "140@en.dub", audioTrackId = "en.dub", audioIsAutoDubbed = true)
+        val catalogue = media(sabrVideo, original, video, dubbed)
+        assertEquals(YouTubeFormatSelection(sabrVideo.id, original.id),
+            YouTubeFormatSelection.recommendedDownload(catalogue, "iOS"))
+        assertNull(YouTubeFormatSelection.recommendedDownload(media(original, video, dubbed), "iOS"))
+    }
+
+    @Test fun originalFormatsStillRespectDrcTransportBitrateAndQualityRules() {
+        val original = audio.copy(id = "original", audioDisplayName = "English original", audioIsDefault = false,
+            bitrate = 128_000)
+        val drc = original.copy(id = "drc", isDrc = true, bitrate = 256_000)
+        val smaller = video.copy(id = "720", height = 720)
+        assertEquals(YouTubeFormatSelection(smaller.id, original.id), YouTubeFormatSelection.choose(
+            media(video, smaller, drc, original), "Android", maxHeight = 720))
+        assertEquals(YouTubeFormatSelection(original.id), YouTubeFormatSelection.choose(
+            media(asSabr(original.copy(bitrate = 512_000), 140), original, drc), "Android", audioOnly = true))
+        assertEquals(YouTubeFormatSelection("higher-bitrate"), YouTubeFormatSelection.choose(
+            media(original, original.copy(id = "higher-bitrate", bitrate = 192_000)), "iOS", audioOnly = true))
+    }
+
     private fun asSabr(track: Representation, itag: Int) = track.copy(id = "${track.id}#sabr", transport = TransportKind.SABR,
         url = "https://rr1.googlevideo.com/sabr", sabr = YouTubeSabrResource("ABCDEFGHIJK", "https://rr1.googlevideo.com/sabr",
             "AQID", SabrFormatId(itag, 1uL, null), SabrClientInfo(1, "authored-client")))

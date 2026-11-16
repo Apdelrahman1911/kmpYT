@@ -57,4 +57,6 @@ data class YouTubeResponseExtractionOptions(
     val requestObservedProgressiveAlternatives: Boolean = false,
     /** Opt-in native integration of the pinned public profiles; account/rate denials still stop requests. */
     val requestPublicProgressiveAlternatives: Boolean = false,
+    /** Resolve standalone audio formats only; source manifest pointers and access restrictions remain intact. */
+    val audioOnly: Boolean = false,
 )

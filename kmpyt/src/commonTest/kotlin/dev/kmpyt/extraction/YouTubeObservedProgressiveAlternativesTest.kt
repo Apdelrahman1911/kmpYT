@@ -142,6 +142,14 @@ class YouTubeObservedProgressiveAlternativesTest {
         }
     }
 
+    @Test fun publicProfileOrderIsExplicitAndKeepsUnnamedProfilesInDefaultOrder() {
+        val observed = assertNotNull(YouTubeObservedWebClient.discover(context, page()))
+        fun names(order: List<String>) = YouTubePublicPlayerClients.fromObservedWeb(observed, order).map { it.clientContext.text("clientName") }
+        assertEquals(listOf("TVHTML5", "VISIONOS"), names(YouTubePublicPlayerClients.DEFAULT_ORDER))
+        assertEquals(listOf("VISIONOS", "TVHTML5"), names(listOf("VISIONOS")))
+        assertEquals(listOf("TVHTML5", "VISIONOS"), names(listOf("UNKNOWN")))
+    }
+
     @Test fun publicProfilesRequireRealPageVisitorContextAndCannotBeAttributedToAnUnobservedClient() {
         val observed = assertNotNull(YouTubeObservedWebClient.discover(context, page()))
         val profiles = YouTubePublicPlayerClients.fromObservedWeb(observed)

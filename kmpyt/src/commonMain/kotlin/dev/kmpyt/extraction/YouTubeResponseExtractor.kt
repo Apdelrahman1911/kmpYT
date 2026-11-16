@@ -3,6 +3,9 @@ package dev.kmpyt.extraction
 import io.ktor.http.Url
 import io.ktor.util.encodeBase64
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.CoroutineContext
 import kotlinx.serialization.json.*
 
 /**
@@ -16,6 +19,7 @@ class YouTubeResponseExtractor(
     private val options: YouTubeResponseExtractionOptions = YouTubeResponseExtractionOptions(),
     programLoader: YouTubePlayerProgramLoader? = null,
     private val integrity: YouTubeIntegrityContextManager? = null,
+    private val nowEpochMs: (() -> Long)? = null,
 ) {
     private val ownsProgramLoader = programLoader == null
     private val programLoader = programLoader ?: YouTubePlayerProgramLoader(transport, compiler)
@@ -23,6 +27,8 @@ class YouTubeResponseExtractor(
     suspend fun close() { if (ownsProgramLoader) programLoader.close() }
 
     suspend fun extract(context: ExtractionContext, response: ResearchResponse): ProviderResult {
+        val operationContext = currentCoroutineContext()
+        operationContext.ensureActive()
         require(response.body.length <= YouTubeProvider.MAX_PAGE_BODY) { "Player response exceeds the page bound" }
         val diagnostics = mutableListOf<ExtractionDiagnostic>()
         val initialReference = programLoader.discover(context, response.body)
@@ -31,8 +37,10 @@ class YouTubeResponseExtractor(
         var memoizedTransforms: YouTubeUrlTransforms? = null
 
         suspend fun parsed(candidate: ResearchResponse, client: YouTubeClientContract?): ProviderResult {
-            val current = context.copy(responseUrl = candidate.url)
-            var result = YouTubeProvider(sabrClientInfo = client?.sabrClientInfoOrNull()).parse(current, candidate.body)
+            val current = context.copy(responseUrl = candidate.url, nowEpochMs = nowEpochMs?.invoke() ?: context.nowEpochMs)
+            val provider = YouTubeProvider(sabrClientInfo = client?.sabrClientInfoOrNull(), audioOnly = options.audioOnly)
+            val prepared = provider.prepare(candidate.body)
+            var result = provider.parse(current, prepared, candidate.body)
             if (requiresAuthorization(result) || !needsTransforms(result, candidate.body)) return result
             val candidateReference = programLoader.discover(current, candidate.body)
             val wantedReference = candidateReference ?: initialReference
@@ -44,9 +52,9 @@ class YouTubeResponseExtractor(
             val transforms = loaded?.compilation?.transforms
             if (transforms !== transformedBy) {
                 transformedBy = transforms
-                memoizedTransforms = transforms?.let(::MemoizedThrottling)
+                memoizedTransforms = transforms?.let { MemoizedTransforms(it, operationContext) }
             }
-            if (memoizedTransforms != null) result = YouTubeProvider(memoizedTransforms, client?.sabrClientInfoOrNull()).parse(current, candidate.body)
+            if (memoizedTransforms != null) result = YouTubeProvider(memoizedTransforms, client?.sabrClientInfoOrNull(), audioOnly = options.audioOnly).parse(current, prepared, candidate.body)
             return result
         }
 
@@ -179,27 +187,65 @@ class YouTubeResponseExtractor(
     } || result.media.any { media -> media.representations.any { representation ->
         representation.url?.let { runCatching { Url(it).parameters["n"] != null }.getOrDefault(false) } == true &&
             representation.unavailableReason?.contains("n", ignoreCase = true) == true
-    } } || Regex("\"serverAbrStreamingUrl\"\\s*:\\s*(\"(?:[^\"\\\\]|\\\\.)*\")").findAll(body).take(4).any { match ->
-        // SABR also carries n on its shared endpoint, even when individual format
-        // descriptors have no URL. Analyze the actual declared JS; never invent n.
-        runCatching { Url(Json.parseToJsonElement(match.groupValues[1]).jsonPrimitive.content).parameters["n"] != null }.getOrDefault(false)
+    } } || sabrNeedsTransforms(body)
+
+    /** Long signed endpoints must not recurse through Kotlin/Native's regex matcher. */
+    private fun sabrNeedsTransforms(body: String): Boolean {
+        val key = "\"serverAbrStreamingUrl\""
+        var cursor = 0
+        var endpoints = 0
+        while (cursor < body.length && endpoints < 4) {
+            val found = body.indexOf(key, cursor)
+            if (found < 0) return false
+            cursor = found + key.length
+            while (body.getOrNull(cursor)?.isWhitespace() == true) cursor++
+            if (body.getOrNull(cursor) != ':') continue
+            cursor++
+            while (body.getOrNull(cursor)?.isWhitespace() == true) cursor++
+            if (body.getOrNull(cursor) != '"') continue
+            val start = cursor++
+            var closed = false
+            while (cursor < body.length) {
+                when (body[cursor++]) {
+                    '\\' -> if (cursor < body.length) cursor++
+                    '"' -> { closed = true; break }
+                }
+            }
+            if (!closed) return false
+            endpoints++
+            // Decode the actual bounded JSON string, including escaped slashes/quotes.
+            // Keep the original four-endpoint limit and inspect its real n parameter.
+            if (runCatching {
+                    val endpoint = Json.parseToJsonElement(body.substring(start, cursor)).jsonPrimitive.content
+                    Url(endpoint).parameters["n"] != null
+                }.getOrDefault(false)) return true
+        }
+        return false
     }
 
     private fun hasUsableResources(result: ProviderResult) = result.media.any { it.representations.any(Representation::selectable) }
 
-    /** Many formats share one n value; do not cross the native VM bridge for each copy. */
-    private class MemoizedThrottling(private val source: YouTubeUrlTransforms) : YouTubeUrlTransforms by source {
-        private val results = linkedMapOf<String, String>()
-        override fun throttling(input: String): String {
+    /** Formats share cipher and n inputs; reuse actual outputs without repeating native VM calls. */
+    private class MemoizedTransforms(private val source: YouTubeUrlTransforms, private val operationContext: CoroutineContext) : YouTubeUrlTransforms by source {
+        private val signatures = linkedMapOf<String, String>()
+        private val throttles = linkedMapOf<String, String>()
+
+        override fun signature(input: String): String = remember(signatures, input) { source.signature(input) }
+        override fun throttling(input: String): String = remember(throttles, input) { source.throttling(input) }
+
+        private inline fun remember(results: MutableMap<String, String>, input: String, transform: () -> String): String {
+            operationContext.ensureActive()
             results.remove(input)?.let { found -> results[input] = found; return found }
-            val transformed = source.throttling(input)
+            val transformed = transform()
+            operationContext.ensureActive()
             if (input.length in 1..8192 && transformed.length in 1..8192) {
                 results[input] = transformed
                 if (results.size > 32) results.remove(results.keys.first())
             }
             return transformed
         }
-        // The loader/cache owns the VM. This wrapper lasts only for this inspection.
+        // Only successful outputs are reused, and only within this inspection/program.
+        // The loader/cache retains ownership of the VM and closes it on eviction.
         override fun close() = Unit
     }
 

@@ -1,10 +1,13 @@
 package dev.kmpyt.internal
 
+import dev.kmpyt.extraction.SourceAvailability
+
 import dev.kmpyt.YouTubeNativePlaybackLimits
 import dev.kmpyt.YouTubePlaybackAdapter
 import dev.kmpyt.YouTubePlaybackEndpoint
 import dev.kmpyt.YouTubePlaybackResource
 import dev.kmpyt.extraction.SabrStreamingLimits
+import dev.kmpyt.extraction.SabrStreamingStatus
 import dev.kmpyt.extraction.SourcePlaybackAuthorization
 import dev.kmpyt.extraction.SourcePlaybackRequest
 import dev.kmpyt.extraction.TrackRole
@@ -39,6 +42,7 @@ internal class FileSabrPlaybackAdapter(
         try {
             return withContext(Dispatchers.IO) {
                 request.requireStaticSabr()
+                SourceAvailability.await(request.plan)
                 val tracks = listOfNotNull(request.plan.primary, request.plan.audio)
                 var total = 0L
                 for (track in tracks) {
@@ -158,6 +162,7 @@ private class FileSabrPlaybackResource(
     private val closed = CompletableDeferred<Unit>()
     private val sockets = ConcurrentHashMap.newKeySet<Socket>()
     private var accepting: Job? = null
+    override val failureCode: String? get() = session.state.value.takeIf { it.status == SabrStreamingStatus.FAILED }?.errorCode
     override val endpoints = listOfNotNull(request.plan.primary, request.plan.audio).map { track ->
         YouTubePlaybackEndpoint(track.role, "http://127.0.0.1:${server.localPort}/$token/${track.role.name.lowercase()}",
             track.mimeType.substringBefore(';').trim().lowercase(), requireNotNull(track.sizeBytes))

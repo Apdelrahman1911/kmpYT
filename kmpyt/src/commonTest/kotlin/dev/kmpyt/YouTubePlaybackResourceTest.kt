@@ -25,6 +25,7 @@ class YouTubePlaybackResourceTest {
         override val endpoints = listOf(YouTubePlaybackEndpoint(TrackRole.AUDIO,
             "http://127.0.0.1:32123/${"a".repeat(64)}/audio", "audio/mp4", length))
         var closes = 0
+        override var failureCode: String? = null
         override suspend fun close() { closes++; onClose(); check(!failClose) { "Authored unknown native release" } }
     }
 
@@ -33,6 +34,20 @@ class YouTubePlaybackResourceTest {
         try {
             assertFalse(client.supportsSabrPlayback)
             assertFailsWith<IllegalArgumentException> { client.openPlayback(request, authorization) }
+        } finally { client.close() }
+    }
+
+    @Test fun ownedResourcePreservesFailuresThatArriveAfterPublication() = runTest {
+        val native = Resource()
+        val client = client(YouTubePlaybackAdapter { _, _ -> native })
+        try {
+            val owned = client.openPlayback(request, authorization)
+            assertNull(owned.failureCode)
+            native.failureCode = "SABR_PROTECTION_RETRY_LIMIT"
+            assertEquals("SABR_PROTECTION_RETRY_LIMIT", owned.failureCode)
+            assertEquals(0, native.closes)
+            owned.close()
+            assertEquals(1, native.closes)
         } finally { client.close() }
     }
 

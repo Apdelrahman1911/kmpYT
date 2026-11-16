@@ -6,6 +6,7 @@ internal fun sameRefreshedTrack(previous: Representation, candidate: Representat
     previous.mimeType.substringBefore(';').trim().lowercase() == candidate.mimeType.substringBefore(';').trim().lowercase() &&
     previous.frameRate == candidate.frameRate && previous.audioGroupId == candidate.audioGroupId &&
     previous.audioTrackId == candidate.audioTrackId && previous.audioLanguage == candidate.audioLanguage &&
+    previous.audioProvenance == candidate.audioProvenance && previous.audioIsAutoDubbed == candidate.audioIsAutoDubbed &&
     previous.audioChannels == candidate.audioChannels && previous.audioSampleRate == candidate.audioSampleRate &&
     previous.colorInfo == candidate.colorInfo && previous.isHdr == candidate.isHdr && previous.isDrc == candidate.isDrc
 

@@ -5,6 +5,9 @@ import kotlinx.serialization.Serializable
 @Serializable enum class ProviderId { YOUTUBE }
 @Serializable enum class TrackRole { MUXED, VIDEO, AUDIO }
 @Serializable enum class TransportKind { PROGRESSIVE, HLS, DASH, SABR, UNRESOLVED }
+@Serializable enum class AudioTrackProvenance { UNKNOWN, ORIGINAL, AUTO_DUBBED, CONFLICTING }
+
+private val originalAudioLabel = Regex("(?:^|\\s)(?:original|\\(original\\))$", RegexOption.IGNORE_CASE)
 
 @Serializable data class SegmentResource(val url: String, val rangeStart: Long? = null,
     val rangeLength: Long? = null, val durationMs: Long? = null)
@@ -41,7 +44,20 @@ import kotlinx.serialization.Serializable
     val isHdr: Boolean? = null,
     /** Manifest that actually supplied this child track; null for an unexpanded catalogue pointer. */
     val manifestUrl: String? = null,
+    /** Earliest source-declared media availability; hosts must wait before opening playback or transfer. */
+    val availableAtEpochMs: Long? = null,
+    val audioIsAutoDubbed: Boolean? = null,
 ) {
+    val audioProvenance: AudioTrackProvenance get() {
+        val original = audioDisplayName?.trim()?.let(originalAudioLabel::containsMatchIn) == true
+        return when {
+            original && audioIsAutoDubbed == true -> AudioTrackProvenance.CONFLICTING
+            original -> AudioTrackProvenance.ORIGINAL
+            audioIsAutoDubbed == true -> AudioTrackProvenance.AUTO_DUBBED
+            else -> AudioTrackProvenance.UNKNOWN
+        }
+    }
+
     val selectable: Boolean get() = unavailableReason == null && !url.isNullOrBlank() &&
         (transport in setOf(TransportKind.PROGRESSIVE, TransportKind.HLS, TransportKind.DASH) || transport == TransportKind.SABR && sabr != null && sizeBytes != null && sizeBytes > 0)
 }

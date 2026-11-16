@@ -6,7 +6,8 @@ import kotlinx.serialization.json.*
 
 /** Bounded response reader. Optional independently compiled transforms process actual supplied URLs. */
 class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
-    private val sabrClientInfo: SabrClientInfo? = null) : ProviderAdapter {
+    private val sabrClientInfo: SabrClientInfo? = null,
+    private val audioOnly: Boolean = false) : ProviderAdapter {
     override val id = ProviderId.YOUTUBE
 
     override fun normalize(url: String): String? {
@@ -50,25 +51,33 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
         )
     }
 
-    override fun parse(context: ExtractionContext, body: String): ProviderResult {
+    internal fun prepare(body: String): Result<List<JsonObject>> = runCatching {
+        require(body.length <= MAX_PAGE_BODY)
+        // Watch pages contain large unrelated recommendation trees. Read only the
+        // named player assignment when available; do not traverse ytInitialData.
+        val base = assignedJson(body, "(?:ytInitialPlayerResponse|playerResponse)").toMutableList()
+        if (base.isEmpty()) base += EmbeddedData.documents(body)
+        val objects = EmbeddedData.objects(base.distinct())
+        var expanded = false
+        objects.forEach { obj ->
+            listOfNotNull(obj.text("playerResponse"), obj.text("player_response")).forEach { encoded ->
+                if (encoded.length <= EmbeddedData.MAX_BODY) runCatching { Json.parseToJsonElement(encoded) }.getOrNull()?.let {
+                    base += it
+                    expanded = true
+                }
+            }
+        }
+        if (expanded) EmbeddedData.objects(base.distinct()) else objects
+    }
+
+    override fun parse(context: ExtractionContext, body: String): ProviderResult = parse(context, prepare(body), body)
+
+    internal fun parse(context: ExtractionContext, prepared: Result<List<JsonObject>>, body: String): ProviderResult {
         val diagnostics = mutableListOf<ExtractionDiagnostic>()
         fun diagnostic(code: String, message: String) {
             diagnostics += ExtractionDiagnostic("youtube-player", code, message)
         }
-        val documents = runCatching {
-            require(body.length <= MAX_PAGE_BODY)
-            // Watch pages contain large unrelated recommendation trees. Read only the
-            // named player assignment when available; do not traverse ytInitialData.
-            val base = assignedJson(body, "(?:ytInitialPlayerResponse|playerResponse)").toMutableList()
-            if (base.isEmpty()) base += EmbeddedData.documents(body)
-            val objects = EmbeddedData.objects(base.distinct())
-            objects.forEach { obj ->
-                listOfNotNull(obj.text("playerResponse"), obj.text("player_response")).forEach { encoded ->
-                    if (encoded.length <= EmbeddedData.MAX_BODY) runCatching { Json.parseToJsonElement(encoded) }.getOrNull()?.let(base::add)
-                }
-            }
-            EmbeddedData.objects(base.distinct())
-        }.getOrElse {
+        val documents = prepared.getOrElse {
             return ProviderResult(emptyList(), listOf(ExtractionDiagnostic("youtube-player", "PARSER_LIMIT_OR_INVALID_DATA", "The supplied response could not be scanned within the bounded JSON parser limits.")))
         }
         val expectedId = normalize(context.pageUrl)?.let { Url(it).parameters["v"] }
@@ -85,11 +94,21 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
                 return@mapNotNull null
             }
             val status = player.obj("playabilityStatus")?.text("status")
-            val restriction = status?.takeIf { it != "OK" }?.let {
+            var restriction = status?.takeIf { it != "OK" }?.let {
                 diagnostic(if (it == "LOGIN_REQUIRED" || it == "AGE_CHECK_REQUIRED") "AUTHORIZATION_REQUIRED" else "PLAYER_UNAVAILABLE",
                     "Player reports $it. This reader does not authenticate, bypass restrictions, or repair that response.")
                 "Player reports $it"
             }
+            val sourceWaitMs = SourceAvailability.waitMillis(player)
+            val availableAt = if (sourceWaitMs > SourceAvailability.MAX_WAIT_MS ||
+                context.nowEpochMs > Long.MAX_VALUE - sourceWaitMs) {
+                restriction = restriction ?: "The source playback wait exceeds the supported bound."
+                diagnostic("PLAYBACK_AVAILABILITY_UNSUPPORTED", "The source-declared playback wait exceeds timing bounds; it was not shortened or bypassed.")
+                null
+            } else if (sourceWaitMs > 0 && context.nowEpochMs > 0) {
+                diagnostic("PLAYBACK_AVAILABILITY_DELAY", "The source declares a $sourceWaitMs millisecond wait before media access.")
+                context.nowEpochMs + sourceWaitMs
+            } else null
             val durationMs = secondsToMillis(details.text("lengthSeconds"))
             val stream = player.obj("streamingData")
             val hasSabr = !stream?.text("serverAbrStreamingUrl").isNullOrBlank()
@@ -121,6 +140,10 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
             fun formats(key: String, adaptive: Boolean) {
                 stream?.array(key)?.forEachIndexed { index, element ->
                     val format = element as? JsonObject ?: return@forEachIndexed
+                    // Filter before parsing ciphers or crossing a native JavaScript bridge.
+                    // Manifest pointers are retained below for explicit audio catalogue expansion.
+                    if (audioOnly && !format.text("mimeType").orEmpty().substringBefore(';').trim().startsWith("audio/"))
+                        return@forEachIndexed
                     val cipher = format.text("signatureCipher") ?: format.text("cipher")
                     val cipherFields = cipher?.let { runCatching { parseQueryString(it) }.getOrNull() }
                     val candidate = format.text("url") ?: cipherFields?.get("url")
@@ -211,7 +234,7 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
                         bitrate = (format.number("averageBitrate") ?: format.number("bitrate"))?.takeIf { it >= 0 },
                         sizeBytes = format.number("contentLength")?.takeIf { it >= 0 },
                         durationMs = format.number("approxDurationMs")?.takeIf { it >= 0 } ?: durationMs,
-                        expiresAtEpochMs = expiry, unavailableReason = unavailable,
+                        expiresAtEpochMs = expiry, unavailableReason = unavailable, availableAtEpochMs = availableAt,
                         frameRate = positiveInt(format.number("fps")),
                         audioSampleRate = positiveInt(format.number("audioSampleRate")),
                         audioChannels = positiveInt(format.number("audioChannels")),
@@ -222,6 +245,7 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
                         adaptive = adaptive, audioTrackId = audioTrackId,
                         sabr = sabrResource,
                         audioIsDefault = (audioTrack?.get("audioIsDefault") as? JsonPrimitive)?.booleanOrNull,
+                        audioIsAutoDubbed = (audioTrack?.get("isAutoDubbed") as? JsonPrimitive)?.booleanOrNull,
                         audioDisplayName = audioTrack?.text("displayName"),
                         audioQuality = format.text("audioQuality"),
                         isDrc = (format["isDrc"] as? JsonPrimitive)?.booleanOrNull,
@@ -262,7 +286,7 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
                     else -> null
                 }
                 representations += Representation(key, url, TrackRole.MUXED, transport, mimeType = mime,
-                    durationMs = durationMs, expiresAtEpochMs = expiry, unavailableReason = reason)
+                    durationMs = durationMs, expiresAtEpochMs = expiry, unavailableReason = reason, availableAtEpochMs = availableAt)
             }
             manifest("hlsManifestUrl", TransportKind.HLS, "application/vnd.apple.mpegurl")
             manifest("dashManifestUrl", TransportKind.DASH, "application/dash+xml")

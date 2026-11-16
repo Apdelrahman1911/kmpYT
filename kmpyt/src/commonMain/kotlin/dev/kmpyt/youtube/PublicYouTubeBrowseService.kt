@@ -521,6 +521,8 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
             "richGridContinuation", "continuations", "contents", "continuationItems",
         )
         private val NON_CONTENT_RENDERERS = setOf(
+            // Query suggestions are controls. Do not follow their search endpoint or count them as media.
+            "didYouMeanRenderer",
             "messageRenderer", "searchHeaderRenderer", "chipCloudRenderer", "feedFilterChipBarRenderer",
             "searchSubMenuRenderer", "menuRenderer", "sortFilterSubMenuRenderer",
         )

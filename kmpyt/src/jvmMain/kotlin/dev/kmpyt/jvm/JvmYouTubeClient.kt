@@ -14,12 +14,13 @@ import io.ktor.client.plugins.HttpTimeout
 
 class JvmYouTubeDownloader(private val httpClient: HttpClient,
     private val ffmpegPath: String? = System.getenv("KMPYT_FFMPEG"),
-    private val allowLocalHttp: Boolean = false) : YouTubeDownloader {
+    private val allowLocalHttp: Boolean = false,
+    private val tuning: dev.kmpyt.ProgressiveDownloadTuning = dev.kmpyt.ProgressiveDownloadTuning.Default) : YouTubeDownloader {
     override suspend fun download(plan: PlannedDownload, destinationPath: String,
         onProgress: suspend (YouTubeDownloadProgress) -> Unit): YouTubeDownloadResult {
         val processor = JvmMediaProcessor(ffmpegPath)
         processor.preflight(plan)
-        return FileDownloadCoordinator(processor, httpClient, "Desktop", allowLocalHttp)
+        return FileDownloadCoordinator(processor, httpClient, "Desktop", allowLocalHttp, tuning)
             .download(plan, destinationPath, onProgress)
     }
 }

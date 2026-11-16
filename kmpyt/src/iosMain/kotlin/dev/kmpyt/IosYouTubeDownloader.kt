@@ -24,6 +24,7 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
         require(plan.credentialRef == null) { "The iOS adapter accepts anonymous inspected resources only." }
         require(plan.sabrCheckpoint == null) { "An external SABR checkpoint has no owned iOS track files. Retry the original destination instead." }
         YouTubeFormatCapabilities.downloadProblem(plan.primary, plan.audio, "iOS")?.let { error(it) }
+        SourceAvailability.await(plan)
         val parts = TransferPlanning.parts(plan)
         val representations = listOfNotNull(plan.primary, plan.audio)
         representations.forEach { representation ->
