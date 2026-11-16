@@ -346,76 +346,117 @@ private class SabrPlaybackBytes(private val session: YouTubeSabrStreamingSession
  * policy; a 401/403/410 fails closed with a stable code. Nothing is persisted.
  */
 internal class ProgressiveRangePlaybackBytes(private val http: HttpClient, private val request: SourcePlaybackRequest,
-    private val authorization: SourcePlaybackAuthorization, private val windowBytes: Long = 1_048_576L) : PlaybackBytes {
+    private val authorization: SourcePlaybackAuthorization, private val windowBytes: Long = 1_048_576L,
+    private val cachedWindows: Int = 4) : PlaybackBytes {
+    private class Window(val start: Long, val end: Long, val bytes: Deferred<ByteArray>)
+    private class RefusedException : IllegalStateException("Media access was refused.")
+
     private val track = request.plan.primary
     private val size = requireNotNull(track.sizeBytes)
     private val mutex = Mutex()
-    private var windowStart = -1L
-    private var window = ByteArray(0)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    /** Recent windows, most recent last; AVPlayer re-reads earlier offsets after probing. */
+    private val windows = ArrayDeque<Window>()
+    /** The validated final URL of the last redirect chain; each piece otherwise costs a 302 first. */
+    @kotlin.concurrent.Volatile private var resolvedUrl: String? = null
     @kotlin.concurrent.Volatile private var failure: String? = null
     override val failureCode: String? get() = failure
 
     override suspend fun start() = Unit
-    override suspend fun close() = mutex.withLock { window = ByteArray(0); windowStart = -1L }
+    override suspend fun close() {
+        scope.coroutineContext[Job]?.cancelAndJoin()
+        mutex.withLock { windows.clear() }
+    }
 
-    override suspend fun read(role: TrackRole, offset: Long, count: Int): ByteArray = mutex.withLock {
+    override suspend fun read(role: TrackRole, offset: Long, count: Int): ByteArray {
         require(role == track.role && count > 0 && offset >= 0 && offset < size)
         val wanted = minOf(count.toLong(), size - offset).toInt()
-        if (windowStart < 0 || offset < windowStart || offset + wanted > windowStart + window.size) {
-            val end = minOf(size, offset + maxOf(windowBytes, wanted.toLong())) - 1
-            window = fetch(offset, end)
-            windowStart = offset
+        var attempt = 0
+        while (true) {
+            val window = mutex.withLock {
+                windows.firstOrNull { offset >= it.start && offset + wanted - 1 <= it.end } ?: open(offset, wanted.toLong())
+            }
+            val bytes = try { window.bytes.await() } catch (cancelled: CancellationException) {
+                currentCoroutineContext().ensureActive()
+                // The shared window itself was cancelled (close or eviction); fetch it again.
+                mutex.withLock { windows.remove(window) }
+                if (++attempt > 1) throw cancelled
+                continue
+            } catch (error: Exception) {
+                mutex.withLock { windows.remove(window) }
+                if (++attempt > 1) {
+                    failure = if (error is RefusedException) "PROGRESSIVE_RESOURCE_NOT_AUTHORIZED" else "PROGRESSIVE_HTTP_REQUEST_FAILED"
+                    throw error
+                }
+                continue
+            }
+            failure = null
+            // Read ahead one window so the next sequential read is already local.
+            mutex.withLock { if (window.end + 1 < size && windows.none { window.end + 1 in it.start..it.end }) open(window.end + 1, 1) }
+            val from = (offset - window.start).toInt()
+            return bytes.copyOfRange(from, from + wanted)
         }
-        val from = (offset - windowStart).toInt()
-        window.copyOfRange(from, from + wanted)
+    }
+
+    /** Caller holds [mutex]. */
+    private fun open(start: Long, minimum: Long): Window {
+        val end = minOf(size, start + maxOf(windowBytes, minimum)) - 1
+        val window = Window(start, end, scope.async { fetch(start, end) })
+        windows.addLast(window)
+        while (windows.size > cachedWindows) windows.removeFirst()
+        return window
     }
 
     private suspend fun fetch(start: Long, end: Long): ByteArray {
-        var url = requireNotNull(track.url)
+        val original = requireNotNull(track.url)
+        resolvedUrl?.let { known ->
+            try { return fetchFrom(known, start, end) }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { resolvedUrl = null } // A stale redirect target: restart from the inspected URL.
+        }
+        return fetchFrom(original, start, end)
+    }
+
+    private suspend fun fetchFrom(first: String, start: Long, end: Long): ByteArray {
+        var url = first
         repeat(6) {
             currentCoroutineContext().ensureActive()
             authorization.requireResource(request, url)
             YouTubeDownloadPolicy.requireResource(url, request.plan.inspectionUrl, request.plan.mediaId)
             var next: String? = null
-            val bytes = try {
-                http.prepareGet(url) {
-                    header(io.ktor.http.HttpHeaders.AcceptEncoding, "identity")
-                    header(io.ktor.http.HttpHeaders.Range, "bytes=$start-$end")
-                }.execute { response ->
-                    val status = response.status.value
-                    debugProgressiveLoopback(status, start, end, response.headers[io.ktor.http.HttpHeaders.ContentRange] != null)
-                    if (status in setOf(301, 302, 303, 307, 308)) {
-                        val location = response.headers[io.ktor.http.HttpHeaders.Location] ?: error("Invalid media redirect.")
-                        next = platform.Foundation.NSURL(string = location, relativeToURL = platform.Foundation.NSURL(string = url))
-                            .absoluteURL?.absoluteString ?: error("Invalid media redirect.")
-                        return@execute null
-                    }
-                    if (status in setOf(401, 403, 410)) { failure = "PROGRESSIVE_RESOURCE_NOT_AUTHORIZED"; error("Media access was refused.") }
-                    check(status == 206) { failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"; "The media server ignored the exact range." }
-                    val range = dev.kmpyt.downloads.DownloadProtocol.parseContentRange(response.headers[io.ktor.http.HttpHeaders.ContentRange])
-                    check(range != null && range.first == start && range.last == end && (range.total == null || range.total == size)) {
-                        failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"; "The media server returned a different range."
-                    }
-                    val expected = (end - start + 1).toInt()
-                    val output = ByteArray(expected)
-                    val channel = response.bodyAsChannel()
-                    var filled = 0
-                    while (filled < expected) {
-                        val n = channel.readAvailable(output, filled, expected - filled)
-                        if (n < 0) break
-                        filled += n
-                    }
-                    check(filled == expected && channel.readAvailable(ByteArray(1), 0, 1) <= 0) {
-                        failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"; "The media range length differed."
-                    }
-                    output
+            val bytes = http.prepareGet(url) {
+                header(io.ktor.http.HttpHeaders.AcceptEncoding, "identity")
+                header(io.ktor.http.HttpHeaders.Range, "bytes=$start-$end")
+            }.execute { response ->
+                val status = response.status.value
+                debugProgressiveLoopback(status, start, end, response.headers[io.ktor.http.HttpHeaders.ContentRange] != null)
+                if (status in setOf(301, 302, 303, 307, 308)) {
+                    val location = response.headers[io.ktor.http.HttpHeaders.Location] ?: error("Invalid media redirect.")
+                    next = platform.Foundation.NSURL(string = location, relativeToURL = platform.Foundation.NSURL(string = url))
+                        .absoluteURL?.absoluteString ?: error("Invalid media redirect.")
+                    return@execute null
                 }
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (error: Exception) { if (failure == null) failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"; throw error }
-            if (bytes != null) { failure = null; return bytes }
+                if (status in setOf(401, 403, 410)) throw RefusedException()
+                check(status == 206) { "The media server ignored the exact range." }
+                val range = dev.kmpyt.downloads.DownloadProtocol.parseContentRange(response.headers[io.ktor.http.HttpHeaders.ContentRange])
+                check(range != null && range.first == start && range.last == end && (range.total == null || range.total == size)) {
+                    "The media server returned a different range."
+                }
+                val expected = (end - start + 1).toInt()
+                val output = ByteArray(expected)
+                val channel = response.bodyAsChannel()
+                var filled = 0
+                while (filled < expected) {
+                    val n = channel.readAvailable(output, filled, expected - filled)
+                    if (n < 0) break
+                    filled += n
+                }
+                check(filled == expected && channel.readAvailable(ByteArray(1), 0, 1) <= 0) { "The media range length differed." }
+                output
+            }
+            if (bytes != null) { resolvedUrl = url; return bytes }
             url = requireNotNull(next)
         }
-        failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"
         error("Too many media redirects.")
     }
 }
