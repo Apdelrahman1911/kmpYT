@@ -56,11 +56,42 @@ private fun measuredIosTransport(delegate: ResearchTransport): ResearchTransport
             val response = delegate.execute(request)
             val elapsed = ((NSProcessInfo.processInfo.systemUptime - started) * 1_000).toLong()
             println("VEYRA_SOURCE_TIMING stage=$stage outcome=END elapsedMs=$elapsed status=${response.status} characters=${response.body.length} uptimeMs=${(NSProcessInfo.processInfo.systemUptime * 1_000).toLong()}")
+            if (request.stage == "youtube-player-client") debugIosAvailability(request, response.body)
             response
         } catch (error: Throwable) {
             val elapsed = ((NSProcessInfo.processInfo.systemUptime - started) * 1_000).toLong()
             println("VEYRA_SOURCE_TIMING stage=$stage outcome=FAILED elapsedMs=$elapsed")
             throw error
         }
+    }
+}
+
+/** Debug binaries only: redacted shape of source-declared pre-playback declarations (names and counts, no URLs). */
+private fun debugIosAvailability(request: dev.kmpyt.extraction.ResearchRequest, body: String) {
+    runCatching {
+        val player = kotlinx.serialization.json.Json.parseToJsonElement(body) as? kotlinx.serialization.json.JsonObject ?: return
+        fun kotlinx.serialization.json.JsonElement?.obj() = this as? kotlinx.serialization.json.JsonObject
+        fun kotlinx.serialization.json.JsonElement?.arr() = this as? kotlinx.serialization.json.JsonArray
+        fun kotlinx.serialization.json.JsonElement?.str() = (this as? kotlinx.serialization.json.JsonPrimitive)?.takeIf { it.isString }?.content
+        val client = request.body?.let { runCatching { kotlinx.serialization.json.Json.parseToJsonElement(it).obj()?.get("context").obj()?.get("client").obj()?.get("clientName").str() }.getOrNull() }
+        val placements = player["adPlacements"].arr().orEmpty().mapNotNull { entry ->
+            val renderer = entry.obj()?.get("adPlacementRenderer").obj() ?: return@mapNotNull "other:" + entry.obj()?.keys?.joinToString("+")
+            val kind = renderer["config"].obj()?.get("adPlacementConfig").obj()?.get("kind").str()
+            val inner = renderer["renderer"].obj()?.keys?.joinToString("+")
+            val skip = renderer["renderer"].obj()?.get("instreamVideoAdRenderer").obj()?.get("skipOffsetMilliseconds").str()
+            "$kind/$inner/skip=$skip"
+        }
+        val slots = player["adSlots"].arr().orEmpty().mapNotNull { entry ->
+            val slot = entry.obj()?.get("adSlotRenderer").obj() ?: return@mapNotNull "other:" + entry.obj()?.keys?.joinToString("+")
+            val trigger = slot["adSlotMetadata"].obj()?.get("triggerEvent").str()
+            val layout = slot["fulfillmentContent"].obj()?.get("fulfilledLayout").obj()?.keys?.joinToString("+")
+            val content = slot["fulfillmentContent"].obj()?.get("fulfilledLayout").obj()?.get("playerBytesAdLayoutRenderer").obj()
+                ?.get("renderingContent").obj()?.keys?.joinToString("+")
+            "$trigger/$layout/$content"
+        }
+        val status = player["playabilityStatus"].obj()?.get("status").str()
+        val waitMs = dev.kmpyt.extraction.SourceAvailability.waitMillis(player)
+        val topKeys = player.keys.filter { it.contains("ad", ignoreCase = true) }
+        println("VEYRA_SOURCE_AVAILABILITY client=$client status=$status waitMs=$waitMs adKeys=$topKeys placements=$placements slots=$slots")
     }
 }
