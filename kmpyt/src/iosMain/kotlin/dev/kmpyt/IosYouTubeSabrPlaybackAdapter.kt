@@ -6,6 +6,10 @@ import dev.kmpyt.extraction.*
 import dev.kmpyt.internal.PlaybackHttpProtocol
 import dev.kmpyt.internal.PlaybackHttpResponse
 import io.ktor.client.HttpClient
+import io.ktor.client.request.header
+import io.ktor.client.request.prepareGet
+import io.ktor.client.statement.bodyAsChannel
+import io.ktor.utils.io.readAvailable
 import kotlinx.cinterop.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -34,7 +38,8 @@ private class IosSabrPlaybackAdapter(private val http: HttpClient, private val c
         var resource: IosSabrPlaybackResource? = null
         try {
             return withContext(Dispatchers.Default) {
-                request.requireStaticSabr()
+                val progressive = request.plan.primary.transport == TransportKind.PROGRESSIVE
+                if (progressive) request.requireStaticProgressive() else request.requireStaticSabr()
                 SourceAvailability.await(request.plan)
                 val tracks = listOfNotNull(request.plan.primary, request.plan.audio)
                 var total = 0L
@@ -43,7 +48,8 @@ private class IosSabrPlaybackAdapter(private val http: HttpClient, private val c
                     require(bytes > 0 && bytes <= limits.maxCacheBytes - total) { "The static playback cache exceeds its configured byte bound." }
                     total += bytes
                 }
-                authorization.requireResource(request, requireNotNull(request.plan.primary.sabr).endpoint)
+                authorization.requireResource(request,
+                    if (progressive) requireNotNull(request.plan.primary.url) else requireNotNull(request.plan.primary.sabr).endpoint)
                 currentCoroutineContext().ensureActive()
                 require(cacheDirectory.startsWith('/') && '\u0000' !in cacheDirectory)
                 val parent = memScoped {
@@ -61,12 +67,18 @@ private class IosSabrPlaybackAdapter(private val http: HttpClient, private val c
                             "Could not create a private playback capability."
                         }
                     } }.joinToString("") { (it.toInt() and 255).toString(16).padStart(2, '0') }
-                    for (track in tracks) caches[track.role] = IosPlaybackCache(
+                    // Progressive bytes are served from bounded in-memory range windows; no cache file.
+                    if (!progressive) for (track in tracks) caches[track.role] = IosPlaybackCache(
                         "$directory/${track.role.name.lowercase()}.media", requireNotNull(track.sizeBytes))
                     val (socket, port) = createIosPlaybackListener(limits.maxConnections)
                     listener = socket
-                    val created = IosSabrPlaybackResource(http, request, authorization, socket, port, directory,
-                        caches.toMap(), capability, limits)
+                    val cacheMap = caches.toMap()
+                    val created = IosSabrPlaybackResource(request, socket, port, directory, capability, limits) { scope ->
+                        if (progressive) ProgressiveRangePlaybackBytes(http, request, authorization)
+                        else SabrPlaybackBytes(YouTubeSabrStreamingSession(http, request, cacheMap, scope, authorization,
+                            SabrStreamingLimits(limits.maxCacheBytes, limits.chunkBytes, limits.waitTimeoutMs),
+                            nowEpochMs = { (NSDate().timeIntervalSince1970 * 1000).toLong() }))
+                    }
                     resource = created
                     created.start()
                     created
@@ -196,21 +208,19 @@ private fun createIosPlaybackListener(backlog: Int): Pair<IosPlaybackSocket, Int
     } catch (failure: Throwable) { platform.posix.close(descriptor); throw failure }
 }
 
-private class IosSabrPlaybackResource(http: HttpClient, request: SourcePlaybackRequest,
-    authorization: SourcePlaybackAuthorization, private val listener: IosPlaybackSocket, port: Int,
-    private val directory: String, caches: Map<TrackRole, YouTubeSabrPlaybackCache>, capability: String,
-    private val limits: YouTubeNativePlaybackLimits) : YouTubePlaybackResource {
+private class IosSabrPlaybackResource(request: SourcePlaybackRequest,
+    private val listener: IosPlaybackSocket, port: Int,
+    private val directory: String, capability: String,
+    private val limits: YouTubeNativePlaybackLimits, source: (CoroutineScope) -> PlaybackBytes) : YouTubePlaybackResource {
     private val job = SupervisorJob()
     private val scope = CoroutineScope(job + Dispatchers.Default)
-    private val session = YouTubeSabrStreamingSession(http, request, caches, scope, authorization,
-        SabrStreamingLimits(limits.maxCacheBytes, limits.chunkBytes, limits.waitTimeoutMs),
-        nowEpochMs = { (NSDate().timeIntervalSince1970 * 1000).toLong() })
+    private val session = source(scope)
     private val closing = MutableStateFlow(false)
     private val closed = CompletableDeferred<Unit>()
     private val connections = Mutex()
     private val sockets = mutableSetOf<IosPlaybackSocket>()
     private var accepting: Job? = null
-    override val failureCode: String? get() = session.state.value.takeIf { it.status == SabrStreamingStatus.FAILED }?.errorCode
+    override val failureCode: String? get() = session.failureCode
     override val endpoints = listOfNotNull(request.plan.primary, request.plan.audio).map { track ->
         YouTubePlaybackEndpoint(track.role, "http://127.0.0.1:$port/$capability/${track.role.name.lowercase()}",
             track.mimeType.substringBefore(';').trim().lowercase(), requireNotNull(track.sizeBytes))
@@ -311,4 +321,100 @@ private class IosSabrPlaybackResource(http: HttpClient, request: SourcePlaybackR
         closed.complete(Unit)
     }
     override fun toString() = "YouTubePlaybackResource(<redacted>)"
+}
+
+/** The bytes behind one loopback playback resource: a static SABR session or a progressive object. */
+internal interface PlaybackBytes {
+    val failureCode: String?
+    suspend fun start()
+    suspend fun read(role: TrackRole, offset: Long, count: Int): ByteArray
+    suspend fun close()
+}
+
+private class SabrPlaybackBytes(private val session: YouTubeSabrStreamingSession) : PlaybackBytes {
+    override val failureCode: String? get() = session.state.value.takeIf { it.status == SabrStreamingStatus.FAILED }?.errorCode
+    override suspend fun start() { session.start() }
+    override suspend fun read(role: TrackRole, offset: Long, count: Int) = session.read(role, offset, count)
+    override suspend fun close() { session.close() }
+}
+
+/**
+ * Serves one progressive audio object to AVPlayer through the owned loopback, as exact
+ * `Range: bytes=a-b` windows of at most [windowBytes]. AVPlayer's own open-ended request for
+ * these objects is refused (2026-11-11 record: HTTP 403 / -11800), while exact ranges return 206.
+ * Every request and redirect destination passes the caller's authorization and the download
+ * policy; a 401/403/410 fails closed with a stable code. Nothing is persisted.
+ */
+internal class ProgressiveRangePlaybackBytes(private val http: HttpClient, private val request: SourcePlaybackRequest,
+    private val authorization: SourcePlaybackAuthorization, private val windowBytes: Long = 1_048_576L) : PlaybackBytes {
+    private val track = request.plan.primary
+    private val size = requireNotNull(track.sizeBytes)
+    private val mutex = Mutex()
+    private var windowStart = -1L
+    private var window = ByteArray(0)
+    @kotlin.concurrent.Volatile private var failure: String? = null
+    override val failureCode: String? get() = failure
+
+    override suspend fun start() = Unit
+    override suspend fun close() = mutex.withLock { window = ByteArray(0); windowStart = -1L }
+
+    override suspend fun read(role: TrackRole, offset: Long, count: Int): ByteArray = mutex.withLock {
+        require(role == track.role && count > 0 && offset >= 0 && offset < size)
+        val wanted = minOf(count.toLong(), size - offset).toInt()
+        if (windowStart < 0 || offset < windowStart || offset + wanted > windowStart + window.size) {
+            val end = minOf(size, offset + maxOf(windowBytes, wanted.toLong())) - 1
+            window = fetch(offset, end)
+            windowStart = offset
+        }
+        val from = (offset - windowStart).toInt()
+        window.copyOfRange(from, from + wanted)
+    }
+
+    private suspend fun fetch(start: Long, end: Long): ByteArray {
+        var url = requireNotNull(track.url)
+        repeat(6) {
+            currentCoroutineContext().ensureActive()
+            authorization.requireResource(request, url)
+            YouTubeDownloadPolicy.requireResource(url, request.plan.inspectionUrl, request.plan.mediaId)
+            var next: String? = null
+            val bytes = try {
+                http.prepareGet(url) {
+                    header(io.ktor.http.HttpHeaders.AcceptEncoding, "identity")
+                    header(io.ktor.http.HttpHeaders.Range, "bytes=$start-$end")
+                }.execute { response ->
+                    val status = response.status.value
+                    if (status in setOf(301, 302, 303, 307, 308)) {
+                        val location = response.headers[io.ktor.http.HttpHeaders.Location] ?: error("Invalid media redirect.")
+                        next = platform.Foundation.NSURL(string = location, relativeToURL = platform.Foundation.NSURL(string = url))
+                            .absoluteURL?.absoluteString ?: error("Invalid media redirect.")
+                        return@execute null
+                    }
+                    if (status in setOf(401, 403, 410)) { failure = "PROGRESSIVE_RESOURCE_NOT_AUTHORIZED"; error("Media access was refused.") }
+                    check(status == 206) { failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"; "The media server ignored the exact range." }
+                    val range = dev.kmpyt.downloads.DownloadProtocol.parseContentRange(response.headers[io.ktor.http.HttpHeaders.ContentRange])
+                    check(range != null && range.first == start && range.last == end && (range.total == null || range.total == size)) {
+                        failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"; "The media server returned a different range."
+                    }
+                    val expected = (end - start + 1).toInt()
+                    val output = ByteArray(expected)
+                    val channel = response.bodyAsChannel()
+                    var filled = 0
+                    while (filled < expected) {
+                        val n = channel.readAvailable(output, filled, expected - filled)
+                        if (n < 0) break
+                        filled += n
+                    }
+                    check(filled == expected && channel.readAvailable(ByteArray(1), 0, 1) <= 0) {
+                        failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"; "The media range length differed."
+                    }
+                    output
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { if (failure == null) failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"; throw error }
+            if (bytes != null) { failure = null; return bytes }
+            url = requireNotNull(next)
+        }
+        failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"
+        error("Too many media redirects.")
+    }
 }

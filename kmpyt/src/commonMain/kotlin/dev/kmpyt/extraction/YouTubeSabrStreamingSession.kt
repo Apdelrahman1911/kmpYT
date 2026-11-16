@@ -47,6 +47,14 @@ data class SourcePlaybackRequest(val metadata: SourcePlaybackMetadata, val plan:
         }
     }
 
+    /** One complete progressive audio object, for hosts whose player needs exact-range loopback reads. */
+    @Throws(Exception::class)
+    fun requireStaticProgressive() {
+        requireSupportedSource()
+        require(plan.audio == null && plan.primary.role == TrackRole.AUDIO && plan.primary.transport == TransportKind.PROGRESSIVE &&
+            plan.primary.url != null && (plan.primary.sizeBytes ?: 0L) > 0L && plan.primary.selectable)
+    }
+
     @Throws(Exception::class)
     fun requireStaticSabr() {
         requireSupportedSource()

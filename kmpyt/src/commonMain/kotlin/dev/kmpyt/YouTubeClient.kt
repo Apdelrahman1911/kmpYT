@@ -167,7 +167,8 @@ class YouTubeClient(
         var acquiredByClient: OwnedPlaybackResource? = null
         try {
             return operation {
-                request.requireStaticSabr()
+                if (request.plan.primary.transport == TransportKind.PROGRESSIVE) request.requireStaticProgressive()
+                else request.requireStaticSabr()
                 validatePlan(request.plan)
                 SourceAvailability.await(request.plan)
                 val adapter = requireNotNull(playbackAdapter) { "Supply a native YouTubePlaybackAdapter for static SABR playback." }
