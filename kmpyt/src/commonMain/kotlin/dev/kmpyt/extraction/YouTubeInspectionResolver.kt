@@ -197,7 +197,7 @@ internal data class YouTubePublicMetadata(val title: String? = null, val thumbna
         fun fromHtml(body: String, canonical: String): YouTubePublicMetadata? {
             if (body.length > YouTubeProvider.MAX_PAGE_BODY) return null
             val fields = mutableMapOf<String, String>()
-            Regex("<(?:meta|link)\\b[^>]{0,16000}>", RegexOption.IGNORE_CASE).findAll(body).take(512).forEach { match ->
+            EmbeddedData.findAllAt(Regex("<(?:meta|link)\\b[^>]{0,16000}>", RegexOption.IGNORE_CASE), body, listOf("<meta", "<link")) { it + 16_010 }.take(512).forEach { match ->
                 val values = attributes(match.value)
                 val key = values["property"] ?: values["name"] ?: values["itemprop"] ?: values["rel"]
                 val value = values["content"] ?: values["href"]
@@ -209,9 +209,7 @@ internal data class YouTubePublicMetadata(val title: String? = null, val thumbna
             var thumbnail = imageUrl(fields["og:image"] ?: fields["thumbnailurl"])
             var duration = parseDuration(fields["duration"])
             var author: String? = fields["author"]
-            Regex("<script\\b[^>]*type\\s*=\\s*[\"']application/ld\\+json[\"'][^>]*>([\\s\\S]*?)</script\\s*>", RegexOption.IGNORE_CASE)
-                .findAll(body).take(16).forEach { script ->
-                    val text = script.groupValues[1]
+            EmbeddedData.ldJsonScripts(body).take(16).forEach { text ->
                     if (text.length > EmbeddedData.MAX_BODY) return@forEach
                     val objects = runCatching { EmbeddedData.objects(listOf(Json.parseToJsonElement(text))) }.getOrNull() ?: return@forEach
                     val video = objects.firstOrNull { objectValue ->

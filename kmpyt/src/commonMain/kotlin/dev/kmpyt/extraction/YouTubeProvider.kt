@@ -55,7 +55,7 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
         require(body.length <= MAX_PAGE_BODY)
         // Watch pages contain large unrelated recommendation trees. Read only the
         // named player assignment when available; do not traverse ytInitialData.
-        val base = assignedJson(body, "(?:ytInitialPlayerResponse|playerResponse)").toMutableList()
+        val base = assignedJson(body, "ytInitialPlayerResponse|playerResponse", listOf("ytInitialPlayerResponse", "playerResponse")).toMutableList()
         if (base.isEmpty()) base += EmbeddedData.documents(body)
         val objects = EmbeddedData.objects(base.distinct())
         var expanded = false
@@ -321,8 +321,8 @@ class YouTubeProvider(private val transforms: YouTubeUrlTransforms? = null,
     }
 
     /** Each parsed JSON object is bounded even when the surrounding HTML is larger. */
-    private fun assignedJson(body: String, identifier: String): List<JsonElement> =
-        Regex("$identifier\\s*[=:]\\s*", RegexOption.IGNORE_CASE).findAll(body).take(32).mapNotNull { match ->
+    private fun assignedJson(body: String, identifier: String, prefixes: List<String>): List<JsonElement> =
+        EmbeddedData.findAllAt(Regex("(?:$identifier)\\s*[=:]\\s*", RegexOption.IGNORE_CASE), body, prefixes) { it + 4_096 }.take(32).mapNotNull { match ->
             val start = match.range.last + 1
             if (body.getOrNull(start) != '{') return@mapNotNull null
             val bounded = body.substring(start, minOf(body.length, start + EmbeddedData.MAX_BODY))
