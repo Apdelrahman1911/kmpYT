@@ -57,6 +57,8 @@ private fun measuredIosTransport(delegate: ResearchTransport): ResearchTransport
             val elapsed = ((NSProcessInfo.processInfo.systemUptime - started) * 1_000).toLong()
             println("VEYRA_SOURCE_TIMING stage=$stage outcome=END elapsedMs=$elapsed status=${response.status} characters=${response.body.length} uptimeMs=${(NSProcessInfo.processInfo.systemUptime * 1_000).toLong()}")
             if (request.stage == "youtube-player-client") debugIosAvailability(request, response.body)
+            if (stage == "BROWSE") Regex("\"itemSectionRenderer\":\\{\"contents\":\\[\\{\"([A-Za-z]{1,64})\"").findAll(response.body).take(3)
+                .map { it.groupValues[1] }.toList().takeIf { it.isNotEmpty() }?.let { println("VEYRA_SEARCH_LEADING_CARDS $it") }
             response
         } catch (error: Throwable) {
             val elapsed = ((NSProcessInfo.processInfo.systemUptime - started) * 1_000).toLong()
