@@ -285,7 +285,7 @@ class YouTubeResponseExtractor(
                     representations = representations.values.toList())
             }
         }
-        return ProviderResult(media, original.diagnostics + incoming.diagnostics)
+        return ProviderResult(media.map(::sharedSourceAvailability), original.diagnostics + incoming.diagnostics)
     }
 
     /** Preserve complete SABR pairs even if the extra response only exposes one progressive track. */
@@ -321,11 +321,25 @@ class YouTubeResponseExtractor(
                 captions = fresh.captions ?: old.captions,
                 uploaderChannelId = old.uploaderChannelId ?: fresh.uploaderChannelId)
         }
-        return ProviderResult(media, original.diagnostics + incoming.diagnostics)
+        return ProviderResult(media.map(::sharedSourceAvailability), original.diagnostics + incoming.diagnostics)
     }
 
     private fun fields(rep: Representation) = listOf(rep.url, rep.codecs, rep.width, rep.height, rep.bitrate, rep.sizeBytes, rep.qualityLabel).count { it != null }
 
     private fun diagnostic(code: String, message: String) = ExtractionDiagnostic("youtube-player-client", code, message)
 
+}
+
+/**
+ * One inspection's player responses describe the same video for the same visitor. A pre-roll
+ * wait declared by any of them gates media access for all of them (observed: a WEB/SABR track
+ * whose own response declared no wait was refused while the TV response for the same visitor
+ * declared 5 s). Apply the longest declared deadline to every track; this can only lengthen a
+ * wait, never shorten or remove one.
+ */
+internal fun sharedSourceAvailability(media: ExtractedMedia): ExtractedMedia {
+    val deadline = media.representations.mapNotNull { it.availableAtEpochMs }.maxOrNull() ?: return media
+    return media.copy(representations = media.representations.map {
+        if ((it.availableAtEpochMs ?: Long.MIN_VALUE) < deadline) it.copy(availableAtEpochMs = deadline) else it
+    })
 }
