@@ -28,7 +28,7 @@ import kotlin.coroutines.CoroutineContext
  * from an active download's progress callback.
  */
 class YouTubeClient(
-    private val transport: ResearchTransport,
+    transport: ResearchTransport,
     playerRuntime: YouTubeJavaScriptRuntime? = null,
     private val downloader: YouTubeDownloader? = null,
     private val onClose: () -> Unit = {},
@@ -43,6 +43,8 @@ class YouTubeClient(
      */
     publicClientOrder: List<String> = YouTubePublicPlayerClients.DEFAULT_ORDER,
 ) {
+    /** Every request carries a neutral language so all platforms see the same source titles. */
+    private val transport: ResearchTransport = NeutralLanguageTransport(transport)
     private val compiler: YouTubePlayerProgramCompiler = playerRuntime?.let(::ContextYouTubePlayerProgramCompiler)
         ?: BoundedYouTubePlayerProgramCompiler()
     private val programs = YouTubePlayerProgramCache(transport, compiler, cacheEntries = 1, store = programStore)
