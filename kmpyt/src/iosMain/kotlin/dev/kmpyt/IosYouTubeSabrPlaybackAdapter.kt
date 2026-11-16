@@ -383,6 +383,7 @@ internal class ProgressiveRangePlaybackBytes(private val http: HttpClient, priva
                     header(io.ktor.http.HttpHeaders.Range, "bytes=$start-$end")
                 }.execute { response ->
                     val status = response.status.value
+                    debugProgressiveLoopback(status, start, end, response.headers[io.ktor.http.HttpHeaders.ContentRange] != null)
                     if (status in setOf(301, 302, 303, 307, 308)) {
                         val location = response.headers[io.ktor.http.HttpHeaders.Location] ?: error("Invalid media redirect.")
                         next = platform.Foundation.NSURL(string = location, relativeToURL = platform.Foundation.NSURL(string = url))
@@ -417,4 +418,9 @@ internal class ProgressiveRangePlaybackBytes(private val http: HttpClient, priva
         failure = "PROGRESSIVE_HTTP_REQUEST_FAILED"
         error("Too many media redirects.")
     }
+}
+
+@OptIn(kotlin.experimental.ExperimentalNativeApi::class)
+private fun debugProgressiveLoopback(status: Int, start: Long, end: Long, hasRange: Boolean) {
+    if (kotlin.native.Platform.isDebugBinary) println("VEYRA_PROGRESSIVE_LOOPBACK status=$status range=$start-$end contentRange=$hasRange")
 }
