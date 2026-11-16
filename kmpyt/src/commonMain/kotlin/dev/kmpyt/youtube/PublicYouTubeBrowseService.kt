@@ -171,8 +171,11 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
         var unavailable = 0
         var truncated = false
         var firstEntry: YouTubeBrowseEntry? = null
+        // Inside a suggestion shelf (related videos, Shorts grid): its tiles are not the answer to
+        // the query, so they never become the leading result (owner decision 2026-11-16, D005).
+        var suggestionDepth = 0
         fun unknown(issue: YouTubeBrowseEntryIssue) {
-            if (firstEntry == null) firstEntry = YouTubeBrowseEntry(null, null, null, null, issue)
+            if (firstEntry == null && suggestionDepth == 0) firstEntry = YouTubeBrowseEntry(null, null, null, null, issue)
         }
         fun continuation(value: JsonObject) {
             val command = value.obj("continuationEndpoint") ?: value
@@ -197,30 +200,33 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
                     }
                     value.obj("continuationItemRenderer")?.let { continuation(it); return }
                     if (value.containsKey("nextContinuationData")) { continuation(value); return }
-                    value.entries.firstOrNull { it.key in SHELF_RENDERERS }?.let { (key, child) ->
+                    value.entries.firstOrNull { it.key in SHELF_RENDERERS || isSuggestionShelf(it.key) }?.let { (key, child) ->
                         if (child !is JsonObject) { unknown(YouTubeBrowseEntryIssue.INVALID_METADATA); return }
                         val shelf = readItem(key, child, source)
                         // A navigable album/channel/playlist shelf is itself a collection result.
                         // Never replace that first result with one of its child video tiles.
                         val collection = shelf.entry.kind in setOf(YouTubeBrowseKind.CHANNEL, YouTubeBrowseKind.PLAYLIST)
-                        if (firstEntry == null) firstEntry = if (collection) shelf.entry else
-                            YouTubeBrowseEntry(null, null, shelf.entry.title, null,
-                                shelf.entry.issue?.takeIf { it != YouTubeBrowseEntryIssue.INVALID_METADATA }
-                                    ?: YouTubeBrowseEntryIssue.UNSUPPORTED)
                         if (collection) {
+                            if (firstEntry == null && suggestionDepth == 0) firstEntry = shelf.entry
                             if (shelf.item != null && items.size < MAX_PAGE_ITEMS) items += shelf.item
                             else if (shelf.item != null) truncated = true else unavailable++
                             return
                         }
-                        // An unrecognized shelf may still expose child rows in the browsing UI,
-                        // but its UNKNOWN leading receipt remains authoritative for selection.
+                        // A suggestion shelf is skipped for selection; its tiles may still appear
+                        // as browsing rows, but the leading result is the next standalone entry.
+                        suggestionDepth++
+                        try {
+                            val children = RESULT_CHILDREN[key]?.firstNotNullOfOrNull { child[it] }
+                            if (children != null) visit(children, depth + 1) else child.values.forEach { visit(it, depth + 1) }
+                        } finally { suggestionDepth-- }
+                        return
                     }
                     for ((key, child) in value) {
                         if (key in ITEM_RENDERERS) {
                             if (child !is JsonObject) { unknown(YouTubeBrowseEntryIssue.INVALID_METADATA); return }
                             if (items.size >= MAX_PAGE_ITEMS) { truncated = true; return }
                             val result = readItem(key, child, source)
-                            if (firstEntry == null) firstEntry = result.entry
+                            if (firstEntry == null && suggestionDepth == 0) firstEntry = result.entry
                             if (result.item != null) items += result.item else unavailable++
                             return
                         }
@@ -496,6 +502,8 @@ class PublicYouTubeBrowseService(private val transport: ResearchTransport) : You
             "playlistVideoRenderer", "playlistPanelVideoRenderer", "reelItemRenderer", "shortsLockupViewModel", "lockupViewModel", "videoWithContextRenderer")
         private val AD_RENDERERS = setOf("adSlotRenderer", "adPlacementRenderer", "inFeedAdLayoutRenderer", "promotedVideoRenderer", "promotedSparklesWebRenderer", "displayAdRenderer")
         private val SHELF_RENDERERS = setOf("shelfRenderer", "richShelfRenderer", "reelShelfRenderer")
+        /** Newer suggestion/Shorts shelf layouts, e.g. `gridShelfViewModel`. */
+        private fun isSuggestionShelf(key: String) = key.endsWith("ShelfViewModel") || key.endsWith("ShelfRenderer")
         private val RESULT_CHILDREN = mapOf(
             "sectionListRenderer" to listOf("contents"),
             "itemSectionRenderer" to listOf("contents"),

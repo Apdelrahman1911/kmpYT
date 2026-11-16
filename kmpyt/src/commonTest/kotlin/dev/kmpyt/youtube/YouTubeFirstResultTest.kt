@@ -124,13 +124,20 @@ class YouTubeFirstResultTest {
             assertEquals(listOf(id, laterId), page.items.map { it.id })
             assertTrue(page.items.none { it.id == firstId })
         }
-        val unknownShelf = buildJsonObject { putJsonObject("reelShelfRenderer") {
+        // Owner decision 2026-11-16: a leading suggestion shelf (Shorts, related grid) is not the
+        // answer to the query; the first standalone result is, and shelf tiles never become it.
+        val shortsShelf = buildJsonObject { putJsonObject("reelShelfRenderer") {
             put("title", "Shorts shelf"); put("items", JsonArray(listOf(video())))
         } }
-        val unknown = PublicYouTubeBrowseService(Transport(body(unknownShelf, video(laterId)))).search("Title")
-        assertNull(unknown.firstEntry?.kind); assertNull(unknown.firstEntry?.id)
-        assertEquals(YouTubeBrowseEntryIssue.UNSUPPORTED, unknown.firstEntry?.issue)
-        assertEquals(listOf(firstId, laterId), unknown.items.map { it.id })
+        val shorts = PublicYouTubeBrowseService(Transport(body(shortsShelf, video(laterId)))).search("Title")
+        assertEquals(laterId, shorts.firstEntry?.id)
+        assertEquals(listOf(firstId, laterId), shorts.items.map { it.id })
+        val gridShelf = buildJsonObject { putJsonObject("gridShelfViewModel") {
+            put("contents", JsonArray(listOf(video())))
+        } }
+        assertEquals(laterId, PublicYouTubeBrowseService(Transport(body(gridShelf, video(laterId)))).search("Title").firstEntry?.id)
+        val onlyShelf = PublicYouTubeBrowseService(Transport(body(gridShelf))).search("Title")
+        assertNull(onlyShelf.firstEntry?.id)
     }
 
     @Test fun firstOversizedMissingOrMalformedTitleIsNotShortenedOrSkipped() = runTest {
