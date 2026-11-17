@@ -35,12 +35,28 @@ class IosProgressiveLoopbackTest {
             assertContentEquals(bytes.copyOfRange(400, 900), source.read(TrackRole.AUDIO, 400, 500))
             assertContentEquals(bytes.copyOfRange(2500, 3000), source.read(TrackRole.AUDIO, 2500, 800))
             assertEquals("bytes=0-999", ranges.first())
-            assertTrue(ranges.contains("bytes=2500-2999"))
+            assertTrue(ranges.contains("bytes=2000-2999"))
             // Every request is an exact bounded window, each authorized; re-reads come from memory.
             assertTrue(ranges.all { r -> Regex("bytes=(\\d+)-(\\d+)").matchEntire(r!!)!!.destructured.let { (a, b) -> b.toLong() - a.toLong() < 1000 } })
             assertEquals(ranges.size, authorized.size)
             assertContentEquals(bytes.copyOfRange(100, 300), source.read(TrackRole.AUDIO, 100, 200))
             assertNull(source.failureCode)
+        } finally { source.close(); http.close() }
+    }
+
+    @Test fun readsAcrossWindowBoundariesNeverRefetchOverlappingBytes() = iosTest {
+        // AVPlayer's reads straddle window boundaries; each window must be fetched exactly once.
+        val ranges = mutableListOf<String?>()
+        val http = HttpClient(engine(ranges))
+        val source = ProgressiveRangePlaybackBytes(http, request(), SourcePlaybackAuthorization { _, _ -> }, windowBytes = 1000)
+        try {
+            val first = source.read(TrackRole.AUDIO, 900, 300)
+            assertContentEquals(bytes.copyOfRange(900, 1000), first) // short read up to the boundary
+            assertContentEquals(bytes.copyOfRange(1000, 1200), source.read(TrackRole.AUDIO, 1000, 200))
+            assertContentEquals(bytes.copyOfRange(2950, 3000), source.read(TrackRole.AUDIO, 2950, 400))
+            assertContentEquals(bytes.copyOfRange(10, 20), source.read(TrackRole.AUDIO, 10, 10))
+            assertEquals(setOf("bytes=0-999", "bytes=1000-1999", "bytes=2000-2999"), ranges.toSet())
+            assertEquals(ranges.size, ranges.distinct().size, "a window was fetched twice: $ranges")
         } finally { source.close(); http.close() }
     }
 

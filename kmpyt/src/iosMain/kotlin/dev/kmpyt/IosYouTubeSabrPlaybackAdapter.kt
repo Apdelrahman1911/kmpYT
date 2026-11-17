@@ -344,10 +344,15 @@ private class SabrPlaybackBytes(private val session: YouTubeSabrStreamingSession
  * these objects is refused (2026-11-11 record: HTTP 403 / -11800), while exact ranges return 206.
  * Every request and redirect destination passes the caller's authorization and the download
  * policy; a 401/403/410 fails closed with a stable code. Nothing is persisted.
+ *
+ * Windows sit on fixed [windowBytes] boundaries and are never fetched twice while cached: a read
+ * that crosses a boundary returns the bytes up to it (the loopback asks again for the rest).
+ * Starting a window at each read offset instead re-downloaded overlapping megabytes whenever
+ * AVPlayer's reads straddled a boundary, about four times the object before playback began.
  */
 internal class ProgressiveRangePlaybackBytes(private val http: HttpClient, private val request: SourcePlaybackRequest,
     private val authorization: SourcePlaybackAuthorization, private val windowBytes: Long = 1_048_576L,
-    private val cachedWindows: Int = 4) : PlaybackBytes {
+    private val cachedWindows: Int = 8, private val readAheadWindows: Int = 2) : PlaybackBytes {
     private class Window(val start: Long, val end: Long, val bytes: Deferred<ByteArray>)
     private class RefusedException : IllegalStateException("Media access was refused.")
 
@@ -370,12 +375,10 @@ internal class ProgressiveRangePlaybackBytes(private val http: HttpClient, priva
 
     override suspend fun read(role: TrackRole, offset: Long, count: Int): ByteArray {
         require(role == track.role && count > 0 && offset >= 0 && offset < size)
-        val wanted = minOf(count.toLong(), size - offset).toInt()
+        val index = offset / windowBytes
         var attempt = 0
         while (true) {
-            val window = mutex.withLock {
-                windows.firstOrNull { offset >= it.start && offset + wanted - 1 <= it.end } ?: open(offset, wanted.toLong())
-            }
+            val window = mutex.withLock { cached(index) ?: open(index) }
             val bytes = try { window.bytes.await() } catch (cancelled: CancellationException) {
                 currentCoroutineContext().ensureActive()
                 // The shared window itself was cancelled (close or eviction); fetch it again.
@@ -391,16 +394,30 @@ internal class ProgressiveRangePlaybackBytes(private val http: HttpClient, priva
                 continue
             }
             failure = null
-            // Read ahead one window so the next sequential read is already local.
-            mutex.withLock { if (window.end + 1 < size && windows.none { window.end + 1 in it.start..it.end }) open(window.end + 1, 1) }
+            // Read ahead so the next sequential reads are already local.
+            mutex.withLock {
+                for (next in index + 1..index + readAheadWindows) {
+                    if (next * windowBytes >= size) break
+                    if (windows.none { it.start == next * windowBytes }) open(next)
+                }
+            }
             val from = (offset - window.start).toInt()
+            val wanted = minOf(count.toLong(), window.end - offset + 1).toInt()
             return bytes.copyOfRange(from, from + wanted)
         }
     }
 
-    /** Caller holds [mutex]. */
-    private fun open(start: Long, minimum: Long): Window {
-        val end = minOf(size, start + maxOf(windowBytes, minimum)) - 1
+    /** Caller holds [mutex]. A hit becomes the most recently used window. */
+    private fun cached(index: Long): Window? {
+        val window = windows.firstOrNull { it.start == index * windowBytes } ?: return null
+        windows.remove(window); windows.addLast(window)
+        return window
+    }
+
+    /** Caller holds [mutex]. Evicts the least recently used window beyond [cachedWindows]. */
+    private fun open(index: Long): Window {
+        val start = index * windowBytes
+        val end = minOf(size, start + windowBytes) - 1
         val window = Window(start, end, scope.async { fetch(start, end) })
         windows.addLast(window)
         while (windows.size > cachedWindows) windows.removeFirst()
