@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import platform.CoreFoundation.CFSwapInt16BigToHost
+import platform.CoreFoundation.CFSwapInt16HostToBig
 import platform.Foundation.NSDate
 import platform.Foundation.NSTemporaryDirectory
 import platform.Foundation.NSUUID
@@ -190,16 +191,25 @@ private fun configureIosPlaybackSocket(descriptor: Int) {
     }
 }
 
-private fun createIosPlaybackListener(backlog: Int): Pair<IosPlaybackSocket, Int> = memScoped {
+/**
+ * [port] 0 picks a free port. A nonzero port re-creates a listener on the port its URLs already
+ * name: iOS may reclaim a suspended app's listening socket, after which it never accepts again.
+ */
+private fun createIosPlaybackListener(backlog: Int, port: Int = 0): Pair<IosPlaybackSocket, Int> = memScoped {
+    require(port in 0..65_535)
     val descriptor = socket(AF_INET, SOCK_STREAM, 0)
     check(descriptor >= 0) { "Could not create a native playback listener." }
     try {
         configureIosPlaybackSocket(descriptor)
+        val reuse = alloc<IntVar>(); reuse.value = 1
+        check(setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, reuse.ptr, sizeOf<IntVar>().convert()) == 0) {
+            "Could not prepare the native playback listener for reuse."
+        }
         val address = alloc<sockaddr_in>()
         memset(address.ptr, 0, sizeOf<sockaddr_in>().convert())
         address.sin_len = sizeOf<sockaddr_in>().convert()
         address.sin_family = AF_INET.convert()
-        address.sin_port = 0u
+        address.sin_port = CFSwapInt16HostToBig(port.toUShort())
         check(inet_pton(AF_INET, "127.0.0.1", address.sin_addr.ptr) == 1)
         check(bind(descriptor, address.ptr.reinterpret(), sizeOf<sockaddr_in>().convert()) == 0 && listen(descriptor, backlog) == 0) {
             "Could not bind the private IPv4-loopback playback listener."
@@ -210,8 +220,10 @@ private fun createIosPlaybackListener(backlog: Int): Pair<IosPlaybackSocket, Int
     } catch (failure: Throwable) { platform.posix.close(descriptor); throw failure }
 }
 
+private const val MAX_LISTENER_REOPENS = 3
+
 private class IosSabrPlaybackResource(request: SourcePlaybackRequest,
-    private val listener: IosPlaybackSocket, port: Int,
+    initialListener: IosPlaybackSocket, private val port: Int,
     private val directory: String, capability: String,
     private val limits: YouTubeNativePlaybackLimits, source: (CoroutineScope) -> PlaybackBytes) : YouTubePlaybackResource {
     private val job = SupervisorJob()
@@ -222,6 +234,8 @@ private class IosSabrPlaybackResource(request: SourcePlaybackRequest,
     private val connections = Mutex()
     private val sockets = mutableSetOf<IosPlaybackSocket>()
     private var accepting: Job? = null
+    /** Replaced in place on the same port when iOS reclaims it, so issued endpoints stay valid. */
+    private var listener: IosPlaybackSocket = initialListener
     override val failureCode: String? get() = session.failureCode
     private val primaryRole = request.plan.primary.role
     private val mediaEndpoints = listOfNotNull(request.plan.primary, request.plan.audio).map { track ->
@@ -244,9 +258,25 @@ private class IosSabrPlaybackResource(request: SourcePlaybackRequest,
         }
         accepting = scope.launch {
             try {
+                var reopened = 0
                 while (isActive && !closing.value) {
-                    val socket = listener.accept()
+                    val socket = try { listener.accept() } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (failure: Exception) {
+                        // A paused app is suspended in the background, and iOS may reclaim its
+                        // listening socket: every later accept fails while AVPlayer keeps the URL.
+                        // Re-create the listener on the same port; give up only if that keeps failing.
+                        if (closing.value || ++reopened > MAX_LISTENER_REOPENS) throw failure
+                        val replaced = connections.withLock {
+                            if (closing.value) return@withLock false
+                            runCatching { listener.close() }
+                            listener = createIosPlaybackListener(limits.maxConnections, port).first
+                            true
+                        }
+                        if (!replaced) throw failure
+                        continue
+                    }
                     if (socket == null) { delay(20); continue }
+                    reopened = 0
                     var registered = false
                     try {
                         registered = connections.withLock {
@@ -330,6 +360,8 @@ private class IosSabrPlaybackResource(request: SourcePlaybackRequest,
         release { listener.close() }
         for (socket in connections.withLock { sockets.toList() }) release { socket.close() }
         release { accepting?.cancelAndJoin() }
+        // A listener re-created while closing began is the accept job's to replace, ours to close.
+        release { listener.close() }
         release { session.close() }
         release { job.cancelAndJoin() }
         release { check(rmdir(directory) == 0) { "Could not release private playback storage." } }
