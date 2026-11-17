@@ -2,13 +2,22 @@ package dev.kmpyt.internal
 
 import dev.kmpyt.YouTubePlaybackEndpoint
 
+/** A small in-memory resource served beside the media endpoints (an HLS playlist). */
+internal class PlaybackHttpDocument(val url: String, val mimeType: String, val body: ByteArray) {
+    init { require(Regex("http://127\\.0\\.0\\.1:[0-9]{1,5}/[0-9a-f]{64}/[a-z]+\\.m3u8").matches(url) && body.isNotEmpty()) }
+}
+
 internal data class PlaybackHttpResponse(
     val status: Int,
     val endpoint: YouTubePlaybackEndpoint? = null,
     val offset: Long = 0,
     val length: Long = 0,
     val sendBody: Boolean = false,
+    val document: PlaybackHttpDocument? = null,
 ) {
+    private val mimeType get() = document?.mimeType ?: endpoint?.mimeType
+    private val totalBytes get() = document?.body?.size?.toLong() ?: endpoint?.lengthBytes
+
     fun headers(): ByteArray = buildString {
         append("HTTP/1.1 $status ")
         append(when (status) {
@@ -19,10 +28,10 @@ internal data class PlaybackHttpResponse(
         append("\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n")
         append("Content-Length: ${this@PlaybackHttpResponse.length}\r\n")
         if (status == 405) append("Allow: GET, HEAD\r\n")
-        endpoint?.let { track ->
-            if (status in setOf(200, 206)) append("Content-Type: ${track.mimeType}\r\nAccept-Ranges: bytes\r\n")
-            if (status == 206) append("Content-Range: bytes $offset-${offset + this@PlaybackHttpResponse.length - 1}/${track.lengthBytes}\r\n")
-            if (status == 416) append("Content-Range: bytes */${track.lengthBytes}\r\n")
+        totalBytes?.let { total ->
+            if (status in setOf(200, 206)) append("Content-Type: $mimeType\r\nAccept-Ranges: bytes\r\n")
+            if (status == 206) append("Content-Range: bytes $offset-${offset + this@PlaybackHttpResponse.length - 1}/$total\r\n")
+            if (status == 416) append("Content-Range: bytes */$total\r\n")
         }
         append("\r\n")
     }.encodeToByteArray()
@@ -30,7 +39,8 @@ internal data class PlaybackHttpResponse(
 
 /** A deliberately small one-request, single-range, exact-origin HTTP/1.x surface. */
 internal object PlaybackHttpProtocol {
-    fun response(headerBytes: ByteArray, endpoints: List<YouTubePlaybackEndpoint>, maximumBytes: Int): PlaybackHttpResponse {
+    fun response(headerBytes: ByteArray, endpoints: List<YouTubePlaybackEndpoint>, maximumBytes: Int,
+        documents: List<PlaybackHttpDocument> = emptyList()): PlaybackHttpResponse {
         if (headerBytes.size > maximumBytes) return PlaybackHttpResponse(431)
         if (headerBytes.any { it.toInt() !in 0x20..0x7e && it != 13.toByte() && it != 10.toByte() })
             return PlaybackHttpResponse(400)
@@ -55,27 +65,29 @@ internal object PlaybackHttpProtocol {
         // No browser/CORS surface and no DNS-rebinding Host alias. The capability
         // route alone never creates permission to access another local path.
         if ("origin" in fields || fields["sec-fetch-site"]?.let { it != "none" } == true) return PlaybackHttpResponse(403)
-        val endpoint = endpoints.singleOrNull { candidate ->
-            fields["host"] == candidate.url.removePrefix("http://").substringBefore('/') &&
-                request[1] == "/" + candidate.url.removePrefix("http://").substringAfter('/')
-        } ?: return PlaybackHttpResponse(404)
-        val total = endpoint.lengthBytes
+        fun addressed(url: String) = fields["host"] == url.removePrefix("http://").substringBefore('/') &&
+            request[1] == "/" + url.removePrefix("http://").substringAfter('/')
+        val document = documents.singleOrNull { addressed(it.url) }
+        val endpoint = if (document != null) null else endpoints.singleOrNull { addressed(it.url) } ?: return PlaybackHttpResponse(404)
+        fun reply(status: Int, offset: Long = 0, length: Long = 0, sendBody: Boolean = false) =
+            PlaybackHttpResponse(status, endpoint, offset, length, sendBody, document)
+        val total = document?.body?.size?.toLong() ?: checkNotNull(endpoint).lengthBytes
         val range = fields["range"].takeIf { method == "GET" && "if-range" !in fields }
-            ?: return PlaybackHttpResponse(200, endpoint, length = total, sendBody = method == "GET")
-        val match = Regex("bytes=([0-9]*)-([0-9]*)").matchEntire(range) ?: return PlaybackHttpResponse(416, endpoint)
+            ?: return reply(200, length = total, sendBody = method == "GET")
+        val match = Regex("bytes=([0-9]*)-([0-9]*)").matchEntire(range) ?: return reply(416)
         val startText = match.groupValues[1]
         val endText = match.groupValues[2]
         val start: Long
         val end: Long
         if (startText.isEmpty()) {
-            val suffix = endText.toLongOrNull()?.takeIf { it > 0 } ?: return PlaybackHttpResponse(416, endpoint)
+            val suffix = endText.toLongOrNull()?.takeIf { it > 0 } ?: return reply(416)
             start = total - minOf(total, suffix)
             end = total - 1
         } else {
-            start = startText.toLongOrNull()?.takeIf { it < total } ?: return PlaybackHttpResponse(416, endpoint)
+            start = startText.toLongOrNull()?.takeIf { it < total } ?: return reply(416)
             end = if (endText.isEmpty()) total - 1 else
-                endText.toLongOrNull()?.takeIf { it >= start }?.coerceAtMost(total - 1) ?: return PlaybackHttpResponse(416, endpoint)
+                endText.toLongOrNull()?.takeIf { it >= start }?.coerceAtMost(total - 1) ?: return reply(416)
         }
-        return PlaybackHttpResponse(206, endpoint, start, end - start + 1, sendBody = true)
+        return reply(206, start, end - start + 1, sendBody = true)
     }
 }

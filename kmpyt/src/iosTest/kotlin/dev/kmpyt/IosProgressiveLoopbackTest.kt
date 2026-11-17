@@ -60,6 +60,36 @@ class IosProgressiveLoopbackTest {
         } finally { source.close(); http.close() }
     }
 
+    @Test fun aFragmentedObjectIsIndexedFromItsFirstWindowAndAnythingElseIsNot() = iosTest {
+        fun u32(v: Long) = byteArrayOf((v shr 24).toByte(), (v shr 16).toByte(), (v shr 8).toByte(), v.toByte())
+        fun box(type: String, vararg body: ByteArray) = body.fold(ByteArray(0)) { a, b -> a + b }.let { u32(8L + it.size) + type.encodeToByteArray() + it }
+        val head = box("ftyp", "dash".encodeToByteArray(), u32(0)) + box("moov", box("mvex", box("trex", ByteArray(24)))) +
+            box("sidx", u32(0), u32(1), u32(1000), u32(0), u32(0), byteArrayOf(0, 0, 0, 2), u32(1200), u32(5000), u32(0), u32(800), u32(5000), u32(0))
+        val fragmented = head + ByteArray(2000) { 7 }
+        val ranges = mutableListOf<String?>()
+        val http = HttpClient(MockEngine { call ->
+            val range = call.headers[HttpHeaders.Range]; ranges += range
+            val (first, last) = Regex("bytes=(\\d+)-(\\d+)").matchEntire(range!!)!!.destructured.let { (a, b) -> a.toInt() to b.toInt() }
+            respond(fragmented.copyOfRange(first, last + 1), HttpStatusCode.PartialContent, Headers.build {
+                append(HttpHeaders.ContentType, "audio/mp4"); append(HttpHeaders.ContentRange, "bytes $first-$last/${fragmented.size}")
+            })
+        })
+        val sized = request().let { it.copy(plan = it.plan.copy(primary = it.plan.primary.copy(sizeBytes = fragmented.size.toLong()))) }
+        val source = ProgressiveRangePlaybackBytes(http, sized, SourcePlaybackAuthorization { _, _ -> }, windowBytes = 1000)
+        try {
+            source.start()
+            val index = assertNotNull(source.segmentIndex)
+            assertEquals(listOf(head.size.toLong(), head.size + 1200L), index.segments.map { it.offset })
+            assertEquals(listOf<String?>("bytes=0-999"), ranges.toList()) // Only the first window, which the player reads first anyway.
+            assertContentEquals(fragmented.copyOfRange(0, 100), source.read(TrackRole.AUDIO, 0, 100))
+            assertEquals(1, ranges.count { it == "bytes=0-999" })
+        } finally { source.close(); http.close() }
+
+        val plainHttp = HttpClient(engine(mutableListOf()))
+        val plain = ProgressiveRangePlaybackBytes(plainHttp, request(), SourcePlaybackAuthorization { _, _ -> }, windowBytes = 1000)
+        try { plain.start(); assertNull(plain.segmentIndex) } finally { plain.close(); plainHttp.close() }
+    }
+
     @Test fun aRefusedRangeFailsClosedWithAStableCode() = iosTest {
         val http = HttpClient(engine(mutableListOf(), HttpStatusCode.Forbidden))
         val source = ProgressiveRangePlaybackBytes(http, request(), SourcePlaybackAuthorization { _, _ -> })

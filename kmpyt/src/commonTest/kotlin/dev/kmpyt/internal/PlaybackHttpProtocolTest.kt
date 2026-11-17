@@ -25,6 +25,25 @@ class PlaybackHttpProtocolTest {
         assertFalse(route in headers); assertFalse(route in endpoint.toString())
     }
 
+    @Test fun aPlaylistDocumentIsServedBesideItsMediaWithItsOwnTypeAndLength() {
+        val body = "#EXTM3U\n#EXT-X-ENDLIST\n".encodeToByteArray()
+        val playlist = PlaybackHttpDocument("http://127.0.0.1:32123$route.m3u8", "application/vnd.apple.mpegurl", body)
+        fun serve(path: String, vararg fields: String) = PlaybackHttpProtocol.response(("GET $path HTTP/1.1\r\nHost: 127.0.0.1:32123\r\n" +
+            fields.joinToString("") { "$it\r\n" } + "\r\n").encodeToByteArray(), listOf(endpoint), 16_384, listOf(playlist))
+        val whole = serve("$route.m3u8")
+        assertEquals(200, whole.status); assertEquals(body.size.toLong(), whole.length); assertTrue(whole.document === playlist)
+        assertTrue("Content-Type: application/vnd.apple.mpegurl\r\n" in whole.headers().decodeToString())
+        val part = serve("$route.m3u8", "Range: bytes=2-5")
+        assertEquals(206, part.status); assertEquals(2, part.offset); assertEquals(4, part.length)
+        assertTrue("Content-Range: bytes 2-5/${body.size}\r\n" in part.headers().decodeToString())
+        val media = serve(route, "Range: bytes=0-9")
+        assertEquals(206, media.status); assertTrue(media.endpoint === endpoint && media.document == null)
+        assertEquals(404, serve("$route.m3u").status)
+        val hls = YouTubePlaybackEndpoint(TrackRole.AUDIO, endpoint.url, "audio/mp4", 100, playlist.url)
+        assertEquals(playlist.url, hls.hlsPlaylistUrl)
+        kotlin.test.assertFails { YouTubePlaybackEndpoint(TrackRole.AUDIO, endpoint.url, "audio/mp4", 100, "http://127.0.0.1:1/other.m3u8") }
+    }
+
     @Test fun exactClosedOpenAndSuffixRangesClampOnlyAtTheActualTrackEnd() {
         for ((range, start, length) in listOf(
             Triple("bytes=10-19", 10L, 10L), Triple("bytes=98-", 98L, 2L),

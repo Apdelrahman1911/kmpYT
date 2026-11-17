@@ -3,6 +3,8 @@
 package dev.kmpyt
 
 import dev.kmpyt.extraction.*
+import dev.kmpyt.internal.FragmentedMp4Index
+import dev.kmpyt.internal.PlaybackHttpDocument
 import dev.kmpyt.internal.PlaybackHttpProtocol
 import dev.kmpyt.internal.PlaybackHttpResponse
 import io.ktor.client.HttpClient
@@ -221,12 +223,25 @@ private class IosSabrPlaybackResource(request: SourcePlaybackRequest,
     private val sockets = mutableSetOf<IosPlaybackSocket>()
     private var accepting: Job? = null
     override val failureCode: String? get() = session.failureCode
-    override val endpoints = listOfNotNull(request.plan.primary, request.plan.audio).map { track ->
+    private val primaryRole = request.plan.primary.role
+    private val mediaEndpoints = listOfNotNull(request.plan.primary, request.plan.audio).map { track ->
         YouTubePlaybackEndpoint(track.role, "http://127.0.0.1:$port/$capability/${track.role.name.lowercase()}",
             track.mimeType.substringBefore(';').trim().lowercase(), requireNotNull(track.sizeBytes))
     }
+    /** Set once by [start], before the resource is handed out; null serves only the plain object. */
+    private var playlist: PlaybackHttpDocument? = null
+    /** The media objects, the primary one naming its HLS playlist when the object is fragmented. */
+    override val endpoints: List<YouTubePlaybackEndpoint>
+        get() = playlist?.let { list -> mediaEndpoints.map { media ->
+            if (list.url == "${media.url}.m3u8") YouTubePlaybackEndpoint(media.role, media.url, media.mimeType, media.lengthBytes, list.url)
+            else media
+        } } ?: mediaEndpoints
     suspend fun start() {
         session.start()
+        (session as? ProgressiveRangePlaybackBytes)?.segmentIndex?.let { index ->
+            val media = mediaEndpoints.single { it.role == primaryRole }
+            playlist = PlaybackHttpDocument("${media.url}.m3u8", HLS_PLAYLIST_MIME, index.hlsPlaylist(media.url).encodeToByteArray())
+        }
         accepting = scope.launch {
             try {
                 while (isActive && !closing.value) {
@@ -283,9 +298,14 @@ private class IosSabrPlaybackResource(request: SourcePlaybackRequest,
             if (size >= 4 && buffer[size - 4] == 13.toByte() && buffer[size - 3] == 10.toByte() &&
                 buffer[size - 2] == 13.toByte() && buffer[size - 1] == 10.toByte()) { complete = true; break }
         }
-        val response = if (complete) PlaybackHttpProtocol.response(buffer.copyOf(size), endpoints, limits.maxHeaderBytes)
+        val response = if (complete) PlaybackHttpProtocol.response(buffer.copyOf(size), mediaEndpoints, limits.maxHeaderBytes, listOfNotNull(playlist))
             else PlaybackHttpResponse(431)
         if (!response.sendBody) { write(response.headers()); return }
+        response.document?.let { document ->
+            write(response.headers())
+            write(document.body.copyOfRange(response.offset.toInt(), (response.offset + response.length).toInt()))
+            return
+        }
         val endpoint = checkNotNull(response.endpoint)
         var offset = response.offset
         var remaining = response.length
@@ -367,7 +387,21 @@ internal class ProgressiveRangePlaybackBytes(private val http: HttpClient, priva
     @kotlin.concurrent.Volatile private var failure: String? = null
     override val failureCode: String? get() = failure
 
-    override suspend fun start() = Unit
+    /**
+     * The object's own fragment index, read from its first window at [start] (which the player
+     * needs first anyway). Null for anything but an exact flat fragmented MP4 audio object.
+     */
+    var segmentIndex: FragmentedMp4Index? = null
+        private set
+
+    override suspend fun start() {
+        if (track.role != TrackRole.AUDIO || track.mimeType.substringBefore(';').trim().lowercase() != "audio/mp4") return
+        val first = mutex.withLock { cached(0) ?: open(0) }
+        segmentIndex = try { FragmentedMp4Index.parse(first.bytes.await(), size) }
+        catch (cancelled: CancellationException) { currentCoroutineContext().ensureActive(); mutex.withLock { windows.remove(first) }; null }
+        catch (_: Exception) { mutex.withLock { windows.remove(first) }; null } // The player's own read retries and reports it.
+        debugProgressiveIndex(segmentIndex)
+    }
     override suspend fun close() {
         scope.coroutineContext[Job]?.cancelAndJoin()
         mutex.withLock { windows.clear() }
@@ -479,6 +513,13 @@ internal class ProgressiveRangePlaybackBytes(private val http: HttpClient, priva
 }
 
 @OptIn(kotlin.experimental.ExperimentalNativeApi::class)
+private fun debugProgressiveIndex(index: FragmentedMp4Index?) {
+    if (kotlin.native.Platform.isDebugBinary) println("VEYRA_PROGRESSIVE_INDEX hls=${index != null} segments=${index?.segments?.size ?: 0}")
+}
+
+@OptIn(kotlin.experimental.ExperimentalNativeApi::class)
 private fun debugProgressiveLoopback(status: Int, start: Long, end: Long, hasRange: Boolean) {
     if (kotlin.native.Platform.isDebugBinary) println("VEYRA_PROGRESSIVE_LOOPBACK status=$status range=$start-$end contentRange=$hasRange")
 }
+
+private const val HLS_PLAYLIST_MIME = "application/vnd.apple.mpegurl"

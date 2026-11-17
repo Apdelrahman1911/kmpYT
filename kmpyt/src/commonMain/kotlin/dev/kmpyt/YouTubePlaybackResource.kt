@@ -4,18 +4,26 @@ import dev.kmpyt.extraction.SourcePlaybackAuthorization
 import dev.kmpyt.extraction.SourcePlaybackRequest
 import dev.kmpyt.extraction.TrackRole
 
-/** An in-memory bearer endpoint. Never persist or log its URL. */
+/**
+ * An in-memory bearer endpoint. Never persist or log its URL.
+ *
+ * [hlsPlaylistUrl], when present, is a VOD HLS playlist on the same loopback whose byte-range
+ * segments are exactly this object. A player that reads a fragmented MP4 only whole before
+ * starting (AVPlayer) should open it instead of [url]; the bytes and their checks are the same.
+ */
 class YouTubePlaybackEndpoint(
     val role: TrackRole,
     val url: String,
     val mimeType: String,
     val lengthBytes: Long,
+    val hlsPlaylistUrl: String? = null,
 ) {
     init {
         val match = Regex("http://127\\.0\\.0\\.1:([0-9]{1,5})/([0-9a-f]{64})/(audio|video)").matchEntire(url)
         require(match != null && match.groupValues[1].toInt() in 1..65_535)
         require(role in setOf(TrackRole.AUDIO, TrackRole.VIDEO) && match.groupValues[3] == role.name.lowercase())
         require(lengthBytes > 0 && Regex("(?:audio|video)/[a-z0-9.+-]+").matches(mimeType))
+        require(hlsPlaylistUrl == null || hlsPlaylistUrl == "$url.m3u8")
     }
     override fun toString() = "YouTubePlaybackEndpoint(role=$role, url=<redacted>)"
 }
