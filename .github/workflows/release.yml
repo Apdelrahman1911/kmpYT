@@ -21,6 +21,7 @@ jobs:
       version: ${{ steps.validate.outputs.version }}
       revision: ${{ steps.validate.outputs.revision }}
       already_public: ${{ steps.validate.outputs.already_public }}
+      verified_ci_run: ${{ steps.prior-ci.outputs.run }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
@@ -36,9 +37,29 @@ jobs:
           python3 -B ci/central_release.py check --inventory ci/publications.json \
             --tag "$GITHUB_REF_NAME" --revision "$revision"
 
+      - name: Find completed verification for this exact main commit
+        id: prior-ci
+        if: steps.validate.outputs.already_public == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REVISION: ${{ steps.validate.outputs.revision }}
+        run: |
+          run="$(gh run list --workflow ci.yml --branch main --event push --commit "$RELEASE_REVISION" \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // ""')" || run=''
+          if [[ "$run" =~ ^[0-9]+$ ]] &&
+             gh run view "$run" --json conclusion,event,headSha,headBranch,jobs |
+               jq -e --arg revision "$RELEASE_REVISION" '
+                 .conclusion == "success" and .event == "push" and .headBranch == "main"
+                 and .headSha == $revision and (.jobs | length >= 8 and all(.[]; .conclusion == "success"))
+               ' >/dev/null; then
+            printf 'run=%s\n' "$run" >> "$GITHUB_OUTPUT"
+            printf 'Reusing successful CI at %s/actions/runs/%s for exactly %s.\n' \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$run" "$RELEASE_REVISION"
+          fi
+
   verify:
     needs: prepare
-    if: needs.prepare.outputs.already_public == 'false'
+    if: needs.prepare.outputs.already_public == 'false' && needs.prepare.outputs.verified_ci_run == ''
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
@@ -77,7 +98,9 @@ jobs:
 
   publish:
     needs: [prepare, verify, stage]
-    if: needs.verify.result == 'success' && needs.stage.result == 'success'
+    if: >-
+      ${{ !cancelled() && needs.stage.result == 'success' &&
+          (needs.verify.result == 'success' || (needs.verify.result == 'skipped' && needs.prepare.outputs.verified_ci_run != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     environment: maven-central
