@@ -261,7 +261,7 @@ object YouTubeCaptions {
 
     private fun attributes(body: String): Map<String, String> {
         val result = mutableMapOf<String, String>(); var position = 0
-        val pattern = Regex("\\s+([A-Za-z_][A-Za-z0-9_.:-]*)\\s*=\\s*(['\"])(.*?)\\2", RegexOption.DOT_MATCHES_ALL)
+        val pattern = Regex("\\s+([A-Za-z_][A-Za-z0-9_.:-]*)\\s*=\\s*(['\"])([\\s\\S]*?)\\2")
         while (position < body.length) {
             if (body.substring(position).isBlank()) break
             val match = pattern.find(body, position) ?: error("Invalid XML attribute")

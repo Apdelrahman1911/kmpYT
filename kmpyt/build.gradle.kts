@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.bundling.Zip
+import org.gradle.jvm.tasks.Jar
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.plugin.mpp.apple.XCFramework
 import org.jetbrains.kotlin.gradle.targets.native.tasks.KotlinNativeSimulatorTest
@@ -82,7 +84,21 @@ tasks.withType<KotlinNativeSimulatorTest>().configureEach {
     providers.gradleProperty("iosSimulatorDevice").orNull?.let { device.set(it) }
 }
 
+val publicationNotices = listOf(rootProject.file("LICENSE"), rootProject.file("THIRD_PARTY_NOTICES.md"))
+val publicationDocumentation by tasks.registering(Jar::class) {
+    archiveClassifier.set("javadoc")
+    from(rootProject.file("README.md"))
+}
+
+tasks.withType<Jar>().configureEach {
+    from(publicationNotices) { into("META-INF/kmpyt") }
+}
+tasks.withType<Zip>().matching { it.name == "bundleReleaseAar" }.configureEach {
+    from(publicationNotices) { into("META-INF/kmpyt") }
+}
+
 publishing.publications.withType<MavenPublication>().configureEach {
+    artifact(publicationDocumentation)
     pom {
         name.set("kmpYT")
         description.set("YouTube inspection, browsing, captions and downloads for Kotlin Multiplatform.")
@@ -94,9 +110,17 @@ publishing.publications.withType<MavenPublication>().configureEach {
                 distribution.set("repo")
             }
         }
+        developers {
+            developer {
+                id.set("Apdelrahman1911")
+                name.set("abdelrahman fahmy")
+                url.set("https://github.com/Apdelrahman1911")
+            }
+        }
         scm {
             url.set("https://github.com/Apdelrahman1911/kmpYT")
             connection.set("scm:git:https://github.com/Apdelrahman1911/kmpYT.git")
+            developerConnection.set("scm:git:ssh://git@github.com/Apdelrahman1911/kmpYT.git")
         }
     }
 }

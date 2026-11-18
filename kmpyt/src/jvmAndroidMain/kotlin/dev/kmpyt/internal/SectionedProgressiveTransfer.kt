@@ -138,15 +138,19 @@ internal class SectionedProgressiveTransfer(
                     while (true) {
                         withTimeoutOrNull(REPORT_INTERVAL_MS) { signal.receive() }
                         checkCurrent()
+                        // Observe worker completion before reading the frontier. A worker
+                        // can finish writing while the prefix is being scanned.
+                        val workersFinished = workers.all { it.isCompleted }
                         // Advance the contiguous prefix; hash bytes in file order.
                         for (section in sections) {
                             if (section.end < committed) continue
-                            val frontier = section.start + section.written.get()
+                            val written = section.written.get()
+                            val frontier = section.start + written
                             if (frontier > committed) {
                                 if (prefix != null) digestRange(channel, committed, frontier, prefix, readBack)
                                 committed = frontier
                             }
-                            if (!section.complete) break
+                            if (written < section.size) break
                         }
                         val now = System.nanoTime()
                         val done = committed == total
@@ -163,7 +167,7 @@ internal class SectionedProgressiveTransfer(
                             lastReceived = bytesNow
                         }
                         if (done) break
-                        if (workers.all { it.isCompleted }) {
+                        if (workersFinished) {
                             // Every worker returned yet the prefix is incomplete: defensive.
                             throw RetryableDownloadException("A media section ended before its declared range arrived.")
                         }

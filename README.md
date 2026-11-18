@@ -20,7 +20,7 @@ Public player programs are versioned by their actual source URL and reused withi
 
 ## Build and integration
 
-Use JDK 17 or newer and the checked-in Gradle wrapper. Android builds require SDK 36; Apple targets require macOS and Xcode. Set the local Android SDK path in `local.properties`, which is not committed.
+Use JDK 17 or newer and the checked-in Gradle wrapper. Android builds require SDK 36. Set the local Android SDK path in `local.properties`, which is not committed. Linking Apple frameworks and running iOS tests require macOS and Xcode.
 
 ```shell
 ./gradlew :kmpyt:jvmTest
@@ -28,9 +28,9 @@ Use JDK 17 or newer and the checked-in Gradle wrapper. Android builds require SD
 ./gradlew :kmpyt:publishToMavenLocal
 ```
 
-The initial version is `0.1.0`. Artifacts are not published to Maven Central. Build from this repository, use a composite build, or publish locally. macOS can produce `KmpYT.xcframework` with `:kmpyt:assembleKmpYTReleaseXCFramework`.
+Use `implementation("io.github.apdelrahman1911.kmpyt:kmpyt:0.1.0")` in `commonMain`. Resolve Maven Central releases with `mavenCentral()`. To try unpublished changes, use a composite build or publish locally and add `mavenLocal()` to the consuming build's repositories.
 
-After publishing locally, add `mavenLocal()` to the consuming build's repositories and use `implementation("io.github.apdelrahman1911.kmpyt:kmpyt:0.1.0")` in `commonMain`. Publish Apple artifacts from macOS. Successful CI jobs also provide the JVM JAR, Android AAR and Apple XCFramework as downloadable build artifacts.
+On macOS, run `:kmpyt:assembleKmpYTReleaseXCFramework` to build `KmpYT.xcframework`.
 
 ```kotlin
 // Android: dev.kmpyt.android.createAndroidYouTubeClient(context)

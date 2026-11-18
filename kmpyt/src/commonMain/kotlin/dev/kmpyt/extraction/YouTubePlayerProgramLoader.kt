@@ -185,7 +185,7 @@ class YouTubePlayerProgramLoader(
         // research programs are never prewarmed from storage.
         private const val PREWARM_ORIGIN = "https://www.youtube.com/"
         private val JSON_REFERENCE = Regex("\"(?:PLAYER_JS_URL|jsUrl)\"\\s*:\\s*(\"(?:\\\\.|[^\"\\\\])*\")")
-        private val SCRIPT_REFERENCE = Regex("<script\\b[^>]*\\bsrc\\s*=\\s*(['\"])(.*?)\\1", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        private val SCRIPT_REFERENCE = Regex("<script\\b[^>]*\\bsrc\\s*=\\s*(['\"])([\\s\\S]*?)\\1", RegexOption.IGNORE_CASE)
         private val PUBLIC_PLAYER_PATH = Regex("/s/player/[A-Za-z0-9_-]{1,64}/[A-Za-z0-9_./-]{1,256}/base\\.js")
     }
 }
