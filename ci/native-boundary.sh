@@ -19,6 +19,10 @@ if [ "${1:-}" = android ]; then
     cp "$installed_sdk"/licenses/* "$emulator_sdk/licenses/"
     image="system-images;android-$api;google_apis;x86_64"
     "$sdk_tools/sdkmanager" --sdk_root="$emulator_sdk" emulator "$image"
+    # The emulator expects platform-tools inside the SDK root. Share the
+    # runner's read-only installation with Gradle so both use the same ADB.
+    test -x "$installed_sdk/platform-tools/adb"
+    ln -s "$installed_sdk/platform-tools" "$emulator_sdk/platform-tools"
     # avdmanager locates packages from its own SDK, so run the command-line
     # tools from the same scoped SDK as the newly installed system image.
     mkdir -p "$emulator_sdk/cmdline-tools/latest"
@@ -57,9 +61,12 @@ PY
         > "$emulator_log" 2>&1 &
     emulator_pid=$!
     export ANDROID_SERIAL=emulator-5554
-    timeout 180 adb wait-for-device
-    for ((attempt=0; attempt<90; attempt++)); do
-        if [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1 ]; then break; fi
+    for ((attempt=0; attempt<120; attempt++)); do
+        if ! kill -0 "$emulator_pid" 2>/dev/null; then
+            printf '%s\n' 'The owned emulator stopped before boot completed.' >&2
+            exit 1
+        fi
+        if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then break; fi
         sleep 2
     done
     test "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1

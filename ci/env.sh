@@ -57,7 +57,12 @@ PY
     export KMPYT_CI_WORK_ROOT="$root/.work"
     export KMPYT_CI_SCOPED_ENV=1
     export HOME="$native_home"
-    export USERPROFILE="$native_home"
+    # The Windows hosted Chromium process needs the runner account's native
+    # profile to initialize. Java, Gradle, the browser profile and temp files
+    # still use the scoped locations configured below.
+    if [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ] || ! command -v cygpath >/dev/null 2>&1; then
+        export USERPROFILE="$native_home"
+    fi
     export GRADLE_USER_HOME="$native_root/.work/gradle"
     export KONAN_DATA_DIR="$native_root/.work/konan"
     export TMPDIR="$native_tmp" TMP="$native_tmp" TEMP="$native_tmp"
