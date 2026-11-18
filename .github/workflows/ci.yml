@@ -135,7 +135,7 @@ jobs:
             ci/native-boundary.sh ios
           '
       - name: Assemble release XCFramework across all Apple targets
-        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' && matrix.arch == 'arm64' }}
+        if: matrix.arch == 'arm64'
         run: |
           ci/scoped.sh bash -euo pipefail -c '
             source ci/select-tools.sh

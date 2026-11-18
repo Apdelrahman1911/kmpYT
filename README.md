@@ -33,13 +33,13 @@ The library is built with Kotlin 2.2.21 and targets JVM 17.
 ```kotlin
 kotlin {
     sourceSets.commonMain.dependencies {
-        implementation("io.github.apdelrahman1911.kmpyt:kmpyt:0.1.1")
+        implementation("io.github.apdelrahman1911.kmpyt:kmpyt:0.1.2")
     }
 }
 ```
 
 Check [Maven Central](https://central.sonatype.com/artifact/io.github.apdelrahman1911.kmpyt/kmpyt)
-for `0.1.1` availability. The previous published version is `0.1.0`.
+for `0.1.2` availability. The previous published version is `0.1.0`.
 
 ## Quick start
 

@@ -80,21 +80,24 @@ elif [ "${1:-}" = ios ]; then
         x86_64) target=IosX64; framework_target=iosX64 ;;
         *) exit 2 ;;
     esac
-    device_spec=$(xcrun simctl list -j devices available | python3 -B -c '
+    # Kotlin/Native keeps its pinned compiler toolchain. The UIKit host and
+    # CoreSimulator use the separately installed, matching iOS SDK and runtime.
+    host_developer=/Applications/Xcode_26.2.app/Contents/Developer
+    test -x "$host_developer/usr/bin/xcodebuild"
+    host_sdk=$(DEVELOPER_DIR="$host_developer" xcrun --sdk iphonesimulator --show-sdk-version)
+    runtime="com.apple.CoreSimulator.SimRuntime.iOS-${host_sdk//./-}"
+    device_type=$(DEVELOPER_DIR="$host_developer" xcrun simctl list -j devices available | python3 -B -c '
 import json, sys
-runtimes = json.load(sys.stdin)["devices"]
-versions = {name: tuple(map(int, name.split(".iOS-")[-1].split("-"))) for name in runtimes if ".iOS-" in name}
-for runtime in sorted(versions, key=versions.__getitem__, reverse=True):
-    for device in runtimes[runtime]:
-        if device["isAvailable"] and device["name"].startswith("iPhone") and device.get("deviceTypeIdentifier"):
-            print(device["deviceTypeIdentifier"], runtime)
-            sys.exit(0)
-raise SystemExit("No installed, available iPhone simulator runtime")
-')
-    read -r device_type runtime <<< "$device_spec"
-    simulator=$(xcrun simctl create "kmpYT CI ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "$device_type" "$runtime")
-    trap 'xcrun simctl shutdown "$simulator" 2>/dev/null || true; xcrun simctl delete "$simulator"' EXIT
-    python3 -B - "$simulator" <<'PY'
+runtime = sys.argv[1]
+for device in json.load(sys.stdin)["devices"].get(runtime, []):
+    if device["isAvailable"] and device["name"].startswith("iPhone") and device.get("deviceTypeIdentifier"):
+        print(device["deviceTypeIdentifier"])
+        sys.exit(0)
+raise SystemExit(f"No installed iPhone simulator matching the host SDK runtime {runtime}")
+' "$runtime")
+    simulator=$(DEVELOPER_DIR="$host_developer" xcrun simctl create "kmpYT CI ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "$device_type" "$runtime")
+    trap 'DEVELOPER_DIR="$host_developer" xcrun simctl shutdown "$simulator" 2>/dev/null || true; DEVELOPER_DIR="$host_developer" xcrun simctl delete "$simulator"' EXIT
+    DEVELOPER_DIR="$host_developer" python3 -B - "$simulator" <<'PY'
 import subprocess, sys
 subprocess.run(['xcrun', 'simctl', 'bootstatus', sys.argv[1], '-b'], timeout=360, check=True)
 PY
@@ -114,10 +117,10 @@ PY
     fi
     "$xcodegen" generate --spec ci/ios-host/project.yml --project ci/ios-host
     result="$KMPYT_CI_WORK_ROOT/xcode/results/ios-host.xcresult"
-    xcodebuild -project ci/ios-host/KmpYTHost.xcodeproj -scheme KmpYTHost -configuration Debug \
-        -destination "id=$simulator" -derivedDataPath "$KMPYT_CI_WORK_ROOT/xcode/DerivedData" \
+    DEVELOPER_DIR="$host_developer" xcodebuild -project ci/ios-host/KmpYTHost.xcodeproj -scheme KmpYTHost -configuration Debug \
+        -destination "platform=iOS Simulator,id=$simulator" -derivedDataPath "$KMPYT_CI_WORK_ROOT/xcode/DerivedData" \
         -resultBundlePath "$result" -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO test
-    xcrun xcresulttool get test-results summary --path "$result" | python3 -B -c '
+    DEVELOPER_DIR="$host_developer" xcrun xcresulttool get test-results summary --path "$result" | python3 -B -c '
 import json, sys
 result = json.load(sys.stdin)
 assert result["passedTests"] >= 5 and result["failedTests"] == 0, "UIKit-hosted WebKit tests did not all pass"
