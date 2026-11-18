@@ -26,7 +26,9 @@ if [ "${1:-}" = android ]; then
     printf 'no\n' | ANDROID_HOME="$emulator_sdk" ANDROID_SDK_ROOT="$emulator_sdk" \
         "$emulator_sdk/cmdline-tools/latest/bin/avdmanager" create avd --name "kmpyt-ci-$api" --package "$image"
     export PATH="$installed_sdk/platform-tools:$PATH"
-    export ADB_SERVER_SOCKET=tcp:127.0.0.1:5037
+    # The default ADB socket starts a local server. Supplying a TCP host to
+    # ADB_SERVER_SOCKET makes adb connect as a client and refuse to start it.
+    unset ADB_SERVER_SOCKET ANDROID_ADB_SERVER_ADDRESS ANDROID_ADB_SERVER_PORT
     python3 -B - <<'PY'
 import socket
 with socket.socket() as port:
@@ -38,7 +40,9 @@ PY
         sudo chown "$USER" /dev/kvm
     fi
     emulator_pid=''
+    emulator_log="$KMPYT_CI_WORK_ROOT/android/emulator-$api.log"
     cleanup() {
+        if [ "$?" -ne 0 ] && [ -f "$emulator_log" ]; then tail -80 "$emulator_log" >&2; fi
         if [ -n "$emulator_pid" ]; then
             kill "$emulator_pid" 2>/dev/null || true
             wait "$emulator_pid" 2>/dev/null || true
@@ -50,7 +54,7 @@ PY
     adb start-server
     ANDROID_HOME="$emulator_sdk" ANDROID_SDK_ROOT="$emulator_sdk" "$emulator_sdk/emulator/emulator" "@kmpyt-ci-$api" -port 5554 \
         -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect \
-        > "$KMPYT_CI_WORK_ROOT/android/emulator-$api.log" 2>&1 &
+        > "$emulator_log" 2>&1 &
     emulator_pid=$!
     export ANDROID_SERIAL=emulator-5554
     timeout 180 adb wait-for-device
