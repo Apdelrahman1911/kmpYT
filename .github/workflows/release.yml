@@ -1,0 +1,157 @@
+name: Release to Maven Central
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: maven-central-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'Apdelrahman1911/kmpYT'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      revision: ${{ steps.validate.outputs.revision }}
+      already_public: ${{ steps.validate.outputs.already_public }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release tag, main ancestry, and version availability
+        id: validate
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          revision="$(git rev-parse "$GITHUB_REF^{commit}")"
+          test "$(git rev-parse HEAD)" = "$revision"
+          git merge-base --is-ancestor "$revision" origin/main
+          python3 -B ci/central_release.py check --inventory ci/publications.json \
+            --tag "$GITHUB_REF_NAME" --revision "$revision"
+
+  verify:
+    needs: prepare
+    if: needs.prepare.outputs.already_public == 'false'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  stage:
+    needs: prepare
+    if: needs.prepare.outputs.already_public == 'false'
+    runs-on: macos-26
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - name: Build and verify the entire unsigned Maven distribution
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
+        run: |
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            candidate="$PWD/build/candidate-maven"
+            ci/gradle.sh -P"kmpyt.version=$RELEASE_VERSION" -P"release.tag=$GITHUB_REF_NAME" \
+              -P"release.revision=$RELEASE_REVISION" -D"maven.repo.local=$candidate" :kmpyt:publishToMavenLocal
+            python3 -B ci/verify_publications.py --repository "$candidate" \
+              --tag "$GITHUB_REF_NAME" --revision "$RELEASE_REVISION"
+            ci/gradle.sh -p ci/publishing/consumer -P"kmpytReleaseVersion=$RELEASE_VERSION" \
+              -P"kmpytCandidateDirectory=$candidate" compileCommonMainKotlinMetadata compileKotlinJvm \
+              compileDebugKotlinAndroid compileKotlinIosArm64 compileKotlinIosSimulatorArm64 compileKotlinIosX64
+          '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: maven-candidate
+          path: build/candidate-maven/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [prepare, verify, stage]
+    if: needs.verify.result == 'success' && needs.stage.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - name: Retrieve and verify the approved Maven stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --name maven-candidate --dir build/candidate-maven
+          python3 -B ci/verify_publications.py --repository build/candidate-maven \
+            --tag "$GITHUB_REF_NAME" --revision "$RELEASE_REVISION"
+      - name: Sign, publish, and verify Maven Central readback
+        env:
+          RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSPHRASE: ${{ secrets.SIGNING_PASSPHRASE }}
+        run: |
+          python3 -B ci/central_release.py publish --inventory ci/publications.json \
+            --tag "$GITHUB_REF_NAME" --revision "$RELEASE_REVISION" \
+            --repository build/candidate-maven --bundle build/central/release.zip
+
+  consume:
+    needs: [prepare, publish]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.publish.result == 'success' || needs.prepare.outputs.already_public == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - name: Resolve and compile a clean Maven Central consumer
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          ci/scoped.sh bash -euo pipefail -c '
+            source ci/select-tools.sh
+            ci/gradle.sh -p ci/publishing/consumer -P"kmpytReleaseVersion=$RELEASE_VERSION" \
+              compileCommonMainKotlinMetadata compileKotlinJvm compileDebugKotlinAndroid
+          '
+
+  github-release:
+    needs: [prepare, consume]
+    if: ${{ !cancelled() && needs.consume.result == 'success' }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - name: Record the published version on GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          remote="$(git ls-remote origin "refs/tags/$GITHUB_REF_NAME" "refs/tags/$GITHUB_REF_NAME^{}")"
+          test "$(git rev-parse HEAD)" = "$(awk 'END {print $1}' <<< "$remote")"
+          classification=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then classification=(--prerelease); fi
+          if existing="$(gh release view "$GITHUB_REF_NAME" --json url,isDraft)"; then
+            if [ "$(jq -r .isDraft <<< "$existing")" = true ]; then
+              gh release edit "$GITHUB_REF_NAME" --draft=false "${classification[@]}"
+            else
+              jq -r .url <<< "$existing"
+            fi
+            exit
+          fi
+          notes=(--generate-notes)
+          if [ -f "docs/releases/$RELEASE_VERSION.md" ]; then notes=(--notes-file "docs/releases/$RELEASE_VERSION.md"); fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "kmpYT $RELEASE_VERSION" "${notes[@]}" "${classification[@]}"

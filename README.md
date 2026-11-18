@@ -1,187 +1,130 @@
 # kmpYT
 
-Licensed under the [MIT License](LICENSE). Retain its copyright and permission
-notice when redistributing. See [third-party notices and the ownership audit](THIRD_PARTY_NOTICES.md)
-for dependency, fixture, runtime and GPLv3 compatibility details.
+[![Cross-platform CI](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/ci.yml)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.apdelrahman1911.kmpyt/kmpyt)](https://central.sonatype.com/artifact/io.github.apdelrahman1911.kmpyt/kmpyt)
+[![MIT License](https://img.shields.io/github/license/Apdelrahman1911/kmpYT)](LICENSE)
 
-A standalone Kotlin Multiplatform YouTube library for Android, JVM desktop and iOS, extracted from ClearMedia's independently implemented YouTube engine.
+kmpYT is a Kotlin Multiplatform library for integrating public YouTube content
+into Android, desktop JVM and iOS apps. It inspects media, selects formats, and
+builds playback and download plans. It also provides search, channel and playlist
+browsing, and caption cues. Your app supplies its own media player, UI, and storage
+and access policies.
 
-The shared library inspects public videos, discovers formats, searches and browses channels/playlists, loads captions, prepares playback/transfer plans and coordinates compatible video/audio downloads. Platform adapters provide offline JavaScript execution, file I/O and media combining. Application screens, databases, advertisements and account UI are outside the library.
+## Supported platforms
 
-## Targets and runtimes
+| Platform | Maven variant | Runtime requirements |
+| --- | --- | --- |
+| Android | `kmpyt-android` | API 23 or later, Android WebView, Internet permission. Compatible audio/video track combinations use platform media APIs. |
+| Desktop JVM | `kmpyt-jvm` | Java 17, Node.js 22 or later, and Chrome, Chromium or Edge. Install FFmpeg if you combine separate audio and video streams. CI uses x64 Windows, Linux and macOS. |
+| iOS | `kmpyt-iosarm64`, `kmpyt-iossimulatorarm64`, `kmpyt-iosx64` | UIKit, WKWebView and AVFoundation. Build with macOS and Xcode. The CI host declares iOS 15 and runs on the installed simulator runtimes. |
 
-| Target | Player-program runtime | Media combining |
-|---|---|---|
-| Android | Ephemeral WebView with network access blocked | Android MediaExtractor/MediaMuxer |
-| JVM desktop | Isolated Chromium controlled by Node.js 22 | Caller-installed FFmpeg |
-| iOS | Nonpersistent WKWebView with external requests blocked | AVFoundation |
+Desktop CI runs the real browser and FFmpeg regression tests. Hosted mobile
+checks use Android API 29 and 35 and Apple Silicon and Intel iOS simulators.
+See the [CI results](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/ci.yml)
+for the tested revision and actual results. Hosted checks leave physical-device
+behavior and arbitrary live-source availability unverified.
 
-Public player programs are versioned by their actual source URL and reused within a bounded cache. Video metadata and signed resource URLs remain fresh. Available combined transfer sizes are reported before downloading; unknown lengths remain unknown. All three platforms support validated checkpoint resume. There is no fixed 512 MiB library limit.
+## Install
 
-## Build and integration
+Use `google()` and `mavenCentral()` for dependency resolution. Use the root
+multiplatform artifact in `commonMain`. Gradle selects the target variant.
+The library is built with Kotlin 2.2.21 and targets JVM 17.
 
-Use JDK 17 or newer and the checked-in Gradle wrapper. Android builds require SDK 36. Set the local Android SDK path in `local.properties`, which is not committed. Linking Apple frameworks and running iOS tests require macOS and Xcode.
+```kotlin
+kotlin {
+    sourceSets.commonMain.dependencies {
+        implementation("io.github.apdelrahman1911.kmpyt:kmpyt:0.1.1")
+    }
+}
+```
 
-```shell
+Check [Maven Central](https://central.sonatype.com/artifact/io.github.apdelrahman1911.kmpyt/kmpyt)
+for `0.1.1` availability. The previous published version is `0.1.0`.
+
+## Quick start
+
+Use the factory for your target.
+
+| Target | Import and invocation |
+| --- | --- |
+| Android | `dev.kmpyt.android.createAndroidYouTubeClient(context)` |
+| Desktop JVM | `dev.kmpyt.jvm.createJvmYouTubeClient()` |
+| iOS | `dev.kmpyt.createIosYouTubeClient()` |
+
+This JVM example prepares and saves a compatible selection. Pass an absolute
+destination in app-owned storage and a URL you have permission to download.
+
+```kotlin
+import dev.kmpyt.YouTubeDownloadResult
+import dev.kmpyt.jvm.createJvmYouTubeClient
+
+suspend fun saveVideo(
+    videoUrl: String,
+    destinationPath: String,
+    ffmpegPath: String?,
+): YouTubeDownloadResult {
+    val client = createJvmYouTubeClient(ffmpegPath = ffmpegPath)
+    try {
+        val report = client.inspect(videoUrl)
+        val selection = client.select(report, maxHeight = 720)
+            ?: error("No supported format is available")
+        val plan = client.plan(report, selection)
+        return client.download(plan, destinationPath) { progress ->
+            println("${progress.bytesDownloaded} bytes downloaded")
+        }
+    } finally {
+        client.close()
+    }
+}
+```
+
+Reuse a client across operations to share its bounded player-program cache.
+Close it when its owner ends, outside progress callbacks. Let coroutine
+cancellation propagate. Handle unavailable formats and network failures at
+the app boundary. Never log signed media URLs.
+
+On desktop, set `KMPYT_NODE`, `KMPYT_CHROMIUM`, or `KMPYT_FFMPEG` if the
+executables are outside their usual locations. An app that manages its own
+runtime can pass explicit executables and a private temporary directory through
+`DesktopYouTubeRuntimeOptions`.
+
+## API guide
+
+| Task | API |
+| --- | --- |
+| Inspect a video or audio-only catalogue | `inspect(url)`, `inspectAudio(url)` |
+| Load available manifest tracks and select quality | `expandFormats(report)`, then `select(report, maxHeight = 720)` |
+| Prepare a progressive source for a player | `preparePlayback(report, selection)` waits for the source's declared availability |
+| Browse or fetch caption cues | `search`, `channel`, `playlist`, `more`, `captions` |
+| Save media or retry an expired selection | `plan`, `download`, `refresh`. Retry the same selection and destination to reuse compatible checkpoint progress. |
+
+Keep transfer-state directories private. Retry with the same destination to
+reuse checked progress, and keep an app-owned record if jobs must survive
+app restarts. For source selection, standalone audio, native playback resources
+and their cleanup rules, see the [integration notes](docs/integration.md).
+
+Media combining requires compatible tracks. The library does not transcode.
+Live or encrypted manifest downloads and nested multivariant manifests are
+outside the supported download scope. iOS segmented transfers are limited to
+static fragmented MP4.
+
+## Build and contribute
+
+Use JDK 17 and the checked-in Gradle wrapper. Android source builds need SDK 36.
+Linking Apple frameworks and running simulator checks require macOS and Xcode.
+
+```sh
 ./gradlew :kmpyt:jvmTest
 ./gradlew :kmpyt:assembleRelease
-./gradlew :kmpyt:publishToMavenLocal
+# macOS with Xcode
+./gradlew :kmpyt:assembleKmpYTReleaseXCFramework
 ```
 
-Use `implementation("io.github.apdelrahman1911.kmpyt:kmpyt:0.1.0")` in `commonMain`. Resolve Maven Central releases with `mavenCentral()`. To try unpublished changes, use a composite build or publish locally and add `mavenLocal()` to the consuming build's repositories.
+- [GitHub releases](https://github.com/Apdelrahman1911/kmpYT/releases) and [Maven Central](https://central.sonatype.com/artifact/io.github.apdelrahman1911.kmpyt/kmpyt)
+- [CI workflow](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/ci.yml) and [tag-based release workflow](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/release.yml)
+- [Issue tracker](https://github.com/Apdelrahman1911/kmpYT/issues). Include the library version, target, runtime versions and a reproducible case. Redact private URLs, credentials and media before sharing.
 
-On macOS, run `:kmpyt:assembleKmpYTReleaseXCFramework` to build `KmpYT.xcframework`.
-
-```kotlin
-// Android: dev.kmpyt.android.createAndroidYouTubeClient(context)
-// iOS: dev.kmpyt.createIosYouTubeClient()
-val youtube = dev.kmpyt.jvm.createJvmYouTubeClient(ffmpegPath = "/usr/bin/ffmpeg")
-try {
-    val report = youtube.inspect(videoUrl)
-    val selection = requireNotNull(youtube.select(report, maxHeight = 720))
-    val plan = youtube.plan(report, selection)
-    youtube.download(plan, destinationPath) { progress ->
-        println("${progress.bytesDownloaded} / ${progress.totalBytes ?: "unknown"}")
-    }
-} finally {
-    youtube.close()
-}
-```
-
-Call these suspending methods from a coroutine. Reuse a client to benefit from its player cache, then close it when its owner ends. Desktop execution requires Node.js 22 and Chrome/Chromium or Edge; set `KMPYT_NODE` and `KMPYT_CHROMIUM` for nonstandard locations. Pass an FFmpeg executable path when combining separate tracks.
-
-For application-owned runtime provisioning, pass `runtimeOptions = DesktopYouTubeRuntimeOptions(
-nodeExecutable = absoluteNodePath, chromiumExecutable = absoluteChromiumPath,
-temporaryDirectory = absolutePrivateTempPath)` to `createJvmYouTubeClient`. Explicit executable
-paths must already exist and be executable; the private temporary directory must exist and be
-writable. Invalid explicit paths fail rather than silently using another installation. The
-default factory/constructor and environment lookups remain available. Only child-process
-`TMPDIR`/`TMP`/`TEMP` change, matching the Java helper/profile directory; no application-wide
-environment or JVM property is modified. Chromium's sandbox and offline network restrictions
-remain required; these options do not add a no-sandbox mode or install runtime dependencies.
-
-Inspect `report.media` to present formats. When a response supplies HLS/DASH catalogues, call `expandFormats(report)` before selecting their tracks; this fetches manifest metadata only. `playbackPlan(report, selection)` provides portable progressive/SABR source contracts. `search`, `channel`, `playlist`, `more` and `captions` expose browsing and subtitle data. Swift callers use `try await` for suspending operations and handle exported errors with `do`/`catch`.
-
-For a music/podcast player, `inspectAudio(videoUrl)` resolves standalone audio without
-running unrelated video-format signature transforms. The returned report marks this audio
-scope and retains source-declared manifest pointers for explicit expansion. The default
-`inspect` method still inspects the full catalogue.
-
-Use the suspending `preparePlayback(report, selection)` before handing a progressive URI to
-a native player. It honors `Representation.availableAtEpochMs`, including a source-declared
-pre-playback wait. The synchronous `playbackPlan` remains available for inspection; a host
-using it directly must honor that timestamp before requesting media. `download` and the
-native transfer/SABR adapters honor the same wait with cancellable delays. An early media
-HTTP 403 is not proof that a link expired, and refreshing a link can restart its source wait.
-No advertising resource or account/integrity grant is fetched to implement this timing.
-
-Large progressive downloads are fetched as exact HTTP byte ranges of at most 8 MiB over up to
-four connections (`ProgressiveDownloadTuning`; googlevideo paces a single larger range to about
-the media bitrate). Only a contiguous, synced and SHA-256-receipted prefix is checkpointed; every
-section must be an exact 206 of the same strong-ETag representation, otherwise the transfer
-falls back to one verified request. Unusually slow watch, player and oEmbed reads are duplicated
-once after a bounded delay (`HedgedResearchTransport`); media transfers are never hedged.
-`publicClientOrder` selects the request order of the pinned public player profiles.
-
-Search submits its **complete query verbatim**, including surrounding whitespace, up to 16,384
-well-formed UTF-16 code units. Oversized/invalid queries and titles are rejected, not shortened.
-`YouTubeBrowsePage.query` records that submitted query; `firstEntry` records the leading content
-entry **before** unavailable/unsupported filtering in the UI-oriented `items` list. Check its
-typed `issue` and nullable kind/identity; never substitute `items.first()` when the first result
-matters. Private videos, unknown cards, advertisements and unrecognized shelves cannot silently
-promote a later video. A navigable album/playlist/channel shelf is a collection result, not one
-of its child tracks. Channels/playlists may be browsed, but are not single-media playback or
-download representations. Browse receipts preserve complete titles and stable public identities;
-they do not certify playback authorization or recording/album equivalence.
-
-### Owned native SABR playback resources
-
-SABR source URLs are POST protocol endpoints, not ordinary MP4/M4A URLs. For an actual
-selected static SABR `SourcePlaybackRequest`, native client factories expose
-`supportsSabrPlayback` and `suspend openPlayback(request, authorization)`. The caller must
-provide its real `SourcePlaybackAuthorization`; no implicit authorization/integrity issuer
-is installed. The existing `YouTubeSabrStreamingSession` is the sole media ingestion engine.
-
-```kotlin
-val resource = youtube.openPlayback(selectedSabrRequest, applicationAuthorization)
-try {
-    // Give the native decoder the exact endpoint for the selected AUDIO/VIDEO role.
-    // Never pass it the original SABR endpoint or persist/log the capability URL.
-    nativePlayer.prepare(resource.endpoints)
-    // Keep resource alive throughout playback, seeks and native callbacks.
-} finally {
-    nativePlayer.release() // Stop native access before releasing its private cache.
-    resource.close()
-}
-```
-
-The owned endpoint binds only numeric IPv4 loopback, uses a random 256-bit capability route,
-and supports exact GET/HEAD/single byte ranges with no-store responses. It serves only verified
-cached coverage, not sparse-file length, and rechecks the caller policy on actual media requests.
-It has bounded headers, connections, chunks and timeouts. `YouTubeNativePlaybackLimits` defaults
-to a 1-GiB static cache budget and four connections per resource; the client permits at most
-eight active/opening resources. Seeking waits for whole-track ingestion to reach the requested
-bytes; there is no invented live window or server-time-seek protocol. Loopback remains **remote
-source playback**, not an offline download.
-
-`resource.close()` cancels/joins owned readers and ingestion, closes listeners and removes its
-private cache. Client close also disposes any remaining resources before its transport. Unknown
-native release stays a failure on repeated close, never a successful deletion authorization.
-Custom hosts can inject `createJvmYouTubeSabrPlaybackAdapter`,
-`createAndroidYouTubeSabrPlaybackAdapter` or `createIosYouTubeSabrPlaybackAdapter`; they retain
-ownership of the HTTP client passed to those adapter factories. Mobile hosts must explicitly
-permit only the required local native transport according to their platform security policy.
-
-The 2026-11-06 focused JVM run passed 103 tests with explicit FFmpeg, including real loopback
-POST-to-range byte integrity and authored AAC decode/seek to a null sink. Android/iOS adapters
-and the Android resume mirror are authored, not yet platform-compiled/executed for this change.
-These tests do not establish authorized live YouTube playback, audible output or app completion.
-
-Retry a cancelled or interrupted download with the same selection and destination to resume
-validated private progress. JVM/Android schema-2 checkpoints additionally permit **standalone
-progressive** signing-URL refresh only when the selected media/format, exact origin/path/content
-query, strong quoted ETag, actual redirected response scope and committed-prefix SHA-256 still
-match. Uncommitted tails are truncated; retained complete parts are revalidated too. Query
-order, duplicate/empty pairs and raw encoding remain identity-bearing. Only documented exact
-lowercase signing keys on Googlevideo (or explicit authored loopback tests) are excluded.
-Changed/unverifiable identity restarts; legacy schema-1 checkpoints require the exact old plan.
-SABR and multi-resource plans retain their existing exact-plan/generation bindings rather than
-borrowing this progressive identity rule. iOS has a separate checkpoint implementation; these
-new JVM/Android prefix/scope guarantees are not a claim of iOS parity.
-
-JVM/Android checkpoint roots must remain caller-private. Symlinks, special files and oversized
-trees fail before reset/cleanup. After success, media/checkpoint data is purged **while holding
-the OS lock**; the empty reusable `.<destination-name>.kmpyt/lock` inode and its parent remain.
-Do not unlink/recreate that lock while any process may reuse the destination: doing so can let
-two processes lock different inodes for one path. A host may remove a retired private generation
-only under a stronger external lifetime fence proving that no current or future writer can
-reuse it. The host owns background scheduling and persistent job state. Checkpoints contain
-hashes/receipts, not signed URLs or an application library database.
-
-## Current limitations
-
-Native media combining only accepts compatible codec/container pairs and does not transcode. iOS segmented transfers require static fragmented MP4. Live/encrypted and nested multivariant manifest downloads are unsupported. Android timing around B-frames and AAC priming remains device dependent. The library supplies playback plans and caption cues; the host app provides its player, subtitle controls and account pages.
-
-## Validation
-
-[Cross-platform CI](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/ci.yml) runs shared/JVM tests on Linux, Windows and macOS, Android emulator tests, and iOS simulator/framework checks. [Approved-channel tests](https://github.com/Apdelrahman1911/kmpYT/actions/workflows/live-youtube.yml) are manually triggered and restricted to [@oPiiLz](https://www.youtube.com/@oPiiLz). They upload redacted results rather than downloaded media or signed URLs. The live-test byte budget is a CI resource limit, not a library download limit.
-
-iOS file/protocol tests use the Kotlin simulator runner. WebKit is exercised by unconditional Swift XCTest cases inside the UIKit app in `ci/ios-host/`, linked to the simulator framework. CI generates that project with XcodeGen, publishes its `.xcresult` report, and assembles the release XCFramework after the tests succeed.
-
-Run `./gradlew :kmpyt:connectedDebugAndroidTest` to exercise the native Android runtime, file transfers and media combining on a connected emulator. These tests use authored fixtures and local servers; the live smoke test is skipped by default. To explicitly check one approved-channel video on Android:
-
-```shell
-./gradlew :kmpyt:connectedDebugAndroidTest \
-  -Pandroid.testInstrumentationRunnerArguments.class=dev.kmpyt.android.AndroidApprovedVideoSmokeTest \
-  -Pandroid.testInstrumentationRunnerArguments.kmpytLiveSmoke=true
-```
-
-The smoke test verifies the uploader before transferring media, checks saved audio/video samples and decodes a video frame. Its five-minute/eight-MiB budget applies only to this test. The test application's private `files/kmpyt-live-smoke.json` contains redacted diagnostics; downloaded media is deleted afterward. The 2026-11-05 local Android 15 run stopped at DNS resolution (`TRANSPORT_DNS_FAILURE`), before any media download. Live playback on that emulator remains unverified.
-
-The [2026-11-05 live run](https://github.com/Apdelrahman1911/kmpYT/actions/runs/41980615183) reached the approved channel, but YouTube again returned `AUTHORIZATION_REQUIRED` and no formats for the selected video. No live media was downloaded. Controlled transfer tests and this upstream access failure are reported separately; a passing offline suite does not establish live YouTube availability.
-
-YouTube's public interfaces can change or refuse resources. A listed format is not a guarantee of server access, device codec support or uninterrupted playback. Account login and bypassing protected playback are not provided. Native playback UIs remain the consuming application's responsibility.
-
-## Source provenance
-
-No code, binaries or assets from the original SnapTube APK are included. Client-profile facts are documented against the upstream yt-dlp version in source; executable extractors and media tools are not bundled. Dependency licensing follows the corresponding published packages.
+**Maintainer:** Abdelrahman Fahmy. kmpYT is licensed under the [MIT License](LICENSE).
+The project originated in ClearMedia’s independently implemented YouTube engine.
+See [third-party notices](THIRD_PARTY_NOTICES.md) for dependency and source
+attribution.

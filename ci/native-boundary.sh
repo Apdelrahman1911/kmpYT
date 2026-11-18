@@ -18,9 +18,14 @@ if [ "${1:-}" = android ]; then
     mkdir -p "$emulator_sdk/licenses"
     cp "$installed_sdk"/licenses/* "$emulator_sdk/licenses/"
     image="system-images;android-$api;google_apis;x86_64"
-    "$sdk_tools/sdkmanager" --sdk_root="$emulator_sdk" platform-tools emulator "$image"
-    printf 'no\n' | ANDROID_HOME="$emulator_sdk" "$sdk_tools/avdmanager" create avd --name "kmpyt-ci-$api" --package "$image"
-    export PATH="$emulator_sdk/platform-tools:$PATH"
+    "$sdk_tools/sdkmanager" --sdk_root="$emulator_sdk" emulator "$image"
+    # avdmanager locates packages from its own SDK, so run the command-line
+    # tools from the same scoped SDK as the newly installed system image.
+    mkdir -p "$emulator_sdk/cmdline-tools/latest"
+    cp -RL "$sdk_tools/.."/* "$emulator_sdk/cmdline-tools/latest/"
+    printf 'no\n' | ANDROID_HOME="$emulator_sdk" ANDROID_SDK_ROOT="$emulator_sdk" \
+        "$emulator_sdk/cmdline-tools/latest/bin/avdmanager" create avd --name "kmpyt-ci-$api" --package "$image"
+    export PATH="$installed_sdk/platform-tools:$PATH"
     export ADB_SERVER_SOCKET=tcp:127.0.0.1:5037
     python3 -B - <<'PY'
 import socket
@@ -43,7 +48,7 @@ PY
     }
     trap cleanup EXIT
     adb start-server
-    ANDROID_HOME="$emulator_sdk" "$emulator_sdk/emulator/emulator" "@kmpyt-ci-$api" -port 5554 \
+    ANDROID_HOME="$emulator_sdk" ANDROID_SDK_ROOT="$emulator_sdk" "$emulator_sdk/emulator/emulator" "@kmpyt-ci-$api" -port 5554 \
         -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect \
         > "$KMPYT_CI_WORK_ROOT/android/emulator-$api.log" 2>&1 &
     emulator_pid=$!

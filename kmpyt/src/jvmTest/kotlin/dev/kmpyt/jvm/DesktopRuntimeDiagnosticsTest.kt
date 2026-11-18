@@ -17,7 +17,7 @@ class DesktopRuntimeDiagnosticsTest {
         const TestEmitter = require('node:events').EventEmitter;
         // Scale authored/helper timers equally: 20s startup stays later than 15s and earlier than 30s.
         const actualTimer = globalThis.setTimeout;
-        globalThis.setTimeout = (callback, ms, ...args) => actualTimer(callback, Math.max(1, Math.ceil(ms / 100)), ...args);
+        globalThis.setTimeout = (callback, ms, ...args) => actualTimer(callback, Math.max(1, Math.ceil(ms / 10)), ...args);
         require('node:child_process').spawn = (_, args) => {
           const child = new TestEmitter();
           child.stderr = new TestEmitter(); child.exitCode = null;

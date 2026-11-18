@@ -1,0 +1,5 @@
+{
+  "group": "io.github.apdelrahman1911.kmpyt",
+  "modules": [{"artifact": "kmpyt"}],
+  "platformArtifacts": ["android", "jvm", "iosarm64", "iossimulatorarm64", "iosx64"]
+}
