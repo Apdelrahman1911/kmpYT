@@ -16,7 +16,8 @@ and artifacts.
   access needs an adjustment, the job restores the original device ownership.
 - Apple jobs use a disposable runner's CoreSimulator service and create, boot,
   and delete only their own simulator. Both Kotlin/Native tests and the UIKit
-  WebKit harness run on that device. The Apple Silicon job assembles the
+  WebKit harness run on that device. The harness uses a checksum-pinned
+  XcodeGen binary under the job workspace. The Apple Silicon job assembles the
   release XCFramework for all three Apple targets.
 - `ci/native-boundary.sh` refuses to start these hosted device services on a
   local machine or a shared runner. Developers can use their existing Android

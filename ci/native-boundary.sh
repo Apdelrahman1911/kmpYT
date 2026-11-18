@@ -101,7 +101,18 @@ PY
     ci/gradle.sh ":kmpyt:linkDebugFramework$target" ":kmpyt:${framework_target}Test" "-PiosSimulatorDevice=$simulator" --stacktrace
     python3 -B ci/summary.py --require-executed
     export KMPYT_FRAMEWORK="$KMPYT_CI_PROJECT_ROOT/kmpyt/build/bin/$framework_target/debugFramework/KmpYT.framework"
-    xcodegen generate --spec ci/ios-host/project.yml --project ci/ios-host
+    generator_dir="$KMPYT_CI_WORK_ROOT/xcode/tools"
+    xcodegen="$generator_dir/xcodegen/bin/xcodegen"
+    if [ ! -x "$xcodegen" ]; then
+        mkdir -p "$generator_dir"
+        archive="$generator_dir/xcodegen-2.47.0.zip"
+        curl --fail --location --retry 2 --proto '=https' --silent --show-error \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.47.0/xcodegen.zip --output "$archive"
+        printf '%s  %s\n' 6ef12a3ef5327c2c713397f46d9160550f8b1cdc5c925cd884d65c77c9f696cd "$archive" |
+            shasum -a 256 -c -
+        unzip -q "$archive" -d "$generator_dir"
+    fi
+    "$xcodegen" generate --spec ci/ios-host/project.yml --project ci/ios-host
     result="$KMPYT_CI_WORK_ROOT/xcode/results/ios-host.xcresult"
     xcodebuild -project ci/ios-host/KmpYTHost.xcodeproj -scheme KmpYTHost -configuration Debug \
         -destination "id=$simulator" -derivedDataPath "$KMPYT_CI_WORK_ROOT/xcode/DerivedData" \
