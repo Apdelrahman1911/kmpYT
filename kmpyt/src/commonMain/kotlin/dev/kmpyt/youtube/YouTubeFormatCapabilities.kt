@@ -5,6 +5,7 @@ import dev.kmpyt.extraction.Representation
 import dev.kmpyt.extraction.TrackRole
 import dev.kmpyt.extraction.TransportKind
 import dev.kmpyt.extraction.SourcePlaybackRequest
+import dev.kmpyt.extraction.AudioTrackProvenance
 
 /** Early compatibility checks; native inspection still validates the received container and tracks. */
 object YouTubeFormatCapabilities {
@@ -103,16 +104,24 @@ object YouTubeFormatCapabilities {
 /** IDs always reference the inspected catalogue; this selector never creates a quality or resource. */
 data class YouTubeFormatSelection(val primaryId: String, val audioId: String? = null) {
     companion object {
+        fun originalAudioTracks(media: ExtractedMedia): List<Representation> = media.representations.filter {
+            it.role == TrackRole.AUDIO && it.audioProvenance == AudioTrackProvenance.ORIGINAL
+        }
+
         fun choose(media: ExtractedMedia, platformName: String, maxHeight: Int? = 1080,
             audioOnly: Boolean = false, preferredPrimaryId: String? = null,
             preferredAudioId: String? = null): YouTubeFormatSelection? {
             require(maxHeight == null || maxHeight > 0) { "Choose a positive video height." }
-            val audio = media.representations.filter { it.role == TrackRole.AUDIO && it.selectable }
+            val originalAudio = originalAudioTracks(media)
+            val audio = media.representations.filter { it.role == TrackRole.AUDIO && it.selectable &&
+                (originalAudio.isEmpty() || it in originalAudio || it.id == preferredAudioId) }
                 .sortedWith(compareByDescending<Representation> { it.id == preferredAudioId }
+                    .thenByDescending { it.audioProvenance == AudioTrackProvenance.ORIGINAL }
                     .thenByDescending { it.audioIsDefault == true }
                     .thenBy { it.isDrc == true }
                     .thenByDescending { it.transport == TransportKind.PROGRESSIVE }
-                    .thenByDescending { it.bitrate ?: 0L })
+                    .thenByDescending { it.bitrate ?: 0L }
+                    .thenBy { it.id })
             if (audioOnly) return audio.firstOrNull {
                 YouTubeFormatCapabilities.downloadProblem(it, null, platformName) == null
             }?.let { YouTubeFormatSelection(it.id) }
@@ -124,7 +133,9 @@ data class YouTubeFormatSelection(val primaryId: String, val audioId: String? = 
                     .thenByDescending { it.transport == TransportKind.PROGRESSIVE }
                     .thenByDescending { it.bitrate ?: 0L })
             for (primary in video) {
-                if (primary.role == TrackRole.MUXED && YouTubeFormatCapabilities.downloadProblem(primary, null, platformName) == null)
+                if (primary.role == TrackRole.MUXED &&
+                    (originalAudio.isEmpty() || primary.audioProvenance == AudioTrackProvenance.ORIGINAL || primary.id == preferredPrimaryId) &&
+                    YouTubeFormatCapabilities.downloadProblem(primary, null, platformName) == null)
                     return YouTubeFormatSelection(primary.id)
                 if (primary.role == TrackRole.VIDEO) audio.firstOrNull {
                     YouTubeFormatCapabilities.downloadProblem(primary, it, platformName) == null
@@ -156,7 +167,10 @@ data class YouTubeFormatSelection(val primaryId: String, val audioId: String? = 
             val ceiling = current?.height ?: maxHeight
             val equivalent = selected?.let { equivalentProgressiveDownload(media, it, platformName) }
             if (current == null || current.transport == TransportKind.SABR) {
-                val progressive = media.copy(representations = media.representations.filter { it.transport == TransportKind.PROGRESSIVE })
+                val originalAudio = originalAudioTracks(media)
+                val progressive = media.copy(representations = media.representations.filter {
+                    it.transport == TransportKind.PROGRESSIVE || it in originalAudio
+                })
                 choose(progressive, platformName, maxHeight = ceiling,
                     preferredPrimaryId = equivalent?.primaryId, preferredAudioId = equivalent?.audioId ?: selected?.audioId)
                     ?.let { return it }
@@ -175,10 +189,12 @@ data class YouTubeFormatSelection(val primaryId: String, val audioId: String? = 
                     YouTubeFormatCapabilities.playbackProblem(video, it, platformName)) }
                 .sortedWith(compareBy<YouTubeAudioChoice> { it.downloadProblem != null }
                     .thenBy { it.playbackProblem != null }
+                    .thenByDescending { it.audio.audioProvenance == AudioTrackProvenance.ORIGINAL }
                     .thenByDescending { it.audio.audioIsDefault == true }
                     .thenBy { it.audio.isDrc == true }
                     .thenByDescending { it.audio.transport == TransportKind.PROGRESSIVE }
-                    .thenByDescending { it.audio.bitrate ?: 0L })
+                    .thenByDescending { it.audio.bitrate ?: 0L }
+                    .thenBy { it.audio.id })
         }
     }
 }

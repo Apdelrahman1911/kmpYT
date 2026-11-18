@@ -47,6 +47,14 @@ data class SourcePlaybackRequest(val metadata: SourcePlaybackMetadata, val plan:
         }
     }
 
+    /** One complete progressive audio object, for hosts whose player needs exact-range loopback reads. */
+    @Throws(Exception::class)
+    fun requireStaticProgressive() {
+        requireSupportedSource()
+        require(plan.audio == null && plan.primary.role == TrackRole.AUDIO && plan.primary.transport == TransportKind.PROGRESSIVE &&
+            plan.primary.url != null && (plan.primary.sizeBytes ?: 0L) > 0L && plan.primary.selectable)
+    }
+
     @Throws(Exception::class)
     fun requireStaticSabr() {
         requireSupportedSource()
@@ -87,6 +95,7 @@ data class SourcePlaybackRequest(val metadata: SourcePlaybackMetadata, val plan:
                 candidate.codecs?.lowercase()?.replace(" ", "") == selected.codecs?.lowercase()?.replace(" ", "") &&
                 candidate.width == selected.width && candidate.height == selected.height && candidate.frameRate == selected.frameRate &&
                 candidate.audioTrackId == selected.audioTrackId && candidate.audioLanguage == selected.audioLanguage &&
+                candidate.audioProvenance == selected.audioProvenance && candidate.audioIsAutoDubbed == selected.audioIsAutoDubbed &&
                 candidate.audioChannels == selected.audioChannels && candidate.audioSampleRate == selected.audioSampleRate &&
                 candidate.colorInfo == selected.colorInfo && candidate.isHdr == selected.isHdr &&
                 candidate.isDrc == selected.isDrc && candidate.segments.isEmpty() && candidate.initialization == null
@@ -121,7 +130,7 @@ data class SabrStreamingLimits(val maxBytes: Long = Long.MAX_VALUE,
 
 /**
  * Static, whole-track SABR playback cache. The existing transfer is the only HTTP
- * engine: it validates/stages UMP packets and fsyncs writes before coverage appears.
+ * engine: it validates/stages UMP packets before publishing written coverage.
  * Reads never mistake sparse file length for received bytes. Seeking selects a
  * cached byte offset or waits for ingestion; it does not invent server-time seek,
  * rolling live windows, signed URLs, player profiles, tokens or integrity issuers.

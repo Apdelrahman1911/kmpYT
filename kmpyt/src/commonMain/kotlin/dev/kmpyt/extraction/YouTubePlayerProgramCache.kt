@@ -12,12 +12,16 @@ class YouTubePlayerProgramCache(
     transport: ResearchTransport,
     compiler: YouTubePlayerProgramCompiler = BoundedYouTubePlayerProgramCompiler(),
     cacheEntries: Int = 1,
+    store: YouTubePlayerProgramStore? = null,
 ) {
     private val lease = Mutex()
-    private val programs = YouTubePlayerProgramLoader(transport, compiler, cacheEntries)
+    private val programs = YouTubePlayerProgramLoader(transport, compiler, cacheEntries, store)
 
     suspend fun <T> use(block: suspend (YouTubePlayerProgramLoader) -> T): T =
         lease.withLock { block(programs) }
+
+    /** Offline: prepares the last stored program so the next matching inspection skips that work. */
+    suspend fun prewarm(): Boolean = lease.withLock { programs.prewarm() }
 
     /** Also waits for a current inspection before releasing native runtime resources. */
     suspend fun clear() = lease.withLock { programs.clear() }

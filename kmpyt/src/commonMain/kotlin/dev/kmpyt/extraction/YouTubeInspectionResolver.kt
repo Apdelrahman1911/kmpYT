@@ -6,6 +6,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlin.time.TimeSource
 
 /**
  * Anonymous inspection is separate from authorization to fetch a media resource.
@@ -21,8 +22,13 @@ class YouTubeInspectionResolver(
     private val compiler: YouTubePlayerProgramCompiler = BoundedYouTubePlayerProgramCompiler(),
     private val usePublicPlayerClients: Boolean = false,
     private val programCache: YouTubePlayerProgramCache? = null,
+    /** Request order of the pinned public profiles, by client name. */
+    private val publicClientOrder: List<String> = YouTubePublicPlayerClients.DEFAULT_ORDER,
 ) {
-    suspend fun inspect(input: String, nowEpochMs: Long = 0): ExtractionReport {
+    suspend fun inspect(input: String, nowEpochMs: Long = 0, audioOnly: Boolean = false): ExtractionReport {
+        val started = TimeSource.Monotonic.markNow()
+        fun responseTime(): Long = if (nowEpochMs > 0)
+            nowEpochMs + started.elapsedNow().inWholeMilliseconds.coerceAtMost(Long.MAX_VALUE - nowEpochMs) else nowEpochMs
         val canonical = provider.normalize(input)
             ?: throw IllegalArgumentException("Enter a recognized YouTube video URL.")
         val videoId = requireNotNull(Url(canonical).parameters["v"])
@@ -43,10 +49,10 @@ class YouTubeInspectionResolver(
                 requests += request.copy(url = ResearchRedaction.url(request.url), headers = emptyMap(), body = null)
                 transport.execute(request)
             }
-            val publicClients = if (usePublicPlayerClients && observed != null) YouTubePublicPlayerClients.fromObservedWeb(observed) else emptyList()
+            val publicClients = if (usePublicPlayerClients && observed != null) YouTubePublicPlayerClients.fromObservedWeb(observed, publicClientOrder) else emptyList()
             suspend fun extract(programs: YouTubePlayerProgramLoader?): ProviderResult {
-                val extractor = YouTubeResponseExtractor(traced, compiler = compiler, programLoader = programs,
-                    options = YouTubeResponseExtractionOptions(clients = publicClients + listOfNotNull(observed),
+                val extractor = YouTubeResponseExtractor(traced, compiler = compiler, programLoader = programs, nowEpochMs = ::responseTime,
+                    options = YouTubeResponseExtractionOptions(audioOnly = audioOnly, clients = publicClients + listOfNotNull(observed),
                         requestObservedProgressiveAlternatives = true,
                         requestPublicProgressiveAlternatives = publicClients.isNotEmpty()))
                 return try { extractor.extract(context, watch) } finally { extractor.close() }
@@ -83,6 +89,8 @@ class YouTubeInspectionResolver(
                 } else diagnostics += ExtractionDiagnostic("youtube-oembed", "INVALID_OEMBED_METADATA", "The response did not contain a valid YouTube video metadata object.")
             }
         }
+        if (audioOnly) diagnostics += ExtractionDiagnostic("youtube-inspection", "AUDIO_FORMAT_SCOPE",
+            "Only standalone audio formats were resolved. Source-declared manifest pointers remain available; this is not a complete video-format catalogue.")
         val media = listOfNotNull(item)
         if (media.isEmpty()) {
             diagnostics += ExtractionDiagnostic("youtube-result", "METADATA_UNAVAILABLE", "Neither the anonymous watch response nor public oEmbed supplied usable video metadata. No result or quality list was manufactured.")
@@ -189,7 +197,7 @@ internal data class YouTubePublicMetadata(val title: String? = null, val thumbna
         fun fromHtml(body: String, canonical: String): YouTubePublicMetadata? {
             if (body.length > YouTubeProvider.MAX_PAGE_BODY) return null
             val fields = mutableMapOf<String, String>()
-            Regex("<(?:meta|link)\\b[^>]{0,16000}>", RegexOption.IGNORE_CASE).findAll(body).take(512).forEach { match ->
+            EmbeddedData.findAllAt(Regex("<(?:meta|link)\\b[^>]{0,16000}>", RegexOption.IGNORE_CASE), body, listOf("<meta", "<link")) { it + 16_010 }.take(512).forEach { match ->
                 val values = attributes(match.value)
                 val key = values["property"] ?: values["name"] ?: values["itemprop"] ?: values["rel"]
                 val value = values["content"] ?: values["href"]
@@ -201,9 +209,7 @@ internal data class YouTubePublicMetadata(val title: String? = null, val thumbna
             var thumbnail = imageUrl(fields["og:image"] ?: fields["thumbnailurl"])
             var duration = parseDuration(fields["duration"])
             var author: String? = fields["author"]
-            Regex("<script\\b[^>]*type\\s*=\\s*[\"']application/ld\\+json[\"'][^>]*>([\\s\\S]*?)</script\\s*>", RegexOption.IGNORE_CASE)
-                .findAll(body).take(16).forEach { script ->
-                    val text = script.groupValues[1]
+            EmbeddedData.ldJsonScripts(body).take(16).forEach { text ->
                     if (text.length > EmbeddedData.MAX_BODY) return@forEach
                     val objects = runCatching { EmbeddedData.objects(listOf(Json.parseToJsonElement(text))) }.getOrNull() ?: return@forEach
                     val video = objects.firstOrNull { objectValue ->

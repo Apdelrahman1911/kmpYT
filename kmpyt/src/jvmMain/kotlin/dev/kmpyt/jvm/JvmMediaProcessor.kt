@@ -17,6 +17,10 @@ internal class JvmMediaProcessor(private val ffmpegPath: String?) : FileMediaPro
     private fun executable(): File = ffmpegPath?.let(::File)?.takeIf { it.isFile }
         ?: error("Combining tracks requires a caller-supplied FFmpeg executable (ffmpegPath or KMPYT_FFMPEG).")
 
+    override fun link(source: java.io.File, target: java.io.File): Boolean = try {
+        java.nio.file.Files.createLink(target.toPath(), source.toPath()); true
+    } catch (_: Exception) { false }
+
     override suspend fun materialize(primary: Representation, audio: Representation?,
         fetch: suspend (SegmentResource, File) -> Unit, output: File): Unit = withContext(Dispatchers.IO) {
         require(!output.exists()) { "The output file already exists." }

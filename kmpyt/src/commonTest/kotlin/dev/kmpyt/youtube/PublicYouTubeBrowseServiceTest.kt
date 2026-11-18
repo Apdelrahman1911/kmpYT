@@ -59,7 +59,7 @@ class PublicYouTubeBrowseServiceTest {
         val playlist = """{"playlistRenderer":{"playlistId":"$playlistId","title":{"simpleText":"Actual playlist"},"videoCountText":{"runs":[{"text":"12 videos"}]}}}"""
         val transport = Transport { ResearchResponse(it.url, 200, initial("${video()},$channel,$playlist")) }
         val page = PublicYouTubeBrowseService(transport).search(" cats & music ")
-        assertEquals("cats & music", Url(transport.requests.single().url).parameters["search_query"])
+        assertEquals(" cats & music ", Url(transport.requests.single().url).parameters["search_query"])
         assertEquals(listOf(YouTubeBrowseKind.VIDEO, YouTubeBrowseKind.CHANNEL, YouTubeBrowseKind.PLAYLIST), page.items.map { it.kind })
         assertEquals("3:42", page.items[0].durationText)
         assertEquals("https://i.ytimg.com/vi/$id/hqdefault.jpg", page.items[0].thumbnailUrl)
@@ -68,6 +68,21 @@ class PublicYouTubeBrowseServiceTest {
         assertEquals("Creator", page.items[0].subtitle)
         assertEquals("GET", transport.requests.single().method)
         assertTrue(transport.requests.single().headers.keys.none { it.equals("cookie", true) || it.equals("authorization", true) })
+    }
+
+    @Test fun spellingSuggestionIsSearchControlAndDoesNotReplaceTheFirstContentResult() = runTest {
+        val query = "Complete requested title — العنوان الكامل"
+        // Its navigation target and nested media-looking data are controls, not result entries.
+        val suggestion = """{"didYouMeanRenderer":{"correctedQuery":{"runs":[{"text":"Different query"}]},"navigationEndpoint":{"searchEndpoint":{"query":"Different query"}},"contents":[${video(secondId)}]}}"""
+        val transport = Transport { ResearchResponse(it.url, 200, initial("$suggestion,${video()}")) }
+        val page = PublicYouTubeBrowseService(transport).search(query)
+        assertEquals(query, page.query)
+        assertEquals(query, Url(transport.requests.single().url).parameters["search_query"])
+        assertEquals(listOf(id), page.items.map { it.id })
+        assertEquals(YouTubeBrowseKind.VIDEO, page.firstEntry?.kind)
+        assertEquals(id, page.firstEntry?.id)
+        assertEquals(0, page.firstEntry?.ordinal)
+        assertNull(page.firstEntry?.issue)
     }
 
     @Test fun newLockupsAndShortsUseActualIdentifiersAndMetadata() = runTest {

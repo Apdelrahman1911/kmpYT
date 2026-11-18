@@ -13,17 +13,24 @@ data class LoadedYouTubePlayerProgram(
     val compilation: YouTubeProgramCompilation?,
     val diagnostics: List<ExtractionDiagnostic>,
     val cacheHit: Boolean = false,
+    /** The exact program text came from the application's private store, then was compiled again. */
+    val storeHit: Boolean = false,
 )
 
 /**
  * Loads only a response-declared player program. The cache is versioned by its actual
  * URL and the requested function binding; a different player cannot reuse its analysis.
  * No iframe lookup, invented hash, integrity program or extractor plugin is downloaded.
+ *
+ * An optional [store] keeps the exact program text for a declared URL across process
+ * restarts, avoiding a repeated multi-megabyte download. A stored program is compiled and
+ * verified exactly like a fresh one; any unusable entry falls back to the network.
  */
 class YouTubePlayerProgramLoader(
     private val transport: ResearchTransport,
     private val compiler: YouTubePlayerProgramCompiler = BoundedYouTubePlayerProgramCompiler(),
     private val cacheEntries: Int = 8,
+    private val store: YouTubePlayerProgramStore? = null,
 ) {
     private val mutex = Mutex()
     private val cache = linkedMapOf<ProgramKey, YouTubeProgramCompilation>()
@@ -60,6 +67,7 @@ class YouTubePlayerProgramLoader(
                             "SIGNATURE_PROGRAM_COMPILED", "THROTTLING_PROGRAM_COMPILED") },
                     cacheHit = true)
             }
+            stored(url, key)?.let { return@withLock it }
             val response = try {
                 requestTransport.execute(ResearchRequest("GET", url, mapOf("Accept" to "application/javascript, text/javascript"), stage = "youtube-player-program"))
             } catch (cancelled: CancellationException) { throw cancelled }
@@ -89,11 +97,55 @@ class YouTubePlayerProgramLoader(
             }
             // A native VM startup failure may be transient. Persist only usable
             // programs so a later inspection can retry the actual declared source.
-            if (compiled.transforms != null) cache[key] = compiled
-            while (cache.size > cacheEntries) cache.remove(cache.keys.first())?.transforms?.let { discarded ->
-                runCatching { discarded.close() }
+            if (compiled.transforms != null) {
+                remember(key, compiled)
+                try { store?.write(url, response.body) } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { /* Storage is an optimization; the prepared program remains usable. */ }
             }
             LoadedYouTubePlayerProgram(url, compiled, listOf(receipt) + compiled.diagnostics)
+        }
+    }
+
+    /**
+     * Prepares the most recently stored program without any network request, so a later
+     * inspection that declares the same URL reuses the ready runtime. Returns true when a
+     * usable program for that URL is in memory afterwards.
+     */
+    suspend fun prewarm(binding: YouTubeProgramBinding = YouTubeProgramBinding()): Boolean {
+        val latest = try { store?.latest() } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { null } ?: return false
+        val url = permittedReference(PREWARM_ORIGIN, latest) ?: return false
+        val key = ProgramKey(url, binding)
+        return mutex.withLock {
+            if (cache.containsKey(key)) return@withLock true
+            stored(url, key) != null
+        }
+    }
+
+    /** Called with [mutex] held. Null means no usable stored program; the caller fetches. */
+    private fun stored(url: String, key: ProgramKey): LoadedYouTubePlayerProgram? {
+        val store = store ?: return null
+        val program = try { store.read(url) } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { null }
+        if (program == null || program.length !in 1..MAX_PROGRAM_CHARS) return null
+        val compiled = try { compiler.compile(program, key.binding) } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { return null }
+        // An unusable stored entry is never trusted as a failure of the declared source.
+        val transforms = compiled.transforms ?: return null
+        if (!transforms.signatureAvailable && !transforms.throttlingAvailable) {
+            runCatching { transforms.close() }
+            return null
+        }
+        remember(key, compiled)
+        return LoadedYouTubePlayerProgram(url, compiled,
+            listOf(diagnostic("PLAYER_PROGRAM_STORE_HIT", "Reused the stored exact program for ${ResearchRedaction.url(url)} without downloading it; it was compiled and initialized again.")) +
+                compiled.diagnostics, storeHit = true)
+    }
+
+    private fun remember(key: ProgramKey, compiled: YouTubeProgramCompilation) {
+        cache[key] = compiled
+        while (cache.size > cacheEntries) cache.remove(cache.keys.first())?.transforms?.let { discarded ->
+            runCatching { discarded.close() }
         }
     }
 
@@ -129,6 +181,9 @@ class YouTubePlayerProgramLoader(
 
     companion object {
         const val MAX_PROGRAM_CHARS = 5_000_000
+        // Stored URLs are re-validated as public YouTube player programs; owned-origin
+        // research programs are never prewarmed from storage.
+        private const val PREWARM_ORIGIN = "https://www.youtube.com/"
         private val JSON_REFERENCE = Regex("\"(?:PLAYER_JS_URL|jsUrl)\"\\s*:\\s*(\"(?:\\\\.|[^\"\\\\])*\")")
         private val SCRIPT_REFERENCE = Regex("<script\\b[^>]*\\bsrc\\s*=\\s*(['\"])(.*?)\\1", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
         private val PUBLIC_PLAYER_PATH = Regex("/s/player/[A-Za-z0-9_-]{1,64}/[A-Za-z0-9_./-]{1,256}/base\\.js")

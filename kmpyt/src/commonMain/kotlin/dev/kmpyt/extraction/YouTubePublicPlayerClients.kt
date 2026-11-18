@@ -13,6 +13,20 @@ import kotlinx.serialization.json.put
 object YouTubePublicPlayerClients {
     const val SOURCE_VERSION = "yt-dlp 2026.10.26"
 
+    /** Pinned public profile names, in kmpYT's default request order. */
+    val DEFAULT_ORDER = listOf("TVHTML5", "VISIONOS")
+
+    /**
+     * The pinned profiles in [order] (client names; unknown names are ignored and omitted
+     * profiles keep their default relative order after the named ones).
+     */
+    fun fromObservedWeb(web: YouTubeClientContract, order: List<String>): List<YouTubeClientContract> {
+        val clients = fromObservedWeb(web)
+        val rank = order.withIndex().associate { (index, name) -> name to index }
+        return clients.withIndex().sortedWith(compareBy({ rank[it.value.clientContext.text("clientName")] ?: Int.MAX_VALUE }, { it.index }))
+            .map { it.value }
+    }
+
     fun fromObservedWeb(web: YouTubeClientContract): List<YouTubeClientContract> {
         require(web.provenance == YouTubeClientProvenance.RESPONSE_DECLARED_BROWSER && web.clientContext.text("clientName") == "WEB")
         val visitor = web.clientContext.text("visitorData")?.takeIf { it.isNotBlank() } ?: return emptyList()

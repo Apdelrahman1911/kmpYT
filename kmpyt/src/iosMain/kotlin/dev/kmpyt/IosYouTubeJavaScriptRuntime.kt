@@ -103,7 +103,10 @@ private class IosJavaScriptSession(private val timeoutSeconds: Double) : YouTube
                 else web.evaluateJavaScript(script) { result, error ->
                     when {
                         isClosed() -> pending.fail("SESSION_CLOSED")
-                        error != null -> pending.fail("PLAYER_FUNCTION_FAILED")
+                        error != null -> {
+                            debugIosJavaScriptError(error)
+                            pending.fail("PLAYER_FUNCTION_FAILED")
+                        }
                         result !is String -> pending.fail("NON_STRING_RESULT")
                         result.length !in 1..8192 || result == input || result.startsWith("enhanced_except_") ||
                             result.startsWith("undefined") || result.startsWith("null") -> pending.fail("PLAYER_FUNCTION_INVALID_RESULT")
@@ -148,6 +151,10 @@ private class OfflineNavigation(private val onLoaded: () -> Unit, private val on
         onLoaded()
     }
     override fun webView(webView: WKWebView, didFailProvisionalNavigation: WKNavigation?, withError: NSError) = onFailed()
+    override fun webViewWebContentProcessDidTerminate(webView: WKWebView) {
+        debugIosJavaScriptTermination()
+        onFailed()
+    }
     override fun webView(webView: WKWebView, decidePolicyForNavigationAction: WKNavigationAction,
         decisionHandler: (WKNavigationActionPolicy) -> Unit) {
         val url = decidePolicyForNavigationAction.request.URL?.absoluteString
@@ -157,18 +164,29 @@ private class OfflineNavigation(private val onLoaded: () -> Unit, private val on
 }
 
 private class IosRuntimeResult<T> {
+    private val started = NSProcessInfo.processInfo.systemUptime
     private val condition = NSCondition()
     private var result: Result<T>? = null
     private var stage = "MAIN_DISPATCH"
     fun stage(value: String) {
         condition.lock()
         try { stage = value } finally { condition.unlock() }
+        trace(value, "START")
     }
     fun succeed(value: T) = finish(Result.success(value))
-    fun fail(code: String) = finish(Result.failure(YouTubeJavaScriptFailure(code)))
+    fun fail(code: String) {
+        trace(stage, code)
+        finish(Result.failure(YouTubeJavaScriptFailure(code)))
+    }
     private fun finish(value: Result<T>) {
         condition.lock()
-        try { if (result == null) { result = value; condition.broadcast() } } finally { condition.unlock() }
+        try {
+            if (result == null) {
+                result = value
+                trace(stage, if (value.isSuccess) "SUCCEEDED" else "FAILED")
+                condition.broadcast()
+            }
+        } finally { condition.unlock() }
     }
     fun await(seconds: Double): T {
         requireWorker()
@@ -177,12 +195,33 @@ private class IosRuntimeResult<T> {
             val deadline = NSDate.dateWithTimeIntervalSinceNow(seconds)
             while (result == null) {
                 if (!condition.waitUntilDate(deadline) && result == null) {
+                    trace(stage, "TIMEOUT")
                     result = Result.failure(YouTubeJavaScriptFailure("RUNTIME_TIMEOUT_$stage"))
                 }
             }
             return requireNotNull(result).getOrThrow()
         } finally { condition.unlock() }
     }
+
+    @OptIn(kotlin.experimental.ExperimentalNativeApi::class)
+    private fun trace(stage: String, outcome: String) {
+        if (kotlin.native.Platform.isDebugBinary) {
+            val elapsed = ((NSProcessInfo.processInfo.systemUptime - started) * 1_000).toLong()
+            println("VEYRA_JS_RUNTIME stage=$stage outcome=$outcome elapsedMs=$elapsed uptimeMs=${(NSProcessInfo.processInfo.systemUptime * 1_000).toLong()}")
+        }
+    }
+}
+
+@OptIn(kotlin.experimental.ExperimentalNativeApi::class)
+private fun debugIosJavaScriptError(error: NSError) {
+    if (!kotlin.native.Platform.isDebugBinary) return
+    val domain = if (error.domain == WKErrorDomain) "WKErrorDomain" else "OTHER"
+    println("VEYRA_JS_RUNTIME stage=FUNCTION_EVALUATION errorDomain=$domain errorCode=${error.code}")
+}
+
+@OptIn(kotlin.experimental.ExperimentalNativeApi::class)
+private fun debugIosJavaScriptTermination() {
+    if (kotlin.native.Platform.isDebugBinary) println("VEYRA_JS_RUNTIME stage=CONTENT_PROCESS outcome=TERMINATED")
 }
 
 private fun requireWorker() {
