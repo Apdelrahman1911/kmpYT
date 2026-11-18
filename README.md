@@ -38,8 +38,8 @@ kotlin {
 }
 ```
 
-Check [Maven Central](https://central.sonatype.com/artifact/io.github.apdelrahman1911.kmpyt/kmpyt)
-for `0.1.2` availability. The previous published version is `0.1.0`.
+The current release is `0.1.2`. See the [version on Maven Central](https://central.sonatype.com/artifact/io.github.apdelrahman1911.kmpyt/kmpyt/0.1.2)
+for coordinates and dependencies.
 
 ## Quick start
 
