@@ -78,7 +78,10 @@ class AndroidYouTubeDownloaderTest {
             assertEquals(samples(sourceVideo, "video/"), samples(output, "video/"))
             assertEquals(samples(sourceAudio, "audio/"), samples(output, "audio/"))
             assertEquals(2, server.requestCount)
-            assertFalse(File(directory, ".saved.mp4.kmpyt").exists())
+            val checkpoints = File(directory, ".saved.mp4.kmpyt")
+            assertEquals(listOf("lock"), checkpoints.list()?.sorted(),
+                "Successful downloads purge media and receipts while retaining the reusable lock")
+            assertTrue("The retained lock must be an ordinary file", File(checkpoints, "lock").isFile)
         } finally { http.close(); server.shutdown(); directory.deleteRecursively() }
     }
 
