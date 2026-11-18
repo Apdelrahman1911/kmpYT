@@ -333,12 +333,12 @@ class RefreshedProgressiveResumeTest {
             fixture.interrupt()
             val storage = fixture.checkpoint.parentFile
             val lock = File(storage, "lock")
-            val identity = assertNotNull(Files.readAttributes(lock.toPath(), "basic:fileKey")["fileKey"])
+            val identity = Files.createLink(File(fixture.directory, "retained-lock").toPath(), lock.toPath())
             fixture.resume()
             fixture.request()
             assertContentEquals(fixture.body, fixture.output.readBytes())
             assertEquals(listOf("lock"), storage.listFiles()!!.map { it.name })
-            assertEquals(identity, Files.readAttributes(lock.toPath(), "basic:fileKey")["fileKey"])
+            assertTrue(Files.isSameFile(identity, lock.toPath()))
             // A later owner must lock the same inode, not race a stale cleanup
             // that removed/recreated the path after releasing its OS lock.
             check(fixture.output.delete())
@@ -346,7 +346,7 @@ class RefreshedProgressiveResumeTest {
             assertNull(fixture.request().getHeader("Range"))
             assertContentEquals(fixture.body, fixture.output.readBytes())
             assertEquals(listOf("lock"), storage.listFiles()!!.map { it.name })
-            assertEquals(identity, Files.readAttributes(lock.toPath(), "basic:fileKey")["fileKey"])
+            assertTrue(Files.isSameFile(identity, lock.toPath()))
         }
     }
 

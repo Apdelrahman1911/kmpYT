@@ -1,4 +1,5 @@
 import org.gradle.api.tasks.bundling.Zip
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
 import org.gradle.jvm.tasks.Jar
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.plugin.mpp.apple.XCFramework
@@ -84,6 +85,12 @@ tasks.withType<KotlinNativeSimulatorTest>().configureEach {
     providers.gradleProperty("iosSimulatorDevice").orNull?.let { device.set(it) }
 }
 
+if (providers.gradleProperty("kmpyt.ciDiagnostics").orNull == "true") {
+    tasks.withType<Test>().configureEach {
+        testLogging.exceptionFormat = TestExceptionFormat.FULL
+    }
+}
+
 val publicationNotices = listOf(rootProject.file("LICENSE"), rootProject.file("THIRD_PARTY_NOTICES.md"))
 val publicationDocumentation by tasks.registering(Jar::class) {
     archiveClassifier.set("javadoc")
@@ -101,7 +108,7 @@ publishing.publications.withType<MavenPublication>().configureEach {
     artifact(publicationDocumentation)
     pom {
         name.set("kmpYT")
-        description.set("YouTube inspection, browsing, captions and downloads for Kotlin Multiplatform.")
+        description.set("YouTube inspection, playback plans, captions and resumable media transfers for Kotlin Multiplatform.")
         url.set("https://github.com/Apdelrahman1911/kmpYT")
         licenses {
             license {
@@ -113,7 +120,7 @@ publishing.publications.withType<MavenPublication>().configureEach {
         developers {
             developer {
                 id.set("Apdelrahman1911")
-                name.set("abdelrahman fahmy")
+                name.set("Abdelrahman Fahmy")
                 url.set("https://github.com/Apdelrahman1911")
             }
         }
@@ -121,6 +128,8 @@ publishing.publications.withType<MavenPublication>().configureEach {
             url.set("https://github.com/Apdelrahman1911/kmpYT")
             connection.set("scm:git:https://github.com/Apdelrahman1911/kmpYT.git")
             developerConnection.set("scm:git:ssh://git@github.com/Apdelrahman1911/kmpYT.git")
+            tag.set(providers.gradleProperty("release.tag"))
         }
+        providers.gradleProperty("release.revision").orNull?.let { properties.put("releaseSourceRevision", it) }
     }
 }

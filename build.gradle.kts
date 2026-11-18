@@ -5,5 +5,5 @@ plugins {
 }
 allprojects {
     group = "io.github.apdelrahman1911.kmpyt"
-    version = "0.1.0"
+    version = providers.gradleProperty("kmpyt.version").orElse("0.1.1-SNAPSHOT").get()
 }

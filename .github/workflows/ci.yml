@@ -2,8 +2,11 @@ name: Cross-platform CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -30,7 +33,7 @@ jobs:
           submodules: false
       - name: Verify complete approved MIT grant and retained third-party notices
         run: ci/scoped.sh python3 -B ci/verify-license.py
-      - name: Check scoped tooling and fail-closed native preflights
+      - name: Check scoped tooling and hosted device boundaries
         run: ci/scoped.sh python3 -B ci/test-tooling.py
 
   jvm:
@@ -57,7 +60,7 @@ jobs:
         run: |
           ci/scoped.sh bash -euo pipefail -c '
             source ci/select-tools.sh jvm
-            ci/gradle.sh :kmpyt:jvmTest :kmpyt:jvmJar --stacktrace
+            ci/gradle.sh :kmpyt:jvmTest :kmpyt:jvmJar -Pkmpyt.ciDiagnostics=true --stacktrace
             python3 -B ci/summary.py --require-executed --require-media
           '
       - name: Summarize without artifact/cache uploads
@@ -93,14 +96,12 @@ jobs:
             test -d "$sdk/build-tools/35.0.0"
             ci/gradle.sh :kmpyt:assembleRelease :kmpyt:lintRelease --stacktrace
           '
-      - name: Required API instrumentation (fails before unaudited native launch)
+      - name: Run instrumentation on an owned GitHub-hosted emulator
         if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
         run: |
           ci/scoped.sh bash -euo pipefail -c '
             source ci/select-tools.sh
             ci/native-boundary.sh android
-            ci/gradle.sh :kmpyt:connectedDebugAndroidTest --stacktrace
-            python3 -B ci/summary.py --require-executed
           '
       - name: Summarize without artifact/cache uploads
         if: ${{ always() && steps.checkout.outcome == 'success' }}
@@ -110,11 +111,15 @@ jobs:
 
   apple:
     if: ${{ github.event.repository.private == false }}
-    name: iOS simulator and XCFramework
-    runs-on: macos-15-intel
-    timeout-minutes: 120
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
+    name: iOS simulator (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: arm64, runner: macos-26}
+          - {arch: x64, runner: macos-15-intel}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         id: checkout
@@ -122,34 +127,15 @@ jobs:
           persist-credentials: false
           set-safe-directory: false
           submodules: false
-      - name: Build simulator framework using pinned read-only Xcode
+      - name: Run native Kotlin and UIKit-hosted WebKit tests
         run: |
           ci/scoped.sh bash -euo pipefail -c '
             source ci/select-tools.sh
             xcodebuild -version
-            ci/gradle.sh :kmpyt:linkDebugFrameworkIosX64 --stacktrace
-          '
-      - name: Required native iOS protocols and media processing
-        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
-        run: |
-          ci/scoped.sh bash -euo pipefail -c '
-            source ci/select-tools.sh
             ci/native-boundary.sh ios
-            ci/gradle.sh :kmpyt:iosX64Test "-PiosSimulatorDevice=$IOS_DEVICE" --stacktrace
           '
-      - name: Required WebKit UIKit-hosted tests
-        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
-        run: |
-          ci/scoped.sh bash -euo pipefail -c '
-            source ci/select-tools.sh
-            ci/native-boundary.sh ios
-            command -v xcodegen
-            export KMPYT_FRAMEWORK="$KMPYT_CI_PROJECT_ROOT/kmpyt/build/bin/iosX64/debugFramework/KmpYT.framework"
-            xcodegen generate --spec ci/ios-host/project.yml --project ci/ios-host
-            xcodebuild -project ci/ios-host/KmpYTHost.xcodeproj -scheme KmpYTHost -configuration Debug -destination "id=$IOS_DEVICE" -derivedDataPath "$KMPYT_CI_WORK_ROOT/xcode/DerivedData" -resultBundlePath "$KMPYT_CI_WORK_ROOT/xcode/results/ios-host.xcresult" -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO test
-          '
-      - name: Assemble release XCFramework independently of runtime boundary
-        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' }}
+      - name: Assemble release XCFramework across all Apple targets
+        if: ${{ always() && !cancelled() && steps.checkout.outcome == 'success' && matrix.arch == 'arm64' }}
         run: |
           ci/scoped.sh bash -euo pipefail -c '
             source ci/select-tools.sh

@@ -27,7 +27,7 @@ for path in paths:
             counts[key]+=count
 message='## kmpYT scoped CI\n\nJob status: '+os.environ.get('KMPYT_CI_JOB_STATUS','see job exit')+'\n\n'
 message+='Discovered JUnit counts: `'+json.dumps(counts,sort_keys=True)+'`\n\n'
-message+='Missing/zero counts are NOT executed tests. Native boundary failures remain failed checks. No artifact/cache uploads or physical-device/source-availability/installation claim.\n'
+message+='Zero results do not count as executed tests. Native results describe the hosted emulator or simulator.\n'
 print(message)
 if os.environ.get('GITHUB_STEP_SUMMARY'):
     # Explicit reporting channel, not application scratch or cache storage.

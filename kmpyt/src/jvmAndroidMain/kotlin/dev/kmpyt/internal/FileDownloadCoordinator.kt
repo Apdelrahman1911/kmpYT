@@ -44,13 +44,19 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
             val parent = requireNotNull(destination.parentFile)
             check(parent.isDirectory || parent.mkdirs()) { "Could not create the destination directory." }
             val directory = File(parent, ".${destination.name}.kmpyt")
-            check(directory.canonicalFile == directory.absoluteFile) { "Download checkpoint storage cannot be a symbolic link." }
-            check(directory.isDirectory || directory.mkdir()) { "Could not create download checkpoint storage." }
+            when (checkpointEntry(directory)) {
+                CheckpointEntry.Missing -> check(directory.mkdir() || checkpointEntry(directory) == CheckpointEntry.Directory) {
+                    "Could not create download checkpoint storage."
+                }
+                CheckpointEntry.Directory -> Unit
+                else -> error("Download checkpoint storage must be an ordinary directory.")
+            }
             // Inspect the entire existing tree before even opening the lock for
             // writing. Future/corrupt-schema resets must not follow child links.
             checkpointTree(directory)
-            check(File(directory, "lock").canonicalFile == File(directory, "lock").absoluteFile) { "The checkpoint lock cannot be a symbolic link." }
-            val lockFile = RandomAccessFile(File(directory, "lock"), "rw")
+            val lock = File(directory, "lock")
+            requireCheckpointFileOrMissing(lock)
+            val lockFile = RandomAccessFile(lock, "rw")
             val fileLock = try { lockFile.channel.tryLock() } catch (_: Exception) { null }
             if (fileLock == null) { lockFile.close(); error("Another download is using this destination.") }
             var complete = false
@@ -64,7 +70,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                     it.key to progressiveResourceScope(it.resource.url, input.mediaId, allowLocalHttp)
                 }
                 val decoded = runCatching {
-                    require(checkpointFile.canonicalFile == checkpointFile.absoluteFile && checkpointFile.length() <= MAX_CHECKPOINT_BYTES)
+                    require(checkpointEntry(checkpointFile) == CheckpointEntry.File && checkpointFile.length() <= MAX_CHECKPOINT_BYTES)
                     json.decodeFromString(FileCheckpoint.serializer(), checkpointFile.readText())
                 }.getOrNull()
                 val restored = decoded?.takeIf {
@@ -88,7 +94,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                     val file = File(directory, state.key)
                     // Only keys authored by TransferPlanning are allowed to name local files.
                     require(Regex("\\d+-\\d+").matches(state.key)) { "Invalid local checkpoint resource key." }
-                    if (!file.isFile || file.canonicalFile != file.absoluteFile) null else if (plan.primary.transport == TransportKind.SABR) state
+                    if (checkpointEntry(file) != CheckpointEntry.File) null else if (plan.primary.transport == TransportKind.SABR) state
                     else {
                         val expected = requireNotNull(expectedParts[state.key]) { "The checkpoint does not belong to the selected media parts." }.expectedBytes
                         val length = file.length()
@@ -122,9 +128,8 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                     current()
                     plan = updated; states = parts
                     val temporary = File(directory, "checkpoint.tmp")
-                    check(temporary.canonicalFile == temporary.absoluteFile && checkpointFile.canonicalFile == checkpointFile.absoluteFile) {
-                        "Checkpoint files cannot be symbolic links."
-                    }
+                    requireCheckpointFileOrMissing(temporary)
+                    requireCheckpointFileOrMissing(checkpointFile)
                     val bytes = json.encodeToString(FileCheckpoint.serializer(),
                         FileCheckpoint(digest, parts, updated.sabrCheckpoint, schema = 2,
                             selectionDigest = selectionDigest, resourceScopes = resourceScopes,
@@ -132,8 +137,7 @@ internal class FileDownloadCoordinator(private val processor: FileMediaProcessor
                             responseScopes = responseScopes.filterKeys { key -> parts.any { it.key == key && it.bytes > 0 } })).encodeToByteArray()
                     check(bytes.size <= MAX_CHECKPOINT_BYTES) { "The download checkpoint exceeds its metadata bound." }
                     RandomAccessFile(temporary, "rw").use { it.setLength(0); it.write(bytes); it.fd.sync() }
-                    check(!checkpointFile.exists() || checkpointFile.delete()) { "Could not replace download checkpoint." }
-                    check(temporary.renameTo(checkpointFile)) { "Could not persist download checkpoint." }
+                    replaceCheckpoint(temporary, checkpointFile)
                     onProgress(YouTubeDownloadProgress(MediaStorageSpace.checkedSum(parts.map { it.bytes }), total, speed))
                 }
                 val published = File(directory, "published.mp4")

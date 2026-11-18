@@ -4,6 +4,11 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import java.io.File
 
+internal enum class CheckpointEntry { Missing, File, Directory, Unsupported }
+
+internal expect fun checkpointEntry(file: File): CheckpointEntry
+internal expect fun replaceCheckpoint(temporary: File, destination: File)
+
 /**
  * API-23-compatible checks for caller-private checkpoint storage. Never recurse
  * through a link, including a dangling one, when inspecting or deleting state.
@@ -15,9 +20,9 @@ internal suspend fun checkpointTree(directory: File): List<File> {
     suspend fun visit(file: File, depth: Int) {
         currentCoroutineContext().ensureActive()
         check(depth <= 16 && result.size < 20_000) { "Private download checkpoint storage exceeds its bounds." }
-        requireCheckpointEntry(file)
+        val entry = requireCheckpointEntry(file)
         result += file
-        if (file.isDirectory) {
+        if (entry == CheckpointEntry.Directory) {
             val children = checkNotNull(file.listFiles()) { "Could not inspect private download checkpoint storage." }
             check(children.size <= 20_000 - result.size) { "Private download checkpoint storage exceeds its bounds." }
             for (child in children) visit(child, depth + 1)
@@ -27,9 +32,18 @@ internal suspend fun checkpointTree(directory: File): List<File> {
     return result
 }
 
-private fun requireCheckpointEntry(file: File) {
-    check(file.canonicalFile == file.absoluteFile && (file.isFile || file.isDirectory)) {
+private fun requireCheckpointEntry(file: File): CheckpointEntry {
+    val entry = checkpointEntry(file)
+    check(entry == CheckpointEntry.File || entry == CheckpointEntry.Directory) {
         "Private download checkpoint storage contains a link or unsupported entry."
+    }
+    return entry
+}
+
+internal fun requireCheckpointFileOrMissing(file: File) {
+    val entry = checkpointEntry(file)
+    check(entry == CheckpointEntry.File || entry == CheckpointEntry.Missing) {
+        "Private download checkpoint must be an ordinary file."
     }
 }
 

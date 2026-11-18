@@ -47,18 +47,34 @@ async function start(executable, suppliedProfile) {
     '--disable-background-networking', '--disable-component-update', '--disable-sync',
     '--disable-extensions', '--disable-features=MediaRouter,OptimizationHints',
     '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', 'about:blank'
-  ], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  ], { windowsHide: true, stdio: 'ignore' });
   const endpoint = await new Promise((resolve, reject) => {
-    let text = '';
-    // Cold browser installation/profile startup is separate from CDP and JS execution limits.
-    const timer = setTimeout(() => reject(failure('OFFLINE_BROWSER_STARTUP_TIMEOUT')), 30000);
-    browser.once('error', () => { clearTimeout(timer); reject(failure('OFFLINE_BROWSER_SPAWN_FAILED')); });
-    browser.once('exit', () => { clearTimeout(timer); reject(failure('OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT')); });
-    browser.stderr.on('data', data => {
-      text = (text + data.toString()).slice(-16000);
-      const match = /DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[a-zA-Z0-9-]+)/.exec(text);
-      if (match) { clearTimeout(timer); resolve(match[1]); }
-    });
+    let poll;
+    let finished = false;
+    function finish(error, address) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      clearTimeout(poll);
+      if (error) reject(failure(error)); else resolve(address);
+    }
+    // Windows GUI Chromium need not emit a startup banner to stderr. Chromium
+    // writes the assigned port and browser path in the owned, initially empty profile.
+    const timer = setTimeout(() => finish('OFFLINE_BROWSER_STARTUP_TIMEOUT'), 30000);
+    browser.once('error', () => finish('OFFLINE_BROWSER_SPAWN_FAILED'));
+    browser.once('exit', () => finish('OFFLINE_BROWSER_EXITED_BEFORE_ENDPOINT'));
+    function readPort() {
+      try {
+        const [port, address, ...extra] = fs.readFileSync(path.join(profile, 'DevToolsActivePort'), 'utf8').trim().split(/\r?\n/);
+        if (extra.length === 0 && /^[0-9]{1,5}$/.test(port) && +port > 0 && +port <= 65535 &&
+            /^\/devtools\/browser\/[a-zA-Z0-9-]+$/.test(address || '')) {
+          finish(null, 'ws://127.0.0.1:' + port + address);
+          return;
+        }
+      } catch (_) { /* The file can be absent or incomplete while Chromium starts. */ }
+      poll = setTimeout(readPort, 50);
+    }
+    readPort();
   });
   try { socket = new WebSocket(endpoint); }
   catch (_) { throw failure('OFFLINE_CDP_CONNECTION_FAILED'); }

@@ -18,13 +18,14 @@ class DesktopRuntimeDiagnosticsTest {
         // Scale authored/helper timers equally: 20s startup stays later than 15s and earlier than 30s.
         const actualTimer = globalThis.setTimeout;
         globalThis.setTimeout = (callback, ms, ...args) => actualTimer(callback, Math.max(1, Math.ceil(ms / 100)), ...args);
-        require('node:child_process').spawn = () => {
+        require('node:child_process').spawn = (_, args) => {
           const child = new TestEmitter();
           child.stderr = new TestEmitter(); child.exitCode = null;
           child.kill = () => { child.exitCode = 1; child.emit('exit', 1); };
           ${if (endpointAfterMs == null) "" else """
-          setTimeout(() => child.stderr.emit('data', Buffer.from(
-            'DevTools listening on ws://127.0.0.1:32123/devtools/browser/authored-slow-fixture\n')), $endpointAfterMs);
+          const profilePath = args.find(value => value.startsWith('--user-data-dir=')).slice('--user-data-dir='.length);
+          setTimeout(() => require('node:fs').writeFileSync(require('node:path').join(profilePath, 'DevToolsActivePort'),
+            '32123\n/devtools/browser/authored-slow-fixture\n'), $endpointAfterMs);
           """.trimIndent()}
           return child;
         };
@@ -80,12 +81,13 @@ class DesktopRuntimeDiagnosticsTest {
     @Test fun cdpFailureNamesTheAuthoredStageWithoutProtocolPayload() {
         val source = helper("""
             const TestEmitter = require('node:events').EventEmitter;
-            require('node:child_process').spawn = () => {
+            require('node:child_process').spawn = (_, args) => {
               const child = new TestEmitter();
               child.stderr = new TestEmitter(); child.exitCode = null;
               child.kill = () => { child.exitCode = 1; child.emit('exit', 1); };
-              setImmediate(() => child.stderr.emit('data', Buffer.from(
-                'DevTools listening on ws://127.0.0.1:32123/devtools/browser/authored-fixture\n')));
+              const profilePath = args.find(value => value.startsWith('--user-data-dir=')).slice('--user-data-dir='.length);
+              setImmediate(() => require('node:fs').writeFileSync(require('node:path').join(profilePath, 'DevToolsActivePort'),
+                '32123\n/devtools/browser/authored-fixture\n'));
               return child;
             };
             globalThis.WebSocket = class {

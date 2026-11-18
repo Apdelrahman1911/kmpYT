@@ -25,11 +25,14 @@ class ToolingTests(unittest.TestCase):
         self.assertEqual(values['TMPDIR'],values['TMP']); self.assertEqual(values['TMP'],values['TEMP'])
         self.assertEqual(dict(os.environ),before)
 
-    def test_both_native_gates_fail_without_starting_services(self):
+    def test_native_controller_refuses_shared_hosts(self):
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ('GITHUB_ACTIONS', 'RUNNER_ENVIRONMENT')}
         for kind in ('android','ios'):
-            result=subprocess.run(['bash',str(ROOT/'ci/native-boundary.sh'),kind],capture_output=True,text=True)
+            result=subprocess.run(['bash',str(ROOT/'ci/native-boundary.sh'),kind],
+                                  env=environment,capture_output=True,text=True)
             self.assertEqual(result.returncode,78)
-            self.assertIn('BLOCKED:',result.stderr)
+            self.assertIn('disposable GitHub-hosted runners only',result.stderr)
 
     def test_escaping_work_symlink_rejected_before_writes(self):
         with tempfile.TemporaryDirectory(dir=ROOT/'.work/tmp') as temp:
