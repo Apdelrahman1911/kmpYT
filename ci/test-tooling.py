@@ -49,6 +49,14 @@ class CentralPublishingTests(unittest.TestCase):
                                                self.version, self.revision)
         portal.assert_not_called()
 
+    def test_failed_deployment_reports_the_category_without_echoing_the_response(self):
+        receipt = self.receipt("FAILED")
+        receipt["errors"] = {"deployment": ["Monthly limit exceeded; private provider detail"]}
+        with patch.object(central_release, "portal", return_value=json.dumps(receipt).encode()), \
+                patch("builtins.print"), self.assertRaisesRegex(ValueError, "FAILED \\(publishing limit\\)") as failure:
+            central_release.await_state(self.deployment, "authored-token", "PUBLISHED")
+        self.assertNotIn("private provider detail", str(failure.exception))
+
 class ToolingTests(unittest.TestCase):
     def test_shell_syntax(self):
         for path in (ROOT/'ci').glob('*.sh'):

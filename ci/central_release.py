@@ -33,15 +33,23 @@ class RejectRedirects(HTTPRedirectHandler):
 HTTP = build_opener(RejectRedirects())
 
 
+def failure_reason(detail):
+    text = detail.lower()
+    return next((label for label, terms in (
+        ("publishing limit", ("quota", "usage limit", "publishing limit", "monthly limit", "release count limit",
+                              "file count limit", "release size limit", "exceeded the", "limit exceeded")),
+        ("coordinate conflict", ("already exists", "already published", "cannot overwrite", "duplicate")),
+        ("deployment state", ("deployment state", "not validated", "already publishing")),
+        ("authorization", ("unauthorized", "forbidden", "permission", "not authorized", "not permitted")),
+        ("signature validation", ("signature", "public key", "checksum")),
+        ("publication service error", ("internal error", "server error", "unexpected error", "service unavailable")),
+    ) if any(term in text for term in terms)), None)
+
+
 class CentralHttpError(RuntimeError):
     def __init__(self, method, url, error):
         self.status = error.code
-        detail = error.read(16_384).decode(errors="replace").lower()
-        reason = next((label for label, terms in (
-            ("publishing limit", ("quota", "usage limit", "publishing limit", "monthly limit")),
-            ("deployment state", ("deployment state", "not validated", "already publishing")),
-            ("authorization", ("unauthorized", "forbidden", "permission")),
-        ) if any(term in detail for term in terms)), None)
+        reason = failure_reason(error.read(16_384).decode(errors="replace"))
         suffix = f" ({reason})" if reason else ""
         super().__init__(f"{method} {url.split('?', 1)[0]} returned HTTP {self.status}{suffix}")
 
@@ -166,7 +174,9 @@ def await_state(deployment, token, *required):
         if status in required:
             return response
         if status == "FAILED":
-            raise ValueError(f"Central validation failed for deployment {deployment}. See its validation messages in the Central Portal.")
+            reason = failure_reason(json.dumps(response.get("errors", {})))
+            suffix = f" ({reason})" if reason else ""
+            raise ValueError(f"Central marked deployment {deployment} FAILED{suffix}. See its details in the Central Portal.")
         time.sleep(12)
     raise TimeoutError(f"Central deployment {deployment} did not reach {' or '.join(required)}; inspect it before retrying")
 
