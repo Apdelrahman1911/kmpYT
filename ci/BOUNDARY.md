@@ -26,3 +26,22 @@ and artifacts.
 Zero test results and failed preflights fail the relevant hosted check. Hosted
 results describe the emulator or simulator and do not establish physical-device
 behavior or continued availability of an external media source.
+
+## Central deployment recovery
+
+A valid release tag still triggers the complete release workflow. If an
+approved bundle was uploaded and the publish request returned an ambiguous
+error, the recovery workflow can resume the exact deployment. It verifies the
+original tag, failed workflow, deployment ID, and Maven stage before using the
+existing Central environment. It compares public files against that stage
+after publication.
+
+Dispatch `release-recovery.yml` on a protected-environment tag named
+`v-recovery-<version>`, with an optional `-r<number>` suffix for revised
+recovery tooling. Supply the original release tag, workflow run ID and
+deployment ID. Recovery tags are excluded from ordinary release triggers.
+After successful readback, rerun the original release workflow to run the
+clean Maven consumer and create its GitHub Release. If Central reports a
+terminal publishing limit, retain the deployment evidence and check the
+[Central Usage Center](https://central.sonatype.com/publishing/usage) before
+starting another upload.
