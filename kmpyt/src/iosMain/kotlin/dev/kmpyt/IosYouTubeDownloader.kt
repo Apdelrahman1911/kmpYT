@@ -41,6 +41,7 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
         val store = IosDownloadResumeStore.open(destinationPath, iosSelectionDigest(plan))
         val files = mutableListOf<IosMediaFile>()
         var published = false
+        var exporterOwnsStore = false
         try {
             require(!manager.fileExistsAtPath(store.destination)) { "The destination already exists; choose another file." }
             store.load(plan, parts)
@@ -106,7 +107,9 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
             val output = if (remux) "${store.directory}/output.mp4" else paths.single()
             if (remux) {
                 requireIosStorage(store.directory, checkedIosSum(paths.map { requireNotNull(store.fileLength(it)) }))
-                IosMediaMuxer.mux(paths[0], plan.primary.role, paths.getOrNull(1), output)
+                IosMediaMuxer.mux(paths[0], plan.primary.role, paths.getOrNull(1), output) {
+                    exporterOwnsStore = true
+                }
                 IosMediaFile(output, existing = true).let { file -> try { file.flush() } finally { file.close() } }
             }
             currentCoroutineContext().ensureActive()
@@ -120,7 +123,8 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
                 else plan.primary.mimeType.substringBefore(';'))
         } finally {
             files.forEach { it.close() }
-            store.close(completed = published)
+            // The export still owns these files if cancellation never reached a terminal state.
+            if (!exporterOwnsStore) store.close(completed = published)
         }
     }
 
@@ -142,6 +146,7 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
                 try {
                     var offset = 0L
                     while (offset < sizes[index]) {
+                        currentCoroutineContext().ensureActive()
                         val bytes = source.read(offset, minOf(64 * 1024L, sizes[index] - offset).toInt())
                         destination.write(position, bytes)
                         offset += bytes.size; position += bytes.size

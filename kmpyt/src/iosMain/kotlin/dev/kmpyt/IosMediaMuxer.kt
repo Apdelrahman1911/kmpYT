@@ -12,7 +12,7 @@ import platform.Foundation.*
 
 /** Local-only, lossless passthrough. It preserves video transforms and each source track's native timescale. */
 internal object IosMediaMuxer {
-    suspend fun mux(primaryPath: String, primaryRole: TrackRole, audioPath: String?, outputPath: String) {
+    suspend fun mux(primaryPath: String, primaryRole: TrackRole, audioPath: String?, outputPath: String, onOwnershipUnconfirmed: () -> Unit = {}) {
         currentCoroutineContext().ensureActive()
         require(!NSFileManager.defaultManager.fileExistsAtPath(outputPath)) { "The mux destination already exists." }
         val composition = AVMutableComposition.composition()
@@ -47,20 +47,74 @@ internal object IosMediaMuxer {
         exporter.outputFileType = AVFileTypeMPEG4
         exporter.shouldOptimizeForNetworkUse = true
         val finished = CompletableDeferred<Unit>()
-        exporter.exportAsynchronouslyWithCompletionHandler { finished.complete(Unit) }
-        try {
-            finished.await()
+        awaitIosExport(
+            start = { exporter.exportAsynchronouslyWithCompletionHandler { finished.complete(Unit) } },
+            state = {
+                when (exporter.status) {
+                    AVAssetExportSessionStatusCompleted -> IosExportState.COMPLETED
+                    AVAssetExportSessionStatusFailed -> IosExportState.FAILED
+                    AVAssetExportSessionStatusCancelled -> IosExportState.CANCELLED
+                    else -> IosExportState.ACTIVE
+                }
+            },
+            completion = finished,
+            cancel = exporter::cancelExport,
+            onOwnershipUnconfirmed = onOwnershipUnconfirmed,
+        )
+        val output = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(outputPath), options = null)
+        if (primaryRole != TrackRole.AUDIO) check(output.tracksWithMediaType(AVMediaTypeVideo).isNotEmpty()) { "The saved MP4 has no video track." }
+        if (primaryRole != TrackRole.VIDEO || audioPath != null) check(output.tracksWithMediaType(AVMediaTypeAudio).isNotEmpty()) { "The saved MP4 has no audio track." }
+    }
+}
+
+internal enum class IosExportState { ACTIVE, COMPLETED, FAILED, CANCELLED }
+
+/** Poll terminal status as well as observing the callback. Only a terminal status releases file ownership. */
+internal suspend fun awaitIosExport(
+    start: () -> Unit,
+    state: () -> IosExportState,
+    completion: Deferred<Unit>,
+    cancel: () -> Unit,
+    onOwnershipUnconfirmed: () -> Unit,
+    timeoutMs: Long = 120_000,
+    drainMs: Long = 10_000,
+) {
+    suspend fun awaitTerminal(): IosExportState {
+        while (true) {
             currentCoroutineContext().ensureActive()
-            check(exporter.status == AVAssetExportSessionStatusCompleted) {
-                "AVFoundation could not combine the downloaded media into MP4 (code ${exporter.error?.code ?: 0})."
-            }
-            val output = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(outputPath), options = null)
-            if (primaryRole != TrackRole.AUDIO) check(output.tracksWithMediaType(AVMediaTypeVideo).isNotEmpty()) { "The saved MP4 has no video track." }
-            if (primaryRole != TrackRole.VIDEO || audioPath != null) check(output.tracksWithMediaType(AVMediaTypeAudio).isNotEmpty()) { "The saved MP4 has no audio track." }
-        } finally {
-            if (!finished.isCompleted) {
-                exporter.cancelExport()
-                withContext(NonCancellable) { withTimeoutOrNull(10_000) { finished.await() } }
+            val observed = state()
+            if (observed != IosExportState.ACTIVE) return observed
+            if (completion.isCompleted) delay(100) else withTimeoutOrNull(100) { completion.await() }
+        }
+    }
+    var reason = DownloadProcessingException.Reason.EXPORT_FAILED
+    var drained = false
+    try {
+        start()
+        val terminal = withTimeoutOrNull(timeoutMs) { awaitTerminal() }
+        drained = terminal != null
+        currentCoroutineContext().ensureActive()
+        if (terminal == IosExportState.COMPLETED) return
+        reason = when (terminal) {
+            null -> DownloadProcessingException.Reason.EXPORT_TIMEOUT
+            IosExportState.CANCELLED -> DownloadProcessingException.Reason.EXPORT_CANCELLED
+            else -> DownloadProcessingException.Reason.EXPORT_FAILED
+        }
+        throw DownloadProcessingException(reason)
+    } catch (cancelled: CancellationException) {
+        reason = DownloadProcessingException.Reason.EXPORT_CANCELLED
+        throw cancelled
+    } finally {
+        if (!drained) {
+            val terminal = try {
+                withContext(NonCancellable) {
+                    cancel()
+                    withTimeoutOrNull(drainMs) { awaitTerminal() }
+                }
+            } catch (_: Exception) { null }
+            if (terminal == null) {
+                onOwnershipUnconfirmed()
+                throw DownloadProcessingException(reason, restartRequired = true)
             }
         }
     }
