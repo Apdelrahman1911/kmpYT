@@ -33,14 +33,28 @@ class RejectRedirects(HTTPRedirectHandler):
 HTTP = build_opener(RejectRedirects())
 
 
+class CentralHttpError(RuntimeError):
+    def __init__(self, method, url, error):
+        self.status = error.code
+        detail = error.read(16_384).decode(errors="replace").lower()
+        reason = next((label for label, terms in (
+            ("publishing limit", ("quota", "usage limit", "publishing limit", "monthly limit")),
+            ("deployment state", ("deployment state", "not validated", "already publishing")),
+            ("authorization", ("unauthorized", "forbidden", "permission")),
+        ) if any(term in detail for term in terms)), None)
+        suffix = f" ({reason})" if reason else ""
+        super().__init__(f"{method} {url.split('?', 1)[0]} returned HTTP {self.status}{suffix}")
+
+
 def request(url, method="GET", data=None, headers=None, missing=False):
     try:
         with HTTP.open(Request(url, method=method, data=data, headers=headers or {}), timeout=120) as reply:
             return reply.read()
     except HTTPError as error:
-        if missing and error.code == 404:
-            return None
-        raise RuntimeError(f"{method} {url.split('?', 1)[0]} returned HTTP {error.code}") from None
+        with error:
+            if missing and error.code == 404:
+                return None
+            raise CentralHttpError(method, url, error) from None
 
 
 def coordinates(inventory):
@@ -135,10 +149,10 @@ def portal(path, token, parameters=None, data=None, content_type=None):
     headers = {"Authorization": f"Bearer {token}"}
     if content_type:
         headers["Content-Type"] = content_type
-    return request(url, method="POST", data=data, headers=headers)
+    return request(url, method="POST", data=data if data is not None else b"", headers=headers)
 
 
-def await_state(deployment, token, required):
+def await_state(deployment, token, *required):
     deadline = time.monotonic() + 25 * 60
     last = None
     while time.monotonic() < deadline:
@@ -149,12 +163,12 @@ def await_state(deployment, token, required):
         if status != last:
             print(f"Central deployment {deployment} is {status}", flush=True)
             last = status
-        if status == required:
+        if status in required:
             return response
         if status == "FAILED":
             raise ValueError(f"Central validation failed for deployment {deployment}. See its validation messages in the Central Portal.")
         time.sleep(12)
-    raise TimeoutError(f"Central deployment {deployment} did not reach {required}; inspect it before retrying")
+    raise TimeoutError(f"Central deployment {deployment} did not reach {' or '.join(required)}; inspect it before retrying")
 
 
 def compare_public(stage, files):
@@ -179,46 +193,74 @@ def compare_public(stage, files):
     print(f"Compared SHA-256 for {len(files)} published files against the approved staged repository.")
 
 
+def deployment_name(group, version, revision):
+    return f"{group} {version} ({revision[:12]})"
+
+
+def central_token():
+    username = os.environ.pop("CENTRAL_USERNAME", "").strip()
+    password = os.environ.pop("CENTRAL_PASSWORD", "").strip()
+    if not username or not password:
+        raise ValueError("The maven-central environment needs CENTRAL_USERNAME and CENTRAL_PASSWORD")
+    return base64.b64encode(f"{username}:{password}".encode()).decode()
+
+
+def publish_deployment(deployment, token, group, artifacts, version, revision):
+    expected = {f"pkg:maven/{group}/{artifact}@{version}" for artifact in artifacts}
+    for attempt in range(4):
+        result = await_state(deployment, token, "VALIDATED", "PUBLISHING", "PUBLISHED")
+        actual = {purl.split("?", 1)[0] for purl in result["purls"]}
+        if actual != expected or result.get("deploymentName") != deployment_name(group, version, revision):
+            raise ValueError(f"Deployment {deployment} does not match the verified release.")
+        if result["deploymentState"] != "VALIDATED":
+            break
+        if attempt == 3:
+            raise last_error
+        try:
+            portal(f"deployment/{deployment}", token)
+            break
+        except CentralHttpError as error:
+            if error.status not in {400, 409, 429, 500, 502, 503, 504}:
+                raise
+            print(f"{error}. Checking the same deployment before retrying.", flush=True)
+            last_error = error
+            time.sleep(12 * (attempt + 1))
+    await_state(deployment, token, "PUBLISHED")
+
+
 def publish(stage, bundle, group, artifacts, version, tag, revision):
     if is_public(group, artifacts, version, tag, revision):
         print(f"{version} is already public for this release commit. Reusing the immutable publication.")
         return
     files = validated_files(stage, group, artifacts, version, tag, revision)
-    username = os.environ.pop("CENTRAL_USERNAME", "").strip()
-    password = os.environ.pop("CENTRAL_PASSWORD", "").strip()
+    token = central_token()
     key = os.environ.pop("SIGNING_KEY", "").encode()
     passphrase = os.environ.pop("SIGNING_PASSPHRASE", "").rstrip("\r\n").encode()
-    if not all((username, password, key)):
-        raise ValueError("The maven-central environment needs CENTRAL_USERNAME, CENTRAL_PASSWORD and SIGNING_KEY")
-    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    if not key:
+        raise ValueError("The maven-central environment needs SIGNING_KEY")
     bundle.parent.mkdir(parents=True, exist_ok=True)
     sign_bundle(stage, files, bundle, key, passphrase)
     boundary = uuid4().hex
     opening = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"bundle\"; filename=\"release.zip\"\r\n"
                "Content-Type: application/octet-stream\r\n\r\n").encode()
     data = opening + bundle.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
-    raw_id = portal("upload", token, {"publishingType": "USER_MANAGED", "name": f"{group} {version} ({revision[:12]})"},
+    raw_id = portal("upload", token, {"publishingType": "USER_MANAGED", "name": deployment_name(group, version, revision)},
                     data, f"multipart/form-data; boundary={boundary}")
     deployment = str(UUID(raw_id.decode().strip()))
     print(f"Submitted Central deployment {deployment}", flush=True)
-    result = await_state(deployment, token, "VALIDATED")
-    expected = {f"pkg:maven/{group}/{artifact}@{version}" for artifact in artifacts}
-    actual = {purl.split("?", 1)[0] for purl in result["purls"]}
-    if actual != expected:
-        raise ValueError(f"Validated coordinates differ from the inventory. Inspect deployment {deployment} in Central Portal.")
-    portal(f"deployment/{deployment}", token)
-    await_state(deployment, token, "PUBLISHED")
+    publish_deployment(deployment, token, group, artifacts, version, revision)
     compare_public(stage, files)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("check", "publish"))
+    parser.add_argument("command", choices=("check", "publish", "resume"))
     parser.add_argument("--inventory", required=True, type=Path)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--repository", type=Path)
     parser.add_argument("--bundle", type=Path)
+    parser.add_argument("--deployment")
     args = parser.parse_args()
     version = version_for(args.tag)
     if not re.fullmatch("[0-9a-f]{40}", args.revision):
@@ -230,10 +272,19 @@ def main():
         if output := os.environ.get("GITHUB_OUTPUT"):
             with Path(output).open("a", encoding="utf-8") as stream:
                 stream.write(f"version={version}\nrevision={args.revision}\nalready_public={str(published).lower()}\n")
-    else:
+    elif args.command == "publish":
         if not args.repository or not args.bundle:
             parser.error("publishing needs a verified local Maven repository and a new bundle path")
         publish(args.repository.resolve(strict=True), args.bundle.resolve(), group, artifacts, version, args.tag, args.revision)
+    else:
+        if not args.repository or not args.deployment:
+            parser.error("resuming needs a verified local Maven repository and an existing deployment ID")
+        stage = args.repository.resolve(strict=True)
+        deployment = str(UUID(args.deployment))
+        files = validated_files(stage, group, artifacts, version, args.tag, args.revision)
+        if not is_public(group, artifacts, version, args.tag, args.revision):
+            publish_deployment(deployment, central_token(), group, artifacts, version, args.revision)
+        compare_public(stage, files)
 
 
 if __name__ == "__main__":

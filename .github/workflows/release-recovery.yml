@@ -1,0 +1,83 @@
+name: Recover an existing Central deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Original verified release tag
+        type: string
+        required: true
+      release_run:
+        description: Original release workflow run ID
+        type: string
+        required: true
+      deployment:
+        description: Existing Central deployment UUID from that run
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: maven-central-refs/tags/${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.repository == 'Apdelrahman1911/kmpYT' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v-recovery-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    environment: maven-central
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_RUN: ${{ inputs.release_run }}
+      CENTRAL_DEPLOYMENT: ${{ inputs.deployment }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Match the original verified release run and deployment
+        id: match
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          [[ "$RELEASE_RUN" =~ ^[0-9]+$ ]]
+          [[ "$CENTRAL_DEPLOYMENT" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]
+          test "$GITHUB_REF_NAME" = "v-recovery-${RELEASE_TAG#v}"
+          git merge-base --is-ancestor HEAD origin/main
+          revision="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor "$revision" origin/main
+          workflow="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml" --jq '.id')"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN" |
+            jq -e --argjson workflow "$workflow" --arg tag "$RELEASE_TAG" --arg revision "$revision" '
+              .workflow_id == $workflow and .event == "push" and .head_branch == $tag and .head_sha == $revision
+              and .status == "completed" and .conclusion == "failure"
+            ' >/dev/null
+          job="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN/jobs?per_page=100" --jq '
+            if any(.jobs[]; .name == "stage" and .conclusion == "success")
+            then .jobs[] | select(.name == "publish" and .conclusion == "failure") | .id
+            else empty end
+          ')"
+          [[ "$job" =~ ^[0-9]+$ ]]
+          mkdir -p build/recovery
+          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job/logs" > build/recovery/publisher.log
+          awk -v deployment="$CENTRAL_DEPLOYMENT" '
+            $NF == deployment && $(NF-1) == "deployment" && $(NF-2) == "Central" && $(NF-3) == "Submitted" { found = 1 }
+            END { exit !found }
+          ' build/recovery/publisher.log
+          gh run download "$RELEASE_RUN" --name maven-candidate --dir build/recovery/candidate
+          python3 -B ci/verify_publications.py --repository build/recovery/candidate --tag "$RELEASE_TAG" --revision "$revision"
+          printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
+      - name: Publish the existing deployment and verify immutable bytes
+        env:
+          RELEASE_REVISION: ${{ steps.match.outputs.revision }}
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+        run: |
+          python3 -B ci/central_release.py resume --inventory ci/publications.json \
+            --tag "$RELEASE_TAG" --revision "$RELEASE_REVISION" \
+            --repository build/recovery/candidate --deployment "$CENTRAL_DEPLOYMENT"

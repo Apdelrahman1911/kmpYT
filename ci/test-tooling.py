@@ -4,11 +4,50 @@ import hashlib,importlib.util,io,json,os
 from pathlib import Path
 import shutil,subprocess,tarfile,tempfile,unittest,zipfile
 from unittest.mock import patch
+from urllib.error import HTTPError
+
+import central_release
 
 ROOT=Path(__file__).resolve().parents[1]
 SPEC=importlib.util.spec_from_file_location('ffmpeg_tool',ROOT/'ci/ffmpeg-tool.py')
 FFMPEG=importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FFMPEG)
+
+class CentralPublishingTests(unittest.TestCase):
+    deployment = "10000000-1000-4000-8000-100000000000"
+    group = "org.example"
+    artifacts = ["authored"]
+    version = "0.1.3"
+    revision = "1" * 40
+
+    def receipt(self, state):
+        return {
+            "deploymentId": self.deployment,
+            "deploymentName": central_release.deployment_name(self.group, self.version, self.revision),
+            "deploymentState": state,
+            "purls": ["pkg:maven/org.example/authored@0.1.3"],
+        }
+
+    def test_resumes_same_deployment_after_ambiguous_publish_response(self):
+        url = central_release.PORTAL + f"deployment/{self.deployment}"
+        response = HTTPError(url, 400, "bad request", None, io.BytesIO(b'{"error":"already publishing"}'))
+        failure = central_release.CentralHttpError("POST", url, response)
+        states = [self.receipt(state) for state in ("VALIDATED", "PUBLISHING", "PUBLISHED")]
+        with patch.object(central_release, "await_state", side_effect=states), \
+                patch.object(central_release, "portal", side_effect=failure) as portal, \
+                patch.object(central_release.time, "sleep"), patch("builtins.print"):
+            central_release.publish_deployment(self.deployment, "authored-token", self.group, self.artifacts,
+                                               self.version, self.revision)
+        portal.assert_called_once_with(f"deployment/{self.deployment}", "authored-token")
+
+    def test_rejects_another_deployment_before_requesting_publication(self):
+        receipt = self.receipt("VALIDATED")
+        receipt["deploymentName"] += "-another-build"
+        with patch.object(central_release, "await_state", return_value=receipt), \
+                patch.object(central_release, "portal") as portal, self.assertRaises(ValueError):
+            central_release.publish_deployment(self.deployment, "authored-token", self.group, self.artifacts,
+                                               self.version, self.revision)
+        portal.assert_not_called()
 
 class ToolingTests(unittest.TestCase):
     def test_shell_syntax(self):
