@@ -21,8 +21,9 @@ import platform.Foundation.timeIntervalSince1970
 /** A response validator is checked before an existing file is opened for appending. */
 internal class IosHttpPartTransfer(private val http: HttpClient, private val store: IosDownloadResumeStore,
     private val plan: PlannedDownload, private val allowLocalHttp: Boolean,
-    private val sectionBytes: Long = IOS_SECTION_BYTES) {
-    suspend fun fetch(part: TransferPart, progress: suspend (PartState, Long) -> Unit, observer: ((IosDownloadStageEvent) -> Unit)? = null): PartState {
+    private val sectionBytes: Long = IOS_SECTION_BYTES,
+    private val observer: ((IosDownloadStageEvent) -> Unit)? = null) {
+    suspend fun fetch(part: TransferPart, progress: suspend (PartState, Long) -> Unit): PartState {
         var previous = store.parts.singleOrNull { it.key == part.key }
         var url = part.resource.url
         val originalOrigin = ResearchAccess.origin(url)

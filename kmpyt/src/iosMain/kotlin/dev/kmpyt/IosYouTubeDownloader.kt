@@ -84,7 +84,7 @@ class IosYouTubeDownloader(
                 paths = files.map { it.path }
             } else {
                 val initial = store.parts.map { PartState(it.key, it.bytes, it.total, complete = false) }
-                val transfer = IosHttpPartTransfer(http, store, plan, allowLocalHttp)
+                val transfer = IosHttpPartTransfer(http, store, plan, allowLocalHttp, observer = trace)
                 var lastProgress: YouTubeDownloadProgress? = null
                 suspend fun publish(speed: Long) {
                     // A validator-driven restart can invalidate a formerly known response size.
@@ -106,7 +106,7 @@ class IosYouTubeDownloader(
                 traceIosDownload(trace, IosDownloadStage.TRANSFER) {
                     TransferCoordinator().run(plan, initial, isCurrent = {
                         currentCoroutineContext().ensureActive(); true
-                    }, transfer = { part, _, progress -> transfer.fetch(part, progress, trace) },
+                    }, transfer = { part, _, progress -> transfer.fetch(part, progress) },
                         persist = { _, speed, _ -> publish(speed) })
                 }
                 check(parts.all { part -> store.parts.any { it.key == part.key && it.complete && it.bytes == it.total } }) {
