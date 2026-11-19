@@ -22,7 +22,7 @@ import platform.Foundation.timeIntervalSince1970
 internal class IosHttpPartTransfer(private val http: HttpClient, private val store: IosDownloadResumeStore,
     private val plan: PlannedDownload, private val allowLocalHttp: Boolean,
     private val sectionBytes: Long = IOS_SECTION_BYTES) {
-    suspend fun fetch(part: TransferPart, progress: suspend (PartState, Long) -> Unit): PartState {
+    suspend fun fetch(part: TransferPart, progress: suspend (PartState, Long) -> Unit, observer: ((IosDownloadStageEvent) -> Unit)? = null): PartState {
         var previous = store.parts.singleOrNull { it.key == part.key }
         var url = part.resource.url
         val originalOrigin = ResearchAccess.origin(url)
@@ -186,9 +186,10 @@ internal class IosHttpPartTransfer(private val http: HttpClient, private val sto
                         return@execute
                     }
                     check(bytes > 0 && (total == null || bytes == total)) { "The media response ended before the complete track was received." }
-                    file.flush()
-                    val final = saved(done = true)
-                    store.savePart(final)
+                    val final = traceIosDownload(observer, IosDownloadStage.CHECKPOINT_FINISH) {
+                        file.flush()
+                        saved(done = true).also { store.savePart(it) }
+                    }
                     complete = true
                     result = final.state()
                 } catch (error: Throwable) {

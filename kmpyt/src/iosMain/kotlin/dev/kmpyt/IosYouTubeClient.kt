@@ -13,7 +13,10 @@ import platform.Foundation.NSUserDomainMask
 
 /** Owns its Darwin client and offline WebKit sessions; call the returned client's suspend close(). */
 @Throws(Exception::class)
-fun createIosYouTubeClient(): YouTubeClient {
+fun createIosYouTubeClient(): YouTubeClient = createIosYouTubeClient(null)
+
+@Throws(Exception::class)
+fun createIosYouTubeClient(observer: ((IosDownloadStageEvent) -> Unit)?): YouTubeClient {
     val http = HttpClient(Darwin) {
         followRedirects = false
         expectSuccess = false
@@ -35,7 +38,7 @@ fun createIosYouTubeClient(): YouTubeClient {
     return YouTubeClient(
         transport = measuredIosTransport(KtorResearchTransport(http, maximumBytes = 8_000_000)),
         playerRuntime = IosYouTubeJavaScriptRuntime(),
-        downloader = IosYouTubeDownloader(http),
+        downloader = IosYouTubeDownloader(http, false, observer),
         onClose = { http.close() },
         platformName = "iOS",
         playbackAdapter = createIosYouTubeSabrPlaybackAdapter(http),

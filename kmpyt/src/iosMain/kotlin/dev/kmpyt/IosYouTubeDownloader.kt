@@ -16,10 +16,20 @@ import platform.Foundation.*
  * session and restarts if its source generation changes. No signed URL/session data
  * is persisted. Existing destination files are never replaced.
  */
-class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalHttp: Boolean = false) : YouTubeDownloader {
+class IosYouTubeDownloader(
+    private val http: HttpClient,
+    private val allowLocalHttp: Boolean,
+    private val observer: ((IosDownloadStageEvent) -> Unit)?,
+) : YouTubeDownloader {
+    constructor(http: HttpClient, allowLocalHttp: Boolean = false) : this(http, allowLocalHttp, null)
     @Throws(Exception::class)
     override suspend fun download(plan: PlannedDownload, destinationPath: String,
         onProgress: suspend (YouTubeDownloadProgress) -> Unit): YouTubeDownloadResult = withContext(Dispatchers.Default) {
+        val trace = observer?.let { sink ->
+            val operationId = NSUUID().UUIDString
+            val emit: (IosDownloadStageEvent) -> Unit = { sink(it.copy(operationId = operationId)) }
+            emit
+        }
         YouTubeDownloadPolicy.requirePlan(plan)
         require(plan.credentialRef == null) { "The iOS adapter accepts anonymous inspected resources only." }
         require(plan.sabrCheckpoint == null) { "An external SABR checkpoint has no owned iOS track files. Retry the original destination instead." }
@@ -44,7 +54,7 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
         var exporterOwnsStore = false
         try {
             require(!manager.fileExistsAtPath(store.destination)) { "The destination already exists; choose another file." }
-            store.load(plan, parts)
+            traceIosDownload(trace, IosDownloadStage.CHECKPOINT_RESTORE) { store.load(plan, parts) }
             val paths: List<String>
             if (plan.primary.transport == TransportKind.SABR) {
                 require(plan.requestHeaders.isEmpty()) { "SABR uses its source-declared anonymous client headers." }
@@ -58,17 +68,19 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
                 try {
                     val sizes = representations.associate { requireNotNull(it.sabr).formatId to requireNotNull(it.sizeBytes) }
                     val sinks = representations.mapIndexed { index, representation -> representation.role to files[index] }.toMap()
-                    transfer.download(plan.sabrSource(), plan.sabrSelection(), requireNotNull(plan.primary.sabr).clientInfo,
-                        sizes, sinks, validateResource = { validate(it, plan) }, checkpoint = checkpoint,
-                        onCheckpoint = resume::save,
-                        onProgress = { onProgress(YouTubeDownloadProgress(it.bytesWritten, it.totalBytes)) },
-                        nowEpochMs = { (NSDate().timeIntervalSince1970 * 1000).toLong() })
+                    traceIosDownload(trace, IosDownloadStage.TRANSFER) {
+                        transfer.download(plan.sabrSource(), plan.sabrSelection(), requireNotNull(plan.primary.sabr).clientInfo,
+                            sizes, sinks, validateResource = { validate(it, plan) }, checkpoint = checkpoint,
+                            onCheckpoint = resume::save,
+                            onProgress = { onProgress(YouTubeDownloadProgress(it.bytesWritten, it.totalBytes)) },
+                            nowEpochMs = { (NSDate().timeIntervalSince1970 * 1000).toLong() })
+                    }
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (failure: Exception) {
                     files.firstNotNullOfOrNull { it.storageFailure }?.let { throw it }
                     throw failure
                 } finally { transfer.close() }
-                files.forEach { it.flush(); it.close() }
+                traceIosDownload(trace, IosDownloadStage.CHECKPOINT_FINISH) { files.forEach { it.flush(); it.close() } }
                 paths = files.map { it.path }
             } else {
                 val initial = store.parts.map { PartState(it.key, it.bytes, it.total, complete = false) }
@@ -91,15 +103,19 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
                     if (update != lastProgress) { onProgress(update); lastProgress = update }
                 }
                 publish(0)
-                TransferCoordinator().run(plan, initial, isCurrent = {
-                    currentCoroutineContext().ensureActive(); true
-                }, transfer = { part, _, progress -> transfer.fetch(part, progress) },
-                    persist = { _, speed, _ -> publish(speed) })
+                traceIosDownload(trace, IosDownloadStage.TRANSFER) {
+                    TransferCoordinator().run(plan, initial, isCurrent = {
+                        currentCoroutineContext().ensureActive(); true
+                    }, transfer = { part, _, progress -> transfer.fetch(part, progress, trace) },
+                        persist = { _, speed, _ -> publish(speed) })
+                }
                 check(parts.all { part -> store.parts.any { it.key == part.key && it.complete && it.bytes == it.total } }) {
                     "The selected media has incomplete private byte coverage."
                 }
-                paths = representations.indices.map { track ->
-                    assemble(store, track, parts.filter { it.key.substringBefore('-').toInt() == track })
+                paths = traceIosDownload(trace, IosDownloadStage.ASSEMBLY) {
+                    representations.indices.map { track ->
+                        assemble(store, track, parts.filter { it.key.substringBefore('-').toInt() == track })
+                    }
                 }
             }
             currentCoroutineContext().ensureActive()
@@ -107,24 +123,34 @@ class IosYouTubeDownloader(private val http: HttpClient, private val allowLocalH
             val output = if (remux) "${store.directory}/output.mp4" else paths.single()
             if (remux) {
                 requireIosStorage(store.directory, checkedIosSum(paths.map { requireNotNull(store.fileLength(it)) }))
-                IosMediaMuxer.mux(paths[0], plan.primary.role, paths.getOrNull(1), output) {
-                    exporterOwnsStore = true
+                traceIosDownload(trace, IosDownloadStage.EXPORT) {
+                    IosMediaMuxer.mux(paths[0], plan.primary.role, paths.getOrNull(1), output) {
+                        exporterOwnsStore = true
+                    }
+                    IosMediaFile(output, existing = true).let { file -> try { file.flush() } finally { file.close() } }
                 }
-                IosMediaFile(output, existing = true).let { file -> try { file.flush() } finally { file.close() } }
             }
             currentCoroutineContext().ensureActive()
             val written = store.fileLength(output) ?: 0
             check(written > 0) { "The downloaded media is empty." }
             require(!manager.fileExistsAtPath(store.destination)) { "The destination was created by another writer." }
-            check(manager.moveItemAtPath(output, toPath = store.destination, error = null)) { "Could not publish the complete media file." }
+            traceIosDownload(trace, IosDownloadStage.STAGING_MOVE) {
+                if (!manager.moveItemAtPath(output, toPath = store.destination, error = null))
+                    throw IosMediaStorageException("Could not publish the complete media file.")
+            }
             published = true
             YouTubeDownloadResult(destinationPath, written,
                 if (remux) if (plan.primary.role == TrackRole.AUDIO) "audio/mp4" else "video/mp4"
                 else plan.primary.mimeType.substringBefore(';'))
         } finally {
-            files.forEach { it.close() }
-            // The export still owns these files if cancellation never reached a terminal state.
-            if (!exporterOwnsStore) store.close(completed = published)
+            try {
+                files.forEach { it.close() }
+            } finally {
+                // The export still owns these files if cancellation never reached a terminal state.
+                if (!exporterOwnsStore) traceIosDownload(trace, IosDownloadStage.STAGING_CLEANUP) {
+                    store.close(completed = published)
+                }
+            }
         }
     }
 
