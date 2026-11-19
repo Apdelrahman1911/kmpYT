@@ -7,9 +7,13 @@ import kotlinx.coroutines.*
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import kotlin.time.TimeSource
 
 /** Local, stream-copy processing; FFmpeg receives only files downloaded and verified by this adapter. */
-internal class JvmMediaProcessor(private val ffmpegPath: String?) : FileMediaProcessor {
+internal class JvmMediaProcessor(
+    private val ffmpegPath: String?,
+    private val remuxStallTimeoutMs: Long = 180_000,
+) : FileMediaProcessor {
     fun preflight(plan: PlannedDownload) {
         if (plan.audio != null || plan.primary.segments.isNotEmpty()) executable()
     }
@@ -40,7 +44,9 @@ internal class JvmMediaProcessor(private val ffmpegPath: String?) : FileMediaPro
                         require(downloaded.isFile && downloaded.length() > 0) { "The source returned empty media." }
                         require(resource.rangeLength == null || downloaded.length() == resource.rangeLength) { "The source returned an incomplete media range." }
                         MediaStorageSpace.requireAvailable(assembled, downloaded.length())
-                        downloaded.inputStream().use { MediaStorageSpace.copy(it, destination, assembled) }
+                        downloaded.inputStream().use {
+                            MediaStorageSpace.copy(it, destination, assembled) { currentCoroutineContext().ensureActive() }
+                        }
                         check(downloaded.delete()) { "Could not release local media staging storage." }
                     }
                 }
@@ -50,7 +56,9 @@ internal class JvmMediaProcessor(private val ffmpegPath: String?) : FileMediaPro
             val sound = audio?.let { assemble(it, "audio") }
             if (sound == null && primary.segments.isEmpty()) {
                 MediaStorageSpace.requireAvailable(output, video.length())
-                video.inputStream().use { input -> output.outputStream().use { MediaStorageSpace.copy(input, it, output) } }
+                video.inputStream().use { input -> output.outputStream().use {
+                    MediaStorageSpace.copy(input, it, output) { currentCoroutineContext().ensureActive() }
+                } }
             } else {
                 val ffmpeg = executable()
                 MediaStorageSpace.requireAvailable(output, MediaStorageSpace.checkedSum(listOfNotNull(video, sound).map { it.length() }))
@@ -62,10 +70,20 @@ internal class JvmMediaProcessor(private val ffmpegPath: String?) : FileMediaPro
                 command += listOf("-c", "copy", "-movflags", "+faststart", "-f", "mp4", output.absolutePath)
                 val process = ProcessBuilder(command).redirectOutput(ProcessBuilder.Redirect.DISCARD)
                     .redirectError(File(temporary, "ffmpeg.log")).start()
-                process.outputStream.close()
                 try {
+                    process.outputStream.close()
+                    var lastOutputSize = 0L
+                    var lastOutput = TimeSource.Monotonic.markNow()
                     while (process.isAlive) {
                         currentCoroutineContext().ensureActive()
+                        val size = output.length()
+                        if (size > lastOutputSize) {
+                            lastOutputSize = size
+                            lastOutput = TimeSource.Monotonic.markNow()
+                        }
+                        check(lastOutput.elapsedNow().inWholeMilliseconds < remuxStallTimeoutMs) {
+                            "FFmpeg stopped producing output while finalizing the media file."
+                        }
                         MediaStorageSpace.requireAvailable(output, 1)
                         delay(100)
                     }
@@ -74,7 +92,10 @@ internal class JvmMediaProcessor(private val ffmpegPath: String?) : FileMediaPro
                 } finally {
                     if (process.isAlive) {
                         process.destroy()
-                        if (!process.waitFor(500, TimeUnit.MILLISECONDS)) process.destroyForcibly()
+                        if (!process.waitFor(500, TimeUnit.MILLISECONDS)) {
+                            process.destroyForcibly()
+                            check(process.waitFor(5, TimeUnit.SECONDS)) { "FFmpeg did not shut down." }
+                        }
                     }
                 }
             }

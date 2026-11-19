@@ -23,6 +23,35 @@ import java.util.concurrent.TimeUnit
 import kotlin.test.*
 
 class JvmYouTubeDownloaderTest {
+    @Test fun stalledRemuxStopsTheProcessAndDiscardsPartialOutput(): Unit = runBlocking {
+        assumeTrue(File("/bin/sh").canExecute() && File("/bin/sleep").canExecute())
+        val directory = Files.createTempDirectory("kmpyt-stalled-remux-").toFile()
+        val output = File(directory, "partial.mp4")
+        val executable = File(directory, "authored-remux")
+        executable.writeText("""#!/bin/sh
+for output do :; done
+printf '%s' "${'$'}${'$'}" > "${'$'}0.pid"
+printf 'partial output' > "${'$'}output"
+exec /bin/sleep 60
+""")
+        check(executable.setExecutable(true))
+        try {
+            val primary = Representation("v", "https://example.invalid/video", TrackRole.VIDEO)
+            val audio = Representation("a", "https://example.invalid/audio", TrackRole.AUDIO)
+            val failure = assertFailsWith<IllegalStateException> {
+                withTimeout(8_000) {
+                    JvmMediaProcessor(executable.absolutePath, remuxStallTimeoutMs = 300)
+                        .materialize(primary, audio, { _, resource -> resource.writeText("authored bytes") }, output)
+                }
+            }
+            assertContains(failure.message.orEmpty(), "stopped producing output")
+            val pid = File(directory, "authored-remux.pid").readText().toLong()
+            assertFalse(ProcessHandle.of(pid).map { it.isAlive }.orElse(false))
+            assertFalse(output.exists())
+            assertFalse(directory.listFiles().orEmpty().any { it.name.startsWith("processing-") })
+        } finally { directory.deleteRecursively() }
+    }
+
     private fun media(name: String) = requireNotNull(javaClass.getResourceAsStream("/research/$name")).use { it.readBytes() }
     private fun plan(server: MockWebServer, audio: Boolean = false): PlannedDownload {
         val video = Representation("video", server.loopbackUrl("/video").toString(), if (audio) TrackRole.VIDEO else TrackRole.MUXED,
