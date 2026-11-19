@@ -151,32 +151,32 @@ class IosYouTubeDownloaderTest {
     @Test fun audioOnlyUsesDirectPublicationOrSegmentedNativeExportAsRequired() = iosTest {
         inIosTestDirectory { directory ->
             val audio = IosAuthoredMedia.audio
-            val split = audio.size / 2
+            val fragments = IosAuthoredMedia.fragmentedAudio
+            val resources = fragments.mapIndexed { index, bytes -> "/segment-$index" to bytes }.toMap()
             val http = HttpClient(MockEngine { request ->
-                val bytes = when (request.url.encodedPath) {
-                    "/first" -> audio.copyOfRange(0, split)
-                    "/second" -> audio.copyOfRange(split, audio.size)
-                    else -> audio
-                }
+                val path = request.url.encodedPath
+                val bytes = if (path == "/audio") audio else resources.getValue(path)
                 respond(bytes, HttpStatusCode.OK, headersOf(HttpHeaders.ContentLength, bytes.size.toString()))
             }) { followRedirects = false }
             try {
                 val primary = checkNotNull(plan(1, audio.size.toLong()).audio)
                 val events = mutableListOf<IosDownloadStageEvent>()
                 val downloader = IosYouTubeDownloader(http, false) { events.add(it) }
-                val direct = downloader.download(plan(1, null).copy(primary = primary), "$directory/direct.m4a")
+                val direct = downloader.download(plan(1, null).copy(primary = primary), "$directory/direct.m4a") {}
                 assertEquals(audio.size.toLong(), direct.bytesWritten)
                 assertTrue(events.none { it.stage == IosDownloadStage.EXPORT })
                 val directId = assertNotNull(events.first().operationId)
                 assertTrue(events.all { it.operationId == directId })
                 events.clear()
 
-                val segmented = primary.copy(segments = listOf(SegmentResource("https://fixture.invalid/first"),
-                    SegmentResource("https://fixture.invalid/second")))
-                val exported = downloader.download(plan(1, null).copy(primary = segmented), "$directory/segmented.m4a")
+                val segments = resources.keys.map { SegmentResource("https://fixture.invalid$it") }
+                val segmented = primary.copy(transport = TransportKind.DASH, initialization = segments.first(),
+                    segments = segments.drop(1), sizeBytes = fragments.sumOf { it.size.toLong() })
+                val exported = downloader.download(plan(1, null).copy(primary = segmented), "$directory/segmented.m4a") {}
                 assertEquals("audio/mp4", exported.mimeType)
                 val result = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(exported.destinationPath), options = null)
                 assertEquals(1, result.tracksWithMediaType(AVMediaTypeAudio).size)
+                assertTrue(CMTimeGetSeconds(result.duration) in 0.5..1.0)
                 assertTrue(events.any { it.stage == IosDownloadStage.EXPORT && it.outcome == IosDownloadStageOutcome.SUCCESS })
                 assertNotEquals(directId, events.first().operationId)
                 assertEquals(listOf("direct.m4a", "segmented.m4a"), children(directory))
