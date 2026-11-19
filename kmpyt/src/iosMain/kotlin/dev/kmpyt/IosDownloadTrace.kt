@@ -16,7 +16,7 @@ data class IosDownloadStageEvent(
 )
 
 internal suspend inline fun <T> traceIosDownload(
-    observer: ((IosDownloadStageEvent) -> Unit)?,
+    noinline observer: ((IosDownloadStageEvent) -> Unit)?,
     stage: IosDownloadStage,
     block: () -> T,
 ): T {

@@ -148,6 +148,42 @@ class IosYouTubeDownloaderTest {
         }
     }
 
+    @Test fun audioOnlyUsesDirectPublicationOrSegmentedNativeExportAsRequired() = iosTest {
+        inIosTestDirectory { directory ->
+            val audio = IosAuthoredMedia.audio
+            val split = audio.size / 2
+            val http = HttpClient(MockEngine { request ->
+                val bytes = when (request.url.encodedPath) {
+                    "/first" -> audio.copyOfRange(0, split)
+                    "/second" -> audio.copyOfRange(split, audio.size)
+                    else -> audio
+                }
+                respond(bytes, HttpStatusCode.OK, headersOf(HttpHeaders.ContentLength, bytes.size.toString()))
+            }) { followRedirects = false }
+            try {
+                val primary = checkNotNull(plan(1, audio.size.toLong()).audio)
+                val events = mutableListOf<IosDownloadStageEvent>()
+                val downloader = IosYouTubeDownloader(http, false) { events.add(it) }
+                val direct = downloader.download(plan(1, null).copy(primary = primary), "$directory/direct.m4a")
+                assertEquals(audio.size.toLong(), direct.bytesWritten)
+                assertTrue(events.none { it.stage == IosDownloadStage.EXPORT })
+                val directId = assertNotNull(events.first().operationId)
+                assertTrue(events.all { it.operationId == directId })
+                events.clear()
+
+                val segmented = primary.copy(segments = listOf(SegmentResource("https://fixture.invalid/first"),
+                    SegmentResource("https://fixture.invalid/second")))
+                val exported = downloader.download(plan(1, null).copy(primary = segmented), "$directory/segmented.m4a")
+                assertEquals("audio/mp4", exported.mimeType)
+                val result = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(exported.destinationPath), options = null)
+                assertEquals(1, result.tracksWithMediaType(AVMediaTypeAudio).size)
+                assertTrue(events.any { it.stage == IosDownloadStage.EXPORT && it.outcome == IosDownloadStageOutcome.SUCCESS })
+                assertNotEquals(directId, events.first().operationId)
+                assertEquals(listOf("direct.m4a", "segmented.m4a"), children(directory))
+            } finally { http.close() }
+        }
+    }
+
     @Test fun nativeFileSupportsSparseOffsetsAbove512MiBAndChecksOverflow() = iosTest {
         inIosTestDirectory { directory ->
             val file = IosMediaFile("$directory/sparse")
