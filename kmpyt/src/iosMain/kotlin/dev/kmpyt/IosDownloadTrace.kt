@@ -13,6 +13,7 @@ data class IosDownloadStageEvent(
     val processingFailure: DownloadProcessingException.Reason? = null,
     val restartRequired: Boolean = false,
     val operationId: String? = null,
+    val correlationKey: Long? = null,
 )
 
 internal suspend inline fun <T> traceIosDownload(

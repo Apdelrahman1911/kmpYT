@@ -9,6 +9,7 @@ import io.ktor.http.*
 import kotlinx.cinterop.readValue
 import kotlinx.cinterop.useContents
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withContext
 import platform.AVFoundation.*
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.Foundation.*
@@ -172,13 +173,16 @@ class IosYouTubeDownloaderTest {
                 val segments = resources.keys.map { SegmentResource("https://fixture.invalid$it") }
                 val segmented = primary.copy(transport = TransportKind.DASH, initialization = segments.first(),
                     segments = segments.drop(1), sizeBytes = fragments.sumOf { it.size.toLong() })
-                val exported = downloader.download(plan(1, null).copy(primary = segmented), "$directory/segmented.m4a") {}
+                val exported = withContext(DownloadTraceContext(712)) {
+                    downloader.download(plan(1, null).copy(primary = segmented), "$directory/segmented.m4a") {}
+                }
                 assertEquals("audio/mp4", exported.mimeType)
                 val result = AVURLAsset.URLAssetWithURL(NSURL.fileURLWithPath(exported.destinationPath), options = null)
                 assertEquals(1, result.tracksWithMediaType(AVMediaTypeAudio).size)
                 assertTrue(CMTimeGetSeconds(result.duration) in 0.5..1.0)
                 assertTrue(events.any { it.stage == IosDownloadStage.EXPORT && it.outcome == IosDownloadStageOutcome.SUCCESS })
                 assertNotEquals(directId, events.first().operationId)
+                assertTrue(events.all { it.correlationKey == 712L })
                 assertEquals(listOf("direct.m4a", "segmented.m4a"), children(directory))
             } finally { http.close() }
         }

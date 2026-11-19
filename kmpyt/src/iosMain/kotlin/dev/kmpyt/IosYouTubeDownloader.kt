@@ -27,7 +27,8 @@ class IosYouTubeDownloader(
         onProgress: suspend (YouTubeDownloadProgress) -> Unit): YouTubeDownloadResult = withContext(Dispatchers.Default) {
         val trace = observer?.let { sink ->
             val operationId = NSUUID().UUIDString
-            val emit: (IosDownloadStageEvent) -> Unit = { sink(it.copy(operationId = operationId)) }
+            val correlation = currentCoroutineContext()[DownloadTraceContext]?.correlationKey
+            val emit: (IosDownloadStageEvent) -> Unit = { sink(it.copy(operationId = operationId, correlationKey = correlation)) }
             emit
         }
         YouTubeDownloadPolicy.requirePlan(plan)
