@@ -7,3 +7,8 @@ import kotlin.coroutines.CoroutineContext
 class DownloadTraceContext(val correlationKey: Long) : AbstractCoroutineContextElement(Key) {
     companion object Key : CoroutineContext.Key<DownloadTraceContext>
 }
+
+/** Links source requests to an operation chosen by an application using the client. */
+class ResearchTraceContext(val correlationId: Long) : AbstractCoroutineContextElement(Key) {
+    companion object Key : CoroutineContext.Key<ResearchTraceContext>
+}
